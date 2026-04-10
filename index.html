@@ -476,21 +476,20 @@ async function init() {
   DATA = window.__HYPERGRAPH_DATA__;
 
   // Re-evolve each rule using the JS engine (undirected matching)
-  // Only re-evolve early steps where multi-edges matter; keep precomputed data for later steps
+  // Time-limited: evolve as many steps as possible within budget per rule
   for (const r of RULES) {
     const d = DATA[r.id];
     if (!d || !d.states || !d.states[0]) continue;
     const parsed = parseNotation(r.notation);
     if (!parsed) continue;
-    const maxReevolve = Math.min(d.states.length - 1, 6);
+    const totalSteps = d.states.length - 1;
     try {
-      const result = HGEngine.evolve(d.states[0], parsed.lhs, parsed.rhs, maxReevolve);
-      for (let i = 0; i < result.states.length && i < d.states.length; i++) {
-        d.states[i] = result.states[i];
-      }
-      for (let i = 0; i < result.events.length && i < d.events.length; i++) {
-        d.events[i] = result.events[i];
-      }
+      const result = HGEngine.evolve(d.states[0], parsed.lhs, parsed.rhs, totalSteps, 4000);
+      // Replace ALL data with re-evolved result (may be fewer steps if timed out)
+      d.states = result.states;
+      d.events = result.events;
+      d.causal_edges = result.causal_edges;
+      d.stats = result.stats;
     } catch(e) { console.warn('Re-evolve failed for ' + r.id, e); }
   }
 
@@ -1665,12 +1664,13 @@ const HGEngine = (() => {
     return [remaining.concat(newEdges), events];
   }
 
-  function evolve(initHyp, lhs, rhs, steps) {
+  function evolve(initHyp, lhs, rhs, steps, timeLimitMs) {
     // Find max existing node id
     let maxN = 0;
     for (const e of initHyp) for (const n of e) if (typeof n === 'number' && n > maxN) maxN = n;
     reset(maxN);
 
+    const t0 = Date.now();
     const states = [initHyp.map(e => e.slice())];
     const allEvents = [];
     let evId = 0;
@@ -1679,6 +1679,7 @@ const HGEngine = (() => {
     const flatEvents = [];
 
     for (let s = 0; s < steps; s++) {
+      if (timeLimitMs && Date.now() - t0 > timeLimitMs) break;
       const [next, stepEvts] = applyAllNonOverlapping(current, lhs, rhs);
       stepEvts.forEach(ev => { ev.id = evId++; });
 
