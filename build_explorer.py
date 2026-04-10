@@ -1710,27 +1710,87 @@ const HGEngine = (() => {
       current = next;
     }
 
-    // Build stats with estimated dimension from log-log node growth slope
-    const nodeCounts = states.map(st => { const ns = new Set(); st.forEach(e => e.forEach(n => ns.add(n))); return ns.size; });
-    const stats = states.map((st, i) => {
-      let dim = null;
-      // Use log(N_i) / log(N_{i-1}) slope averaged over recent steps (need at least 3 data points)
-      if (i >= 3) {
-        // Fit log(nodes) vs step over last few steps
-        const window = Math.min(i, 4);
-        const xs = [], ys = [];
-        for (let j = i - window; j <= i; j++) {
-          if (nodeCounts[j] > 1) { xs.push(j); ys.push(Math.log(nodeCounts[j])); }
-        }
-        if (xs.length >= 3) {
-          const n = xs.length;
-          const mx = xs.reduce((a,b)=>a+b)/n, my = ys.reduce((a,b)=>a+b)/n;
-          const num = xs.reduce((s,x,k)=>s+(x-mx)*(ys[k]-my),0);
-          const den = xs.reduce((s,x)=>s+(x-mx)**2,0);
-          if (den > 0) dim = num/den;
+    // Build stats with geodesic ball dimension estimate
+    // For each state: build adjacency, BFS from multiple seed nodes,
+    // count nodes within radius r, fit slope of log(count) vs log(r)
+    function estimateDimension(st) {
+      if (st.length < 5) return null;
+      const nodeSet = new Set(); st.forEach(e => e.forEach(n => nodeSet.add(n)));
+      const nodes = Array.from(nodeSet);
+      if (nodes.length < 8) return null;
+
+      // Build adjacency list (undirected)
+      const adj = {};
+      for (const n of nodes) adj[n] = new Set();
+      for (const e of st) {
+        for (let i = 0; i < e.length; i++) {
+          for (let j = i + 1; j < e.length; j++) {
+            adj[e[i]].add(e[j]);
+            adj[e[j]].add(e[i]);
+          }
+          // Self-loops don't contribute to adjacency
         }
       }
-      return { step: i, num_nodes: nodeCounts[i], num_edges: st.length, estimated_dimension: dim };
+
+      // BFS from seed nodes, record ball sizes at each radius
+      const numSeeds = Math.min(5, nodes.length);
+      const seedStep = Math.max(1, Math.floor(nodes.length / numSeeds));
+      const allBalls = []; // array of {r, count} arrays
+
+      for (let si = 0; si < numSeeds; si++) {
+        const seed = nodes[si * seedStep];
+        const dist = {}; dist[seed] = 0;
+        const queue = [seed];
+        let qi = 0;
+        while (qi < queue.length) {
+          const u = queue[qi++];
+          const d = dist[u];
+          for (const v of (adj[u] || [])) {
+            if (dist[v] === undefined) {
+              dist[v] = d + 1;
+              queue.push(v);
+            }
+          }
+        }
+        // Count nodes at each distance
+        const maxDist = Math.max(...Object.values(dist));
+        const ballSizes = [];
+        let cumul = 0;
+        for (let r = 0; r <= maxDist; r++) {
+          cumul += Object.values(dist).filter(d => d === r).length;
+          ballSizes.push({ r, count: cumul });
+        }
+        allBalls.push(ballSizes);
+      }
+
+      // Average ball sizes across seeds, then fit log(count) vs log(r)
+      const maxR = Math.min(...allBalls.map(b => b.length)) - 1;
+      if (maxR < 2) return null;
+
+      const xs = [], ys = [];
+      for (let r = 1; r <= maxR; r++) {
+        let avgCount = 0;
+        for (const balls of allBalls) avgCount += balls[r].count;
+        avgCount /= allBalls.length;
+        if (avgCount > 1) {
+          xs.push(Math.log(r));
+          ys.push(Math.log(avgCount));
+        }
+      }
+      if (xs.length < 2) return null;
+
+      // Linear regression: slope of log(count) vs log(r)
+      const n = xs.length;
+      const mx = xs.reduce((a,b) => a+b) / n;
+      const my = ys.reduce((a,b) => a+b) / n;
+      const num = xs.reduce((s, x, k) => s + (x - mx) * (ys[k] - my), 0);
+      const den = xs.reduce((s, x) => s + (x - mx) ** 2, 0);
+      return den > 0 ? num / den : null;
+    }
+
+    const stats = states.map((st, i) => {
+      const nodeSet = new Set(); st.forEach(e => e.forEach(n => nodeSet.add(n)));
+      return { step: i, num_nodes: nodeSet.size, num_edges: st.length, estimated_dimension: estimateDimension(st) };
     });
 
     return { states, events: allEvents, causal_edges: causalEdges, stats, multiway_states: {}, multiway_edges: [] };
