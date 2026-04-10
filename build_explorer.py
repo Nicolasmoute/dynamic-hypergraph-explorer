@@ -424,10 +424,30 @@ let isDark = true;
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
 
-// Lineage tracking
-let selectedEdgeIdx = null;
-let lineageSet = new Set(); // set of edge indices that are descendants
-let edgeLineageMap = {};    // edgeIdx -> set of descendant edge indices
+// Lineage tracking — multi-select up to 3 edges
+const SEL_COLORS = ['#ffdd00', '#ff2222', '#2288ff']; // yellow, red, blue
+const SEL_MIX = {
+  '100': '#ffdd00', '010': '#ff2222', '001': '#2288ff',       // single
+  '110': '#ff8800', '101': '#44dd44', '011': '#cc44ff',       // pairs: orange, green, purple
+  '111': '#ffffff'                                              // all three: white
+};
+let selectedEdges = [];      // array of {edgeIdx, step} up to 3
+let lineageSets = [];        // parallel array of Sets of descendant edge indices
+let edgeLineageMap = {};     // edgeIdx -> set of descendant edge indices
+
+function getEdgeSelColor(edgeIdx) {
+  // Returns the mixed color for an edge based on which selections it belongs to
+  const bits = [0, 0, 0];
+  for (let i = 0; i < selectedEdges.length; i++) {
+    const sel = selectedEdges[i];
+    const isOrigin = currentStep === sel.step && edgeIdx === sel.edgeIdx;
+    const isDesc = lineageSets[i] && lineageSets[i].has(edgeIdx);
+    if (isOrigin || isDesc) bits[i] = 1;
+  }
+  const key = bits.join('');
+  if (key === '000') return null; // not part of any selection
+  return SEL_MIX[key] || null;
+}
 
 // Multiway system
 let MULTIWAY = {};  // ruleId -> { states: {hash: edges}, edges: [{from,to,event}], paths: {hash: [event_ids]} }
@@ -636,9 +656,22 @@ function getDescendants(ruleId, step, edgeIdx) {
   return result;
 }
 
+function recomputeLineage() {
+  lineageSets = selectedEdges.map(sel => {
+    window._lineageOriginStep = sel.step;
+    return getDescendantsFromStep(activeRule, currentStep, sel.edgeIdx);
+  });
+  const bar = document.getElementById('lineage-bar');
+  const totalDesc = new Set();
+  lineageSets.forEach(s => s.forEach(v => totalDesc.add(v)));
+  document.getElementById('lineage-count').textContent =
+    selectedEdges.length + ' selected, ' + totalDesc.size + ' descendant' + (totalDesc.size !== 1 ? 's' : '');
+  bar.classList.add('active');
+}
+
 function clearLineage() {
-  selectedEdgeIdx = null;
-  lineageSet = new Set();
+  selectedEdges = [];
+  lineageSets = [];
   document.getElementById('lineage-bar').classList.remove('active');
   renderSpatial();
 }
@@ -721,14 +754,9 @@ function setStep(step) {
   selectedPath = null;
   document.getElementById('step-display').textContent = step;
   document.getElementById('step-slider').value = step;
-  // Recompute lineage for new step if there's a selection
-  if (selectedEdgeIdx !== null) {
-    lineageSet = getDescendantsFromStep(activeRule, currentStep, selectedEdgeIdx);
-    const bar = document.getElementById('lineage-bar');
-    const isOrigin = currentStep === window._lineageOriginStep;
-    document.getElementById('lineage-count').textContent =
-      isOrigin ? 'selected' : lineageSet.size + ' descendant' + (lineageSet.size !== 1 ? 's' : '');
-    bar.classList.add('active');
+  // Recompute lineage for all selections
+  if (selectedEdges.length > 0) {
+    recomputeLineage();
   }
   renderCurrentView();
 }
@@ -817,59 +845,52 @@ function renderSpatial() {
   const link = g.append('g').selectAll('path').data(links).join('path')
     .attr('fill', 'none')
     .attr('stroke', (d) => {
-      if (selectedEdgeIdx !== null) {
-        const isSelected = currentStep === window._lineageOriginStep && d.edgeIdx === selectedEdgeIdx;
-        const isDesc = lineageSet.has(d.edgeIdx);
-        if (isSelected) return isDark ? '#fff' : '#000';
-        if (isDesc) return isDark ? '#fff' : '#111';
+      if (selectedEdges.length > 0) {
+        const selColor = getEdgeSelColor(d.edgeIdx);
+        if (selColor) return selColor;
         return opts.colors ? edgeBirthColor(d.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
       }
       return opts.colors ? edgeBirthColor(d.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
     })
     .attr('stroke-width', (d) => {
-      if (selectedEdgeIdx !== null) {
-        const isSelected = currentStep === window._lineageOriginStep && d.edgeIdx === selectedEdgeIdx;
-        const isDesc = lineageSet.has(d.edgeIdx);
-        if (isSelected) return baseEdgeWidth * 2;
-        if (isDesc) return baseEdgeWidth * 1.8;
+      if (selectedEdges.length > 0) {
+        const selColor = getEdgeSelColor(d.edgeIdx);
+        if (selColor) return baseEdgeWidth * 2;
         return baseEdgeWidth;
       }
       return baseEdgeWidth;
     })
     .attr('stroke-opacity', (d) => {
-      if (selectedEdgeIdx !== null) {
-        const isSelected = currentStep === window._lineageOriginStep && d.edgeIdx === selectedEdgeIdx;
-        const isDesc = lineageSet.has(d.edgeIdx);
-        if (isSelected || isDesc) return 1;
-        return 0.65;
+      if (selectedEdges.length > 0) {
+        const selColor = getEdgeSelColor(d.edgeIdx);
+        if (selColor) return 1;
+        return 0.25;
       }
       return 0.65;
     })
     .style('cursor', 'pointer')
     .on('click', function(e, d) {
       e.stopPropagation();
-      // Select this edge and trace its descendants
-      selectedEdgeIdx = d.edgeIdx;
-      // We need to trace from this edge at this step forward to the current viewing step
-      // But for simplicity, let's store the original step and edge, and recompute on step change
-      // Store selection as "step:edgeIdx"
-      window._lineageOriginStep = currentStep;
-      window._lineageOriginIdx = d.edgeIdx;
-
-      if (currentStep === 0) {
-        lineageSet = new Set(); // no descendants at step 0
+      // Toggle: if already selected, remove it; otherwise add (up to 3)
+      const existIdx = selectedEdges.findIndex(s => s.step === currentStep && s.edgeIdx === d.edgeIdx);
+      if (existIdx >= 0) {
+        selectedEdges.splice(existIdx, 1);
+        lineageSets.splice(existIdx, 1);
       } else {
-        // Trace from origin to current step
-        lineageSet = getDescendantsFromStep(activeRule, currentStep, d.edgeIdx);
+        if (selectedEdges.length >= 3) {
+          // Remove oldest selection to make room
+          selectedEdges.shift();
+          lineageSets.shift();
+        }
+        selectedEdges.push({ edgeIdx: d.edgeIdx, step: currentStep });
       }
 
-      // Show lineage bar
-      const bar = document.getElementById('lineage-bar');
-      document.getElementById('lineage-count').textContent =
-        (currentStep === window._lineageOriginStep ? 'selected' : lineageSet.size + ' descendant' + (lineageSet.size !== 1 ? 's' : ''));
-      bar.classList.add('active');
-
-      renderSpatial(); // re-render with highlighting
+      if (selectedEdges.length === 0) {
+        clearLineage();
+        return;
+      }
+      recomputeLineage();
+      renderSpatial();
     });
 
   // Compute node birth step: earliest birth step of any edge containing that node
@@ -894,13 +915,18 @@ function renderSpatial() {
   const node = g.append('g').selectAll('circle').data(nodes).join('circle')
     .attr('r', nodeR)
     .attr('fill', (d, i) => {
-      if (selectedEdgeIdx !== null) {
-        // Highlight nodes that belong to lineage edges
-        const isInLineage = links.some(l =>
-          lineageSet.has(l.edgeIdx) && (l.source.id === d.id || l.target.id === d.id ||
-            l.source === d.id || l.target === d.id)
-        );
-        if (isInLineage) return isDark ? '#fff' : '#111';
+      if (selectedEdges.length > 0) {
+        // Find best color from any link touching this node
+        let bestColor = null;
+        for (const l of links) {
+          const nid = typeof l.source === 'object' ? l.source.id : l.source;
+          const tid = typeof l.target === 'object' ? l.target.id : l.target;
+          if (nid === d.id || tid === d.id) {
+            const c = getEdgeSelColor(l.edgeIdx);
+            if (c) { bestColor = c; break; }
+          }
+        }
+        if (bestColor) return bestColor;
         return isDark ? '#222' : '#ccc';
       }
       return opts.colors ? nodeBirthColor(d.id) : getPalette()[i % getPalette().length];
@@ -908,12 +934,13 @@ function renderSpatial() {
     .attr('stroke', () => isDark ? '#08080c' : '#ffffff')
     .attr('stroke-width', 0.3)
     .attr('opacity', (d) => {
-      if (selectedEdgeIdx !== null) {
-        const isInLineage = links.some(l =>
-          (lineageSet.has(l.edgeIdx) || (currentStep === window._lineageOriginStep && l.edgeIdx === selectedEdgeIdx)) && (l.source.id === d.id || l.target.id === d.id ||
-            l.source === d.id || l.target === d.id)
-        );
-        return isInLineage ? 1 : 0.2;
+      if (selectedEdges.length > 0) {
+        for (const l of links) {
+          const nid = typeof l.source === 'object' ? l.source.id : l.source;
+          const tid = typeof l.target === 'object' ? l.target.id : l.target;
+          if ((nid === d.id || tid === d.id) && getEdgeSelColor(l.edgeIdx)) return 1;
+        }
+        return 0.2;
       }
       return 1;
     })
@@ -940,17 +967,11 @@ function renderSpatial() {
   if (simulation) simulation.stop();
   const baseDist = 20 + 200/Math.sqrt(nodes.length);
   const linkDistFn = d => {
-    if (selectedEdgeIdx !== null) {
-      const isSel = currentStep === window._lineageOriginStep && d.edgeIdx === selectedEdgeIdx;
-      if (isSel || lineageSet.has(d.edgeIdx)) return baseDist * 0.2;
-    }
+    if (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) return baseDist * 0.2;
     return baseDist;
   };
   const linkStrFn = d => {
-    if (selectedEdgeIdx !== null) {
-      const isSel = currentStep === window._lineageOriginStep && d.edgeIdx === selectedEdgeIdx;
-      if (isSel || lineageSet.has(d.edgeIdx)) return 1.0;
-    }
+    if (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) return 1.0;
     return 0.3;
   };
   simulation = d3.forceSimulation(nodes)
@@ -986,9 +1007,15 @@ function renderSpatial() {
         loopG.append('path')
           .attr('d', `M${n.x},${n.y - nodeR} A${r},${r} 0 1,1 ${n.x + 0.01},${n.y - nodeR}`)
           .attr('fill', 'none')
-          .attr('stroke', opts.colors ? edgeBirthColor(sl.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa'))
-          .attr('stroke-width', baseEdgeWidth)
-          .attr('stroke-opacity', 0.65);
+          .attr('stroke', () => {
+            if (selectedEdges.length > 0) {
+              const c = getEdgeSelColor(sl.edgeIdx);
+              if (c) return c;
+            }
+            return opts.colors ? edgeBirthColor(sl.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
+          })
+          .attr('stroke-width', selectedEdges.length > 0 && getEdgeSelColor(sl.edgeIdx) ? baseEdgeWidth * 2 : baseEdgeWidth)
+          .attr('stroke-opacity', selectedEdges.length > 0 ? (getEdgeSelColor(sl.edgeIdx) ? 1 : 0.25) : 0.65);
       });
     });
 
