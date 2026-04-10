@@ -1710,10 +1710,27 @@ const HGEngine = (() => {
       current = next;
     }
 
-    // Build stats
+    // Build stats with estimated dimension from log-log node growth slope
+    const nodeCounts = states.map(st => { const ns = new Set(); st.forEach(e => e.forEach(n => ns.add(n))); return ns.size; });
     const stats = states.map((st, i) => {
-      const nodes = new Set(); st.forEach(e => e.forEach(n => nodes.add(n)));
-      return { step: i, num_nodes: nodes.size, num_edges: st.length, estimated_dimension: null };
+      let dim = null;
+      // Use log(N_i) / log(N_{i-1}) slope averaged over recent steps (need at least 3 data points)
+      if (i >= 3) {
+        // Fit log(nodes) vs step over last few steps
+        const window = Math.min(i, 4);
+        const xs = [], ys = [];
+        for (let j = i - window; j <= i; j++) {
+          if (nodeCounts[j] > 1) { xs.push(j); ys.push(Math.log(nodeCounts[j])); }
+        }
+        if (xs.length >= 3) {
+          const n = xs.length;
+          const mx = xs.reduce((a,b)=>a+b)/n, my = ys.reduce((a,b)=>a+b)/n;
+          const num = xs.reduce((s,x,k)=>s+(x-mx)*(ys[k]-my),0);
+          const den = xs.reduce((s,x)=>s+(x-mx)**2,0);
+          if (den > 0) dim = num/den;
+        }
+      }
+      return { step: i, num_nodes: nodeCounts[i], num_edges: st.length, estimated_dimension: dim };
     });
 
     return { states, events: allEvents, causal_edges: causalEdges, stats, multiway_states: {}, multiway_edges: [] };
