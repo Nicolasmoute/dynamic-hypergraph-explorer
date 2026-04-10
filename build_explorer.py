@@ -658,8 +658,7 @@ function getDescendants(ruleId, step, edgeIdx) {
 
 function recomputeLineage() {
   lineageSets = selectedEdges.map(sel => {
-    window._lineageOriginStep = sel.step;
-    return getDescendantsFromStep(activeRule, currentStep, sel.edgeIdx);
+    return getDescendantsFromStep(activeRule, currentStep, sel.edgeIdx, sel.step);
   });
   const bar = document.getElementById('lineage-bar');
   const totalDesc = new Set();
@@ -1052,8 +1051,8 @@ function renderSpatial() {
 }
 
 // Get descendants from a specific step (not just step 0)
-function getDescendantsFromStep(ruleId, viewingStep, edgeIdx) {
-  const originStep = window._lineageOriginStep;
+function getDescendantsFromStep(ruleId, viewingStep, edgeIdx, originStep) {
+  if (originStep === undefined) originStep = viewingStep;
   const data = DATA[ruleId];
   if (!data._edgeLineage) return new Set();
 
