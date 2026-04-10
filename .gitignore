@@ -1,0 +1,6 @@
+# Ignore everything except project files
+*
+!.gitignore
+!build_explorer.py
+!extracted_data.json
+!hypergraph_explorer.html
