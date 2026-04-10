@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dynamic Hypergraph Explorer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500;600;700&display=swap');
+
+  :root {
+    --bg: #08080c;
+    --surface: #0e0e14;
+    --surface2: #14141e;
+    --border: #1c1c2e;
+    --border-bright: #2a2a4e;
+    --text: #c8c8d4;
+    --text-dim: #666680;
+    --text-heading: #ffffff;
+    --accent: #6c7bff;
+    --accent-glow: #6c7bff40;
+    --green: #4cdd8a;
+    --orange: #ffaa44;
+    --pink: #ff6b9d;
+    --cyan: #4cdddd;
+    --node-stroke: #08080c;
+    --chart-bg: #0e0e14;
+    --chart-grid: #1c1c2e;
+  }
+
+  html.light {
+    --bg: #eaebef;
+    --surface: #ffffff;
+    --surface2: #e2e3e8;
+    --border: #c8cad2;
+    --border-bright: #a0a4b0;
+    --text: #2a2d35;
+    --text-dim: #5a5e6a;
+    --text-heading: #111318;
+    --accent: #3a44b8;
+    --accent-glow: #3a44b840;
+    --green: #117a42;
+    --orange: #a86200;
+    --pink: #b8306a;
+    --cyan: #0e7a7a;
+    --node-stroke: #ffffff;
+    --chart-bg: #ffffff;
+    --chart-grid: #d0d2d8;
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: background 0.3s, color 0.3s;
+  }
+
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    z-index: 100;
+    transition: background 0.3s;
+  }
+  .logo { display: flex; align-items: center; gap: 12px; }
+  .logo-icon {
+    width: 32px; height: 32px;
+    background: linear-gradient(135deg, var(--accent), var(--pink));
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+  }
+  .logo h1 { font-size: 15px; font-weight: 600; color: var(--text-heading); letter-spacing: -0.3px; }
+  .logo span { font-size: 11px; color: var(--text-dim); font-weight: 400; }
+
+  .header-right { display: flex; align-items: center; gap: 16px; }
+
+  .view-tabs {
+    display: flex; gap: 2px; background: var(--surface2); border-radius: 8px; padding: 3px;
+  }
+  .view-tab {
+    padding: 6px 16px; border-radius: 6px; cursor: pointer;
+    font-size: 12px; font-weight: 500; color: var(--text-dim);
+    border: none; background: none; transition: all 0.2s;
+  }
+  .view-tab:hover { color: var(--text); }
+  .view-tab.active { background: var(--accent); color: #fff; }
+
+  .theme-btn {
+    width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface2); cursor: pointer; font-size: 15px;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s; color: var(--text);
+  }
+  .theme-btn:hover { border-color: var(--accent); }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  .sidebar {
+    width: 320px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    overflow-y: auto; flex-shrink: 0;
+    transition: background 0.3s;
+  }
+  .sidebar-section { padding: 16px; border-bottom: 1px solid var(--border); }
+  .sidebar-section h3 {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--text-dim); margin-bottom: 12px; font-weight: 600;
+  }
+
+  .rule-card {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; margin-bottom: 8px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .rule-card:hover { border-color: var(--border-bright); }
+  .rule-card.active { border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); }
+  .rule-card .rule-name { font-size: 13px; font-weight: 600; color: var(--text-heading); margin-bottom: 4px; }
+  .rule-card .rule-notation {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px; color: var(--accent); margin-bottom: 6px; word-break: break-all;
+  }
+  .rule-card .rule-desc { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+  .rule-tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: 600; margin-top: 6px; }
+  .tag-2d { background: #4cdd8a20; color: var(--green); }
+  .tag-1d { background: #ffaa4420; color: var(--orange); }
+  .tag-tree { background: #ff6b9d20; color: var(--pink); }
+  .tag-fractal { background: #cb7cff20; color: var(--accent); }
+  .tag-mixed { background: #ffcc4420; color: #ccaa00; }
+  .tag-custom { background: #4cdddd20; color: var(--cyan); }
+  .remove-custom {
+    float: right; background: none; border: none; color: var(--text-dim);
+    font-size: 18px; cursor: pointer; padding: 0 2px; line-height: 1;
+    margin: -4px -4px 0 0;
+  }
+  .remove-custom:hover { color: #e05050; }
+
+  .step-control { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .step-control input[type=range] {
+    flex: 1; accent-color: var(--accent);
+    -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border);
+  }
+  .step-control input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px;
+    border-radius: 50%; background: var(--accent); cursor: pointer;
+  }
+  .step-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; font-weight: 600; color: var(--accent); min-width: 24px; text-align: right;
+  }
+
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-box {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px; transition: background 0.3s;
+  }
+  .stat-box .stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); margin-bottom: 4px; }
+  .stat-box .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 600; color: var(--text-heading); }
+  .stat-box .stat-sub { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+
+  .option-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
+  .option-row label { font-size: 12px; }
+  .toggle {
+    width: 36px; height: 20px; border-radius: 10px;
+    background: var(--border); cursor: pointer; position: relative;
+    transition: background 0.2s; border: none;
+  }
+  .toggle::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--text-dim); transition: all 0.2s;
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle.on::after { left: 18px; background: #fff; }
+
+  .canvas-area { flex: 1; position: relative; overflow: hidden; }
+  .canvas-area svg { width: 100%; height: 100%; }
+
+  .play-btn {
+    background: var(--accent); border: none;
+    width: 32px; height: 32px; border-radius: 50%; color: #fff;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    font-size: 14px; transition: all 0.2s; flex-shrink: 0;
+  }
+  .play-btn:hover { transform: scale(1.1); box-shadow: 0 0 16px var(--accent-glow); }
+
+  .causal-overlay { display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .causal-overlay.active { display: block; }
+
+  .tooltip {
+    position: absolute; pointer-events: none;
+    background: var(--surface); border: 1px solid var(--border-bright);
+    border-radius: 6px; padding: 8px 12px; font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    line-height: 1.7; max-width: 400px;
+    display: none; z-index: 200;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  }
+
+  .lineage-bar {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    background: var(--surface); border: 1px solid var(--accent);
+    border-radius: 8px; padding: 8px 16px; font-size: 12px;
+    display: none; z-index: 150; gap: 12px; align-items: center;
+    box-shadow: 0 4px 20px var(--accent-glow);
+  }
+  .lineage-bar.active { display: flex; }
+  .lineage-bar .lineage-text { color: var(--accent); font-weight: 500; }
+  .lineage-bar .lineage-count { font-family: 'JetBrains Mono', monospace; color: var(--text-heading); font-weight: 600; }
+  .lineage-bar button {
+    background: none; border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text-dim); padding: 2px 8px; cursor: pointer; font-size: 11px;
+  }
+  .lineage-bar button:hover { border-color: var(--accent); color: var(--accent); }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .edge-row {
+    display: flex; align-items: center; gap: 4px; margin-bottom: 4px;
+  }
+  .edge-row select {
+    background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 3px 4px; font-size: 11px;
+    font-family: 'JetBrains Mono', monospace; width: 40px; cursor: pointer;
+  }
+  .edge-row .edge-label {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-dim);
+  }
+  .edge-row .remove-edge {
+    background: none; border: none; color: var(--text-dim); cursor: pointer;
+    font-size: 14px; padding: 0 2px; line-height: 1;
+  }
+  .edge-row .remove-edge:hover { color: #e05050; }
+  .editor-btn {
+    background: var(--surface2); border: 1px solid var(--border); color: var(--text-dim);
+    padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 10px;
+    margin-top: 4px;
+  }
+  .editor-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .run-btn {
+    display: block; width: 100%; margin-top: 12px; padding: 8px;
+    background: var(--accent); border: none; color: #fff; border-radius: 6px;
+    font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s;
+  }
+  .run-btn:hover { filter: brightness(1.2); }
+  .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Loading overlay */
+  .loading-overlay {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000; flex-direction: column; gap: 16px;
+  }
+  .loading-overlay .spinner {
+    width: 40px; height: 40px; border: 3px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-overlay .loading-text {
+    font-size: 13px; color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<div class="loading-overlay" id="loading-overlay">
+  <div class="spinner"></div>
+  <div class="loading-text" id="loading-text">Loading rules...</div>
+</div>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">&#x2B21;</div>
+    <div>
+      <h1>Dynamic Hypergraph Explorer</h1>
+      <span>Hypergraph Rewriting Simulator</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="view-tabs">
+      <button class="view-tab active" onclick="setView('spatial', this)">Spatial Graph</button>
+      <button class="view-tab" onclick="setView('causal', this)">Causal Graph</button>
+      <button class="view-tab" onclick="setView('multiway', this)">Multiway</button>
+      <button class="view-tab" onclick="setView('growth', this)">Growth Analysis</button>
+    </div>
+    <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle light/dark mode">&#9790;</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <h3>Rewriting Rules</h3>
+      <div id="rule-cards"></div>
+    </div>
+    <div class="sidebar-section">
+      <h3>Custom Rule Editor</h3>
+      <div id="rule-editor" style="font-size: 11px;">
+        <div style="margin-bottom: 8px; color: var(--text-dim);">LHS (input pattern)</div>
+        <div id="lhs-edges"></div>
+        <button class="editor-btn" onclick="addEdge('lhs')">+ Add LHS edge</button>
+        <div style="margin: 10px 0 8px; color: var(--text-dim);">RHS (replacement)</div>
+        <div id="rhs-edges"></div>
+        <button class="editor-btn" onclick="addEdge('rhs')">+ Add RHS edge</button>
+        <div style="margin: 10px 0 8px; color: var(--text-dim);">Initial hypergraph</div>
+        <div id="init-edges"></div>
+        <button class="editor-btn" onclick="addEdge('init')">+ Add init edge</button>
+        <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
+          <label style="color: var(--text-dim); white-space:nowrap;">Steps:</label>
+          <input type="number" id="custom-steps" value="8" min="1" max="15"
+            style="width:48px; background:var(--surface2); border:1px solid var(--border); color:var(--text); border-radius:4px; padding:3px 6px; font-size:11px; font-family: 'JetBrains Mono', monospace;">
+        </div>
+        <button class="run-btn" onclick="runCustomRule()">Run Simulation</button>
+        <div id="custom-error" style="color:#e05050; font-size:10px; margin-top:4px; display:none;"></div>
+        <div id="custom-preview" style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--accent); margin-top:6px; word-break:break-all;"></div>
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <h3>Evolution Step</h3>
+      <div class="step-control">
+        <button class="play-btn" id="play-btn" onclick="togglePlay()">&#9654;</button>
+        <input type="range" id="step-slider" min="0" max="20" value="0" oninput="setStep(+this.value)">
+        <span class="step-value" id="step-display">0</span>
+        <button class="play-btn" style="width:26px;height:26px;font-size:16px;font-weight:700;" onclick="stepPlus1()">+</button>
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <h3>Statistics</h3>
+      <div class="stats-grid">
+        <div class="stat-box"><div class="stat-label">Nodes</div><div class="stat-value" id="stat-nodes">1</div></div>
+        <div class="stat-box"><div class="stat-label">Edges</div><div class="stat-value" id="stat-edges">2</div></div>
+        <div class="stat-box"><div class="stat-label">Dimension</div><div class="stat-value" id="stat-dim">--</div><div class="stat-sub" id="stat-dim-sub"></div></div>
+        <div class="stat-box"><div class="stat-label">Growth Rate</div><div class="stat-value" id="stat-growth">--</div><div class="stat-sub" id="stat-growth-sub"></div></div>
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <h3>Display Options</h3>
+      <div class="option-row"><label>Node labels</label><button class="toggle" id="toggle-labels" onclick="toggleOption('labels')"></button></div>
+      <div class="option-row"><label>Edge colors</label><button class="toggle on" id="toggle-colors" onclick="toggleOption('colors')"></button></div>
+      <div class="option-row"><label>Hyperedge hulls</label><button class="toggle on" id="toggle-hulls" onclick="toggleOption('hulls')"></button></div>
+      <div class="option-row"><label>Nudge mode</label><button class="toggle" id="toggle-nudge" onclick="toggleOption('nudge')"></button></div>
+      <div style="font-size:10px; color:var(--text-dim); margin-top:4px; line-height:1.5;" id="nudge-hint" hidden>Click &amp; drag on empty space to push nearby nodes around</div>
+    </div>
+    <div class="sidebar-section" style="border-bottom: none;">
+      <h3>About This Rule</h3>
+      <p id="theory-blurb" style="font-size: 11px; line-height: 1.7; color: var(--text-dim);"></p>
+    </div>
+  </div>
+
+  <div class="canvas-area" id="canvas-area">
+    <svg id="main-svg"></svg>
+    <div class="causal-overlay" id="causal-view"><svg id="causal-svg"></svg></div>
+    <div class="causal-overlay" id="multiway-view"><svg id="multiway-svg"></svg></div>
+    <div id="growth-view" style="display:none; position:absolute; inset:0; background:var(--bg); overflow-y:auto; padding: 32px;"></div>
+    <div class="lineage-bar" id="lineage-bar">
+      <span class="lineage-text">Edge lineage:</span>
+      <span class="lineage-count" id="lineage-count">0 descendants</span>
+      <button onclick="clearLineage()">&#10005; Clear</button>
+    </div>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

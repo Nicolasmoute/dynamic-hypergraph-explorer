@@ -4,3 +4,21 @@
 !build_explorer.py
 !extracted_data.json
 !index.html
+!Dockerfile
+!zeabur.json
+
+# Server
+!server/
+!server/__init__.py
+!server/engine.py
+!server/main.py
+!server/requirements.txt
+
+# Client
+!client/
+!client/index.html
+!client/app.js
+
+# Python cache
+__pycache__/
+*.pyc
