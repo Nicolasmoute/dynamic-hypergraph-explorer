@@ -2293,7 +2293,7 @@ init();
 </body>
 </html>'''
 
-out_path = os.path.join(tmp, 'hypergraph_explorer.html')
+out_path = os.path.join(tmp, 'index.html')
 with open(out_path, 'w', encoding='utf-8') as f:
     f.write(HTML)
 

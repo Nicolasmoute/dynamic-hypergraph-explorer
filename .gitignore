@@ -3,4 +3,4 @@
 !.gitignore
 !build_explorer.py
 !extracted_data.json
-!hypergraph_explorer.html
+!index.html
