@@ -1,6 +1,9 @@
 """FastAPI server for Dynamic Hypergraph Explorer."""
 from __future__ import annotations
 import json
+import threading
+from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,9 +12,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from server import engine
-
-app = FastAPI(title="Dynamic Hypergraph Explorer")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Preloaded rules ───────────────────────────────────────────────────
 RULES = [
@@ -57,8 +57,6 @@ RULES = [
     },
 ]
 
-import threading
-
 # Cache for computed data
 CACHE: dict[str, dict] = {}
 _compute_locks: dict[str, threading.Lock] = {}
@@ -102,6 +100,34 @@ def get_rule_data(rule_id: str) -> dict:
         CACHE[rule_id] = data
         return data
 
+# ── App + lifespan ────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Precompute all rule data in a background thread at startup."""
+    def _precompute():
+        for r in RULES:
+            print(f"Precomputing {r['id']}...")
+            try:
+                get_rule_data(r["id"])
+                print(f"  {r['id']} done: {len(CACHE[r['id']]['states'])} states")
+            except Exception as e:
+                print(f"  {r['id']} failed: {e}")
+        for r in RULES:
+            print(f"Computing multiway for {r['id']}...")
+            try:
+                get_multiway(r["id"])
+                print(f"  {r['id']} multiway done")
+            except Exception as e:
+                print(f"  {r['id']} multiway failed: {e}")
+        print("All rules precomputed!")
+    threading.Thread(target=_precompute, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Dynamic Hypergraph Explorer", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 # ── API endpoints ─────────────────────────────────────────────────────
 
 @app.get("/api/rules")
@@ -131,14 +157,19 @@ def get_multiway(rule_id: str):
     if cache_key in CACHE:
         return CACHE[cache_key]
 
-    rule = next((r for r in RULES if r["id"] == rule_id), None)
-    if not rule:
-        raise HTTPException(404, f"Rule {rule_id} not found")
+    lock = _get_lock(cache_key)
+    with lock:
+        if cache_key in CACHE:
+            return CACHE[cache_key]
 
-    parsed = engine.parse_notation(rule["notation"])
-    result = engine.compute_multiway(rule["init"], parsed["lhs"], parsed["rhs"])
-    CACHE[cache_key] = result
-    return result
+        rule = next((r for r in RULES if r["id"] == rule_id), None)
+        if not rule:
+            raise HTTPException(404, f"Rule {rule_id} not found")
+
+        parsed = engine.parse_notation(rule["notation"])
+        result = engine.compute_multiway(rule["init"], parsed["lhs"], parsed["rhs"])
+        CACHE[cache_key] = result
+        return result
 
 @app.get("/api/rules/{rule_id}/descendants")
 def get_descendants(rule_id: str, viewing_step: int, edge_idx: int, origin_step: int):
@@ -147,11 +178,11 @@ def get_descendants(rule_id: str, viewing_step: int, edge_idx: int, origin_step:
     lineage = data["lineage"]
 
     result = set()
-    queue = [f"{origin_step}:{edge_idx}"]
+    queue: deque[str] = deque([f"{origin_step}:{edge_idx}"])
     visited = set(queue)
 
     while queue:
-        current = queue.pop(0)
+        current = queue.popleft()
         for child in lineage.get(current, []):
             if child in visited:
                 continue
@@ -215,24 +246,3 @@ def serve_app_js():
 # Mount static files (JS, CSS, images) after API routes
 app.mount("/static", StaticFiles(directory=CLIENT_DIR), name="static")
 
-# ── Startup: precompute rules in background thread ───────────────────
-@app.on_event("startup")
-async def precompute():
-    import threading
-    def _precompute():
-        for r in RULES:
-            print(f"Precomputing {r['id']}...")
-            try:
-                get_rule_data(r["id"])
-                print(f"  {r['id']} done: {len(CACHE[r['id']]['states'])} states")
-            except Exception as e:
-                print(f"  {r['id']} failed: {e}")
-        for r in RULES:
-            print(f"Computing multiway for {r['id']}...")
-            try:
-                get_multiway(r["id"])
-                print(f"  {r['id']} multiway done")
-            except Exception as e:
-                print(f"  {r['id']} multiway failed: {e}")
-        print("All rules precomputed!")
-    threading.Thread(target=_precompute, daemon=True).start()

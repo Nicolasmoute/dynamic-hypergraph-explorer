@@ -327,10 +327,14 @@ def canonical_hash(hyp: Hypergraph) -> str:
 
     def solve(col, assigned, next_lbl):
         if time.time() - t0 > 0.5:
-            r = dict(assigned)
-            lbl = next_lbl
-            rem = sorted((n for n in nodes if n not in r), key=lambda n: (col[n], n))
-            for n in rem:
+            # Deterministic fallback: ignore partial recursive state and assign
+            # all nodes by the fixed post-initial-refinement coloring (closed
+            # over from the outer scope) so two calls with identical input
+            # always produce the same hash string even when the timeout fires
+            # at different recursion depths.
+            r = {}
+            lbl = 0
+            for n in sorted(nodes, key=lambda n: (color[n], n)):
                 r[n] = lbl
                 lbl += 1
             return edge_str(r)
