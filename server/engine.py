@@ -2,6 +2,7 @@
 from __future__ import annotations
 import itertools
 import math
+import threading
 from collections import defaultdict
 from typing import Optional
 
@@ -9,16 +10,16 @@ from typing import Optional
 Edge = list[int]
 Hypergraph = list[Edge]
 
-_next_node = 0
+# Thread-local node counter — each request/thread gets its own counter so
+# concurrent calls to evolve() or compute_multiway() cannot race.
+_tls = threading.local()
 
 def reset(start: int = 0):
-    global _next_node
-    _next_node = start + 1
+    _tls._next_node = start + 1
 
 def fresh() -> int:
-    global _next_node
-    n = _next_node
-    _next_node += 1
+    n = _tls._next_node
+    _tls._next_node += 1
     return n
 
 # ── pattern matching (undirected) ────────────────────────────────────
@@ -532,9 +533,10 @@ def parse_notation(notation: str):
 
     def parse_side(s: str):
         s = s.strip()
+        # Strip a single outer wrapper only when it encloses multiple edges,
+        # i.e. the notation uses {{e1},{e2},...} style.  A bare single-edge
+        # like {x,y} must NOT be stripped or the regex finds nothing.
         if s.startswith("{{"):
-            s = s[1:-1]
-        elif s.startswith("{"):
             s = s[1:-1]
         edges = []
         for m in re.finditer(r"\{([^}]+)\}", s):

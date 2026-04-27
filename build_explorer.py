@@ -1,10 +1,36 @@
-"""Build the Dynamic Hypergraph Explorer HTML with embedded data."""
-import os, json
+"""Build the Dynamic Hypergraph Explorer HTML with embedded data.
 
-tmp = os.environ.get('TEMP')
+Usage:
+  python build_explorer.py [input_json] [output_html]
+
+  input_json   path to extracted_data.json  (default: ./extracted_data.json)
+  output_html  path to write the bundle      (default: ./index.html)
+
+Environment variables (legacy, lower priority than CLI args):
+  TEMP / TMPDIR  directory that contains extracted_data.json
+"""
+import os, sys, json
+
+# Resolve input / output paths.
+# Priority: CLI args > legacy %TEMP%/%TMPDIR% env var > repo root defaults.
+_legacy_tmp = os.environ.get('TEMP') or os.environ.get('TMPDIR')
+
+if len(sys.argv) >= 2:
+    _input_path = sys.argv[1]
+elif _legacy_tmp:
+    _input_path = os.path.join(_legacy_tmp, 'extracted_data.json')
+else:
+    _input_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'extracted_data.json')
+
+if len(sys.argv) >= 3:
+    _output_path = sys.argv[2]
+elif _legacy_tmp:
+    _output_path = os.path.join(_legacy_tmp, 'index.html')
+else:
+    _output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
 
 # Load simulation data
-with open(os.path.join(tmp, 'extracted_data.json'), 'r', encoding='utf-8') as f:
+with open(_input_path, 'r', encoding='utf-8') as f:
     data_str = f.read()
 
 HTML = r'''<!DOCTYPE html>
@@ -2397,7 +2423,7 @@ init();
 </body>
 </html>'''
 
-out_path = os.path.join(tmp, 'index.html')
+out_path = _output_path
 with open(out_path, 'w', encoding='utf-8') as f:
     f.write(HTML)
 
