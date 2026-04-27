@@ -30,8 +30,19 @@ class TestHealth:
         assert r.status_code == 200
 
     def test_body_has_ok_status(self, client):
-        r = client.get("/health")
-        assert r.json() == {"status": "ok"}
+        assert client.get("/health").json()["status"] == "ok"
+
+    def test_body_has_uptime_s(self, client):
+        data = client.get("/health").json()
+        assert "uptime_s" in data
+        assert isinstance(data["uptime_s"], int)
+        assert data["uptime_s"] >= 0
+
+    def test_body_has_version(self, client):
+        data = client.get("/health").json()
+        assert "version" in data
+        # short git SHA or the literal "dev" if git unavailable
+        assert isinstance(data["version"], str) and len(data["version"]) > 0
 
 
 # ── /api/rules ────────────────────────────────────────────────────────

@@ -1,7 +1,9 @@
 """FastAPI server for Dynamic Hypergraph Explorer."""
 from __future__ import annotations
 import json
+import subprocess
 import threading
+import time as _time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,6 +14,22 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from server import engine
+
+# ── Process metadata (captured once at import time) ───────────────────
+_START_TIME: float = _time.time()
+
+def _git_sha() -> str:
+    """Return short git SHA of HEAD, or 'dev' if git is unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2, cwd=Path(__file__).parent.parent,
+        )
+        return result.stdout.strip() or "dev"
+    except Exception:
+        return "dev"
+
+_VERSION: str = _git_sha()
 
 # ── Preloaded rules ───────────────────────────────────────────────────
 RULES = [
@@ -132,8 +150,19 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 def health():
-    """Liveness probe — returns 200 {status: ok} when the server is up."""
-    return {"status": "ok"}
+    """Liveness probe / readiness check.
+
+    Response fields:
+    - status   : always "ok" while the server is alive.
+    - uptime_s : integer seconds since the uvicorn process started.
+    - version  : short git SHA of the deployed commit, or "dev" if git
+                 is unavailable (e.g. inside a Docker image without .git).
+    """
+    return {
+        "status": "ok",
+        "uptime_s": int(_time.time() - _START_TIME),
+        "version": _VERSION,
+    }
 
 
 @app.get("/api/rules")
