@@ -28,6 +28,10 @@
 !tests/test_engine.py
 !tests/test_api.py
 
+# Git hooks (tracked so all agents get the same rules)
+!.githooks/
+!.githooks/pre-commit
+
 # Python cache
 __pycache__/
 *.pyc

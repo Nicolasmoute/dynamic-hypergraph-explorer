@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# ── pre-commit hook — dynamic-hypergraph-explorer shared clone ────────
+#
+# PURPOSE
+#   Block direct commits to 'main'.  All changes must go through a
+#   topic branch (feat/<name>-<slug> or fix/<name>-<slug>), then be
+#   fast-forward merged after tests pass.
+#
+# BACKGROUND
+#   This repo uses a single shared clone at:
+#     /data/projects/dynamichypergraph/repo/shared
+#   Multiple agents commit concurrently.  The harness Bash tool resets
+#   cwd between calls, so "what branch am I on?" is not preserved
+#   across shell invocations.  Direct-to-main incidents have occurred;
+#   this hook is the safety net.
+#
+# BYPASS (genuine emergencies only)
+#   git commit --no-verify -m "..."
+#   Announce the bypass on broadcast BEFORE using it.
+#
+# INSTALLATION (already done for the shared clone)
+#   git config core.hooksPath .githooks
+#
+# ACTIVATION CHECK
+#   git config core.hooksPath   # should print ".githooks"
+
+BRANCH=$(git branch --show-current 2>/dev/null)
+
+# Detached HEAD (e.g. during rebase) — allow without complaint.
+if [ -z "$BRANCH" ]; then
+  exit 0
+fi
+
+if [ "$BRANCH" = "main" ]; then
+  echo "" >&2
+  echo "  ✗  BLOCKED: direct commit to 'main' is not allowed." >&2
+  echo "" >&2
+  echo "  All changes must go through a topic branch:" >&2
+  echo "    git checkout -b feat/<your-name>-<slug>   # or fix/..." >&2
+  echo "    # edit, test, then:" >&2
+  echo "    git push -u origin feat/<your-name>-<slug>" >&2
+  echo "    # fast-forward merge to main only after tests pass" >&2
+  echo "" >&2
+  echo "  Emergency bypass (announce on broadcast first):" >&2
+  echo "    git commit --no-verify -m \"...\"" >&2
+  echo "" >&2
+  exit 1
+fi
+
+exit 0
