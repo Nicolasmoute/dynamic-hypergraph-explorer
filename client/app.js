@@ -946,8 +946,11 @@ function showTooltip(event, text) {
   const tip = document.getElementById('tooltip');
   tip.innerHTML = text.replace(/\n/g, '<br>');
   tip.style.display = 'block';
-  tip.style.left = (event.pageX + 12) + 'px';
-  tip.style.top = (event.pageY - 8) + 'px';
+  // Use canvas-area-relative coordinates: clientX/Y minus the canvas rect offset,
+  // because #tooltip is position:absolute inside the position:relative #canvas-area.
+  const area = document.getElementById('canvas-area').getBoundingClientRect();
+  tip.style.left = (event.clientX - area.left + 12) + 'px';
+  tip.style.top  = (event.clientY - area.top  -  8) + 'px';
 }
 function hideTooltip() { document.getElementById('tooltip').style.display = 'none'; }
 
@@ -1388,11 +1391,20 @@ function parseNotation(notation) {
   const [lStr, rStr] = notation.split(arrow);
   function parseSide(s) {
     s = s.trim();
+    // Strip one layer of outer braces for the multi-edge wrapper:
+    //   "{{x,y},{y,z}}" \u2192 "{x,y},{y,z}"  (double-brace: multi-edge)
+    //   "{x,y}"         \u2192 "x,y"           (single-brace: single-edge wrapper)
     if (s.startsWith('{{')) s = s.slice(1, -1);
     else if (s.startsWith('{')) s = s.slice(1, -1);
     const edges = [];
     for (const m of s.matchAll(/\{([^}]+)\}/g)) {
       edges.push(m[1].split(',').map(v => v.trim()));
+    }
+    // Fallback: if no inner {\u2026} were found the side was a single edge whose
+    // outer braces we already stripped (e.g. original "{x,y}" \u2192 now "x,y").
+    // Treat the entire remaining string as one edge's elements.
+    if (edges.length === 0 && s.length > 0) {
+      edges.push(s.split(',').map(v => v.trim()).filter(Boolean));
     }
     return edges;
   }
