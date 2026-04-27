@@ -130,6 +130,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── API endpoints ─────────────────────────────────────────────────────
 
+@app.get("/health")
+def health():
+    """Liveness probe — returns 200 {status: ok} when the server is up."""
+    return {"status": "ok"}
+
+
 @app.get("/api/rules")
 def list_rules():
     """List all available rules."""

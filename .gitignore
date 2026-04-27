@@ -19,6 +19,15 @@
 !client/index.html
 !client/app.js
 
+# DevX
+!.dockerignore
+!pytest.ini
+!requirements-dev.txt
+!tests/
+!tests/__init__.py
+!tests/test_engine.py
+!tests/test_api.py
+
 # Python cache
 __pycache__/
 *.pyc
