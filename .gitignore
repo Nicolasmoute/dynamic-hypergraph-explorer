@@ -16,6 +16,9 @@
 !client/index.html
 !client/app.js
 
+# Docs
+!README.md
+
 # DevX
 !.dockerignore
 !pytest.ini
@@ -24,6 +27,7 @@
 !tests/__init__.py
 !tests/test_engine.py
 !tests/test_api.py
+!tests/test_smoke.py
 
 # Git hooks (tracked so all agents get the same rules)
 !.githooks/
