@@ -6,6 +6,12 @@ import threading
 from collections import defaultdict
 from typing import Optional
 
+# ── Cache version ─────────────────────────────────────────────────────
+# Bump this constant when the engine's output semantics change (e.g. after
+# fixing estimate_dimension in §5.4).  The cache directory path includes this
+# value so old files remain on disk but are no longer read.
+CACHE_VERSION = "v1"
+
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
 Hypergraph = list[Edge]
