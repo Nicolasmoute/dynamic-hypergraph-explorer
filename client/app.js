@@ -129,6 +129,10 @@ async function loadRuleData(ruleId) {
       return DATA[ruleId];
     } catch (e) {
       console.warn('Failed to load rule', ruleId, e);
+      // Store error sentinel so the canvas shows an actionable message
+      // instead of "Computing…" forever. selectRule() clears this on retry.
+      DATA[ruleId] = { _error: true, _errorMsg: e.message };
+      if (activeRule === ruleId) renderCurrentView();
       return null;
     } finally {
       delete _loading[ruleId];
@@ -159,8 +163,9 @@ function getDescendantsFromStep(ruleId, viewingStep, edgeIdx, originStep) {
   const queue = [originStep + ':' + edgeIdx];
   const visited = new Set(queue);
 
-  while (queue.length > 0) {
-    const current = queue.shift();
+  let head = 0; // cursor index — avoids O(n) array shift on every dequeue
+  while (head < queue.length) {
+    const current = queue[head++];
     const children = data.lineage[current] || [];
     for (const child of children) {
       if (!visited.has(child)) {
@@ -223,11 +228,16 @@ function removeCustomRule(ruleId) {
 }
 
 function selectRule(ruleId) {
+  // Stop playback before switching rules so the play button stays consistent
+  if (playing) togglePlay();
   activeRule = ruleId;
   clearLineage();
   document.querySelectorAll('.rule-card').forEach(c => c.classList.remove('active'));
   const card = document.getElementById('card-' + ruleId);
   if (card) card.classList.add('active');
+
+  // Clear any previous error so clicking the card retries the fetch
+  if (DATA[ruleId] && DATA[ruleId]._error) delete DATA[ruleId];
 
   const data = DATA[ruleId];
   if (!data) {
@@ -289,6 +299,21 @@ function setStep(step) {
   renderCurrentView();
 }
 
+// Debounced variant for the slider oninput event.
+// Updates state and display immediately, but defers the expensive D3
+// re-render to the next animation frame (capped at ~60 fps regardless
+// of how many input events fire during a fast drag).
+let _stepRafId = null;
+function setStepFromSlider(step) {
+  currentStep = step;
+  selectedMultiwayNode = null;
+  selectedPath = null;
+  document.getElementById('step-display').textContent = step;
+  if (selectedEdges.length > 0) recomputeLineage();
+  if (_stepRafId !== null) cancelAnimationFrame(_stepRafId);
+  _stepRafId = requestAnimationFrame(() => { _stepRafId = null; renderCurrentView(); });
+}
+
 // =========================================================================
 // SPATIAL GRAPH
 // =========================================================================
@@ -299,9 +324,18 @@ function renderSpatial() {
     const svg = d3.select('#main-svg');
     svg.selectAll('*').remove();
     const rect = document.getElementById('canvas-area').getBoundingClientRect();
+    let msg;
+    if (!data) {
+      msg = 'Computing… (server is crunching the numbers)';
+    } else if (data._error) {
+      msg = 'Failed to load rule data: ' + (data._errorMsg || 'server error') +
+            ' — click the rule card to retry';
+    } else {
+      msg = 'No data at this step';
+    }
     svg.append('text').attr('x', rect.width/2).attr('y', rect.height/2)
-      .attr('text-anchor', 'middle').attr('fill', isDark ? '#666' : '#999')
-      .attr('font-size', 14).text(data ? 'No data at this step' : 'Computing... (server is crunching the numbers)');
+      .attr('text-anchor', 'middle').attr('fill', isDark ? '#e05050' : '#c03030')
+      .attr('font-size', data && data._error ? 13 : 14).text(msg);
     return;
   }
 
@@ -597,12 +631,24 @@ function renderCausal() {
   let allEvNodes = [];
   let allCausalEdges = [];
   let eventInfo = {};
+  // produced-edge lookup: JSON(edge) → [eventId, ...] — replaces the O(n²)
+  // inner scan when computing causal edges for alternative matches.
+  const producedEdgeIndex = new Map();
+
+  function _indexProduced(evId, produced) {
+    for (const e of (produced || [])) {
+      const k = JSON.stringify(e);
+      if (!producedEdgeIndex.has(k)) producedEdgeIndex.set(k, []);
+      producedEdgeIndex.get(k).push(evId);
+    }
+  }
 
   let greedyStep = 0;
   for (const stepEvents of (data.events || [])) {
     for (const ev of stepEvents) {
       allEvNodes.push({ id: ev.id, step: greedyStep, consumed: ev.consumed, produced: ev.produced, onPath: true });
       eventInfo[ev.id] = ev;
+      _indexProduced(ev.id, ev.produced);
     }
     greedyStep++;
   }
@@ -640,11 +686,14 @@ function renderCausal() {
         allEvNodes.push(node);
         eventInfo[altId] = node;
 
-        const cSet = new Set(consumed.map(e => JSON.stringify(e)));
-        for (const prev of allEvNodes) {
-          if (prev.id === altId || prev.step >= s) continue;
-          if ((prev.produced || []).some(e => cSet.has(JSON.stringify(e)))) {
-            allCausalEdges.push({ source: prev.id, target: altId });
+        // O(consumed_edges) lookup instead of O(all_events) scan
+        const seen = new Set();
+        for (const ce of consumed) {
+          for (const prevId of (producedEdgeIndex.get(JSON.stringify(ce)) || [])) {
+            if (!seen.has(prevId) && eventInfo[prevId] && eventInfo[prevId].step < s) {
+              seen.add(prevId);
+              allCausalEdges.push({ source: prevId, target: altId });
+            }
           }
         }
         altId++;
@@ -1291,7 +1340,9 @@ function renderMultiway() {
   const lg = g.append('g').attr('transform', `translate(${width - 180}, 20)`);
   lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');
   lg.append('text').attr('x', 10).attr('y', 4).attr('fill', isDark ? '#aaa' : '#555')
-    .attr('font-size', 11).text('Default path (greedy)');
+    .attr('font-size', 11).text('One possible history (greedy)')
+    .append('title').text('The greedy rewriting order is one of many valid orderings. ' +
+      'All branches are equally valid histories of the same rule.');
   lg.append('circle').attr('cx', 0).attr('cy', 20).attr('r', 5).attr('fill', '#44aaff');
   lg.append('text').attr('x', 10).attr('y', 24).attr('fill', isDark ? '#aaa' : '#555')
     .attr('font-size', 11).text('Selected path');
