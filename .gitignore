@@ -2,6 +2,7 @@
 *
 !.gitignore
 !Dockerfile
+!start.sh
 !zeabur.json
 
 # Server

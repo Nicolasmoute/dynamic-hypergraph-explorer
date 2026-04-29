@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server/ ./server/
 COPY client/ ./client/
+COPY start.sh ./
+RUN chmod +x start.sh
 
 # Pre-create the cache directory so a volume mount at /app/data works cleanly
 # even on first run.  The server also calls CACHE_DIR.mkdir(parents=True) at
@@ -15,5 +17,7 @@ RUN mkdir -p /app/data/cache
 
 EXPOSE 8080
 
-# Use $PORT if injected by the host (e.g. Zeabur), otherwise default to 8080.
-CMD ["sh", "-c", "python -m uvicorn server.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# start.sh prints diagnostic info before handing off to uvicorn — this makes
+# "no runtime logs" incidents triageable without platform dashboard access.
+# Uses $PORT if injected by the host (Zeabur), otherwise defaults to 8080.
+CMD ["./start.sh"]
