@@ -3,13 +3,17 @@
 // All heavy computation runs on the FastAPI server.
 // =========================================================================
 
-const BLURBS = {
-  rule1: 'Starting from two self-loops on a single node, this rule generates a hypergraph whose large-scale structure approximates continuous 2-dimensional space. The estimated dimension converges toward 2.0 as the graph grows. Each rule application finds two edges sharing a common source node and replaces them with four edges plus a fresh node \u2014 the fundamental act of "space creation."',
-  rule2: 'This rule finds any path of two consecutive edges (x\u2192y\u2192z) and subdivides it by inserting a fresh node w. Starting from a pentagon, it progressively refines the ring into a finer and finer circular mesh. The dimension converges to ~1.0, confirming it generates 1-dimensional space.',
-  rule3: 'The simplest non-trivial rule: every edge {x,y} keeps itself and adds a new edge {y,z} from its target to a fresh node. This produces a binary tree with perfect exponential doubling \u2014 2^n edges at step n. This rule illustrates how even the simplest rewriting generates complex structure from nothing.',
-  rule4: 'This rule operates on ternary hyperedges \u2014 relations connecting 3 nodes at once. Each hyperedge {x,y,z} is replaced by three new hyperedges, each introducing fresh nodes u, v, w. Starting from a single triangle-relation {0,1,2}, it generates a Sierpinski-like fractal with dimension converging to ~1.4. This demonstrates how hyperedges (not just binary edges) create fundamentally different spatial structures.',
-  rule5: 'This rule matches two ternary hyperedges linked end-to-start (the last node of the first equals the first node of the second). Both are consumed and replaced by three new hyperedges with a fresh node. Starting from an interlocking mesh of 8 ternary hyperedges, each step leaves 5\u201327% of edges unmatched \u2014 they survive with their birth-step color while the active portion reshapes. Demonstrates partial rewriting on a genuinely evolving hypergraph.',
-};
+// \u00a76.5 [M5] XSS guard \u2014 escape user-controlled strings before innerHTML injection
+function escHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// \u00a76.8 [L5] BLURBS removed \u2014 rule descriptions now come from server /api/rules blurb field
 
 let RULES = [];        // [{id, name, notation, desc, tag, tagClass}]
 let DATA = {};         // ruleId -> {states, events, causal_edges, stats, lineage, birthSteps}
@@ -19,6 +23,7 @@ let currentStep = 0;
 let currentView = 'spatial';
 let playing = false;
 let playTimer = null;
+let playIntervalMs = 1200; // §6.9 [L6] configurable play speed (50–5000 ms)
 let simulation = null;
 let isDark = true;
 
@@ -78,10 +83,20 @@ function toggleTheme() {
 // =========================================================================
 // API helpers
 // =========================================================================
-async function apiFetch(path) {
-  const resp = await fetch(path);
-  if (!resp.ok) throw new Error(`API error ${resp.status}: ${await resp.text()}`);
-  return resp.json();
+// §6.10 [L7] AbortController timeout on apiFetch (30 s default)
+async function apiFetch(path, timeoutMs = 30000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(path, { signal: ctrl.signal });
+    if (!resp.ok) throw new Error(`API error ${resp.status}: ${await resp.text()}`);
+    return resp.json();
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs / 1000}s — click the rule card to retry`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // =========================================================================
@@ -206,13 +221,14 @@ function clearLineage() {
 // =========================================================================
 function renderRuleCards() {
   const container = document.getElementById('rule-cards');
+  // §6.5 [M5] Use escHtml for all user-controlled fields to prevent XSS
   container.innerHTML = RULES.map(r => `
-    <div class="rule-card ${r.id === activeRule ? 'active' : ''}" id="card-${r.id}" onclick="selectRule('${r.id}')">
-      ${r.isCustom ? '<button class="remove-custom" onclick="event.stopPropagation(); removeCustomRule(\'' + r.id + '\')" title="Remove">&times;</button>' : ''}
-      <div class="rule-name">${r.name}</div>
-      <div class="rule-notation">${r.notation}</div>
-      <div class="rule-desc">${r.desc}</div>
-      <span class="rule-tag ${r.tagClass}">${r.tag}</span>
+    <div class="rule-card ${r.id === activeRule ? 'active' : ''}" id="card-${escHtml(r.id)}" onclick="selectRule(${JSON.stringify(r.id)})">
+      ${r.isCustom ? `<button class="remove-custom" onclick="event.stopPropagation(); removeCustomRule(${JSON.stringify(r.id)})" title="Remove">&times;</button>` : ''}
+      <div class="rule-name">${escHtml(r.name)}</div>
+      <div class="rule-notation">${escHtml(r.notation)}</div>
+      <div class="rule-desc">${escHtml(r.desc)}</div>
+      <span class="rule-tag ${escHtml(r.tagClass)}">${escHtml(r.tag)}</span>
     </div>
   `).join('');
 }
@@ -252,7 +268,9 @@ function selectRule(ruleId) {
   slider.value = Math.min(currentStep, maxStep);
   currentStep = +slider.value;
 
-  const blurb = BLURBS[ruleId] || (data._blurb || '');
+  // §6.8 [L5] Blurb comes from server /api/rules; custom rules store it in the rule object
+  const rule = RULES.find(r => r.id === ruleId);
+  const blurb = (rule && rule.blurb) || (data && data._blurb) || '';
   document.getElementById('theory-blurb').textContent = blurb;
   selectedMultiwayNode = null;
   selectedPath = null;
@@ -800,18 +818,19 @@ function renderGrowthAnalysis() {
   const stats = data.stats || [];
   const rule = RULES.find(r => r.id === activeRule);
 
+  // §6.5 [M5] Rule name/notation escaped; stats are numeric (safe)
   container.innerHTML = `
     <div style="max-width: 800px; margin: 0 auto;">
-      <h2 style="font-size: 18px; font-weight: 600; color: var(--text-heading); margin-bottom: 4px;">${rule ? rule.name : activeRule}</h2>
-      <p style="font-family: JetBrains Mono, monospace; font-size: 12px; color: var(--accent); margin-bottom: 24px;">${rule ? rule.notation : ''}</p>
+      <h2 style="font-size: 18px; font-weight: 600; color: var(--text-heading); margin-bottom: 4px;">${escHtml(rule ? rule.name : activeRule)}</h2>
+      <p style="font-family: JetBrains Mono, monospace; font-size: 12px; color: var(--accent); margin-bottom: 24px;">${escHtml(rule ? rule.notation : '')}</p>
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px;">
         <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px;">
-          <h4 style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px;">Node & Edge Growth</h4>
-          <canvas id="chart-growth" width="340" height="180"></canvas>
+          <h4 style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px;">Node &amp; Edge Growth</h4>
+          <canvas id="chart-growth" style="width:100%; height:180px; display:block;"></canvas>
         </div>
         <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px;">
           <h4 style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px;">Dimension Estimate</h4>
-          <canvas id="chart-dim" width="340" height="180"></canvas>
+          <canvas id="chart-dim" style="width:100%; height:180px; display:block;"></canvas>
         </div>
       </div>
       <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px;">
@@ -841,23 +860,49 @@ function renderGrowthAnalysis() {
     </div>
   `;
 
-  drawLineChart('chart-growth', stats.filter(s => s.num_nodes !== undefined), [
-    { key: 'num_nodes', color: '#6c7bff', label: 'Nodes' },
-    { key: 'num_edges', color: '#ff6b9d', label: 'Edges' }
-  ]);
+  const growthStats = stats.filter(s => s.num_nodes !== undefined);
   const dimStats = stats.filter(s => s.estimated_dimension != null);
-  if (dimStats.length > 0) {
-    drawLineChart('chart-dim', dimStats, [
-      { key: 'estimated_dimension', color: '#4cdd8a', label: 'Dimension' }
-    ], true);
+
+  function redrawCharts() {
+    drawLineChart('chart-growth', growthStats, [
+      { key: 'num_nodes', color: '#6c7bff', label: 'Nodes' },
+      { key: 'num_edges', color: '#ff6b9d', label: 'Edges' }
+    ]);
+    if (dimStats.length > 0) {
+      drawLineChart('chart-dim', dimStats, [
+        { key: 'estimated_dimension', color: '#4cdd8a', label: 'Dimension' }
+      ], true);
+    }
   }
+  redrawCharts();
+
+  // §6.7 [L3/L4] ResizeObserver: re-draw charts when container resizes
+  if (_growthResizeObs) _growthResizeObs.disconnect();
+  _growthResizeObs = new ResizeObserver(() => {
+    if (currentView === 'growth') redrawCharts();
+  });
+  _growthResizeObs.observe(container);
 }
+
+// §6.7 [L3/L4] ResizeObserver instance for growth-view charts
+let _growthResizeObs = null;
 
 function drawLineChart(canvasId, data, series, fixedRange) {
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
+
+  // §6.7 [L3/L4] HiDPI: scale canvas by devicePixelRatio for crisp rendering
+  const dpr = window.devicePixelRatio || 1;
+  const logicalW = canvas.offsetWidth || 340;
+  const logicalH = canvas.offsetHeight || 180;
+  canvas.width = Math.round(logicalW * dpr);
+  canvas.height = Math.round(logicalH * dpr);
+  canvas.style.width = logicalW + 'px';
+  canvas.style.height = logicalH + 'px';
+
   const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
+  ctx.scale(dpr, dpr);
+  const W = logicalW, H = logicalH;
   const pad = { top: 20, right: 16, bottom: 24, left: 48 };
   const cw = W - pad.left - pad.right;
   const ch = H - pad.top - pad.bottom;
@@ -971,10 +1016,26 @@ function togglePlay() {
       const max = (data.states || []).length - 1;
       if (currentStep >= max) { togglePlay(); return; }
       setStep(currentStep + 1);
-    }, 1200);
+    }, playIntervalMs); // §6.9 [L6] uses configurable interval
   } else {
     btn.innerHTML = '&#9654;';
     clearInterval(playTimer);
+  }
+}
+
+// §6.9 [L6] Play-speed slider handler (50–5000 ms)
+function setPlaySpeed(ms) {
+  playIntervalMs = ms;
+  const display = document.getElementById('speed-display');
+  if (display) display.textContent = ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+  if (playing) {
+    clearInterval(playTimer);
+    playTimer = setInterval(() => {
+      const data = DATA[activeRule];
+      const max = (data.states || []).length - 1;
+      if (currentStep >= max) { togglePlay(); return; }
+      setStep(currentStep + 1);
+    }, playIntervalMs);
   }
 }
 
@@ -1139,6 +1200,7 @@ async function runCustomRule() {
     }
 
     const finalNodes = result.stats[result.stats.length - 1].num_nodes;
+    const finalEdges = result.stats[result.stats.length - 1].num_edges;
     RULES.push({
       id: ruleId,
       name: 'Custom #' + customRuleCounter,
@@ -1146,8 +1208,9 @@ async function runCustomRule() {
       desc: finalNodes + ' nodes at step ' + steps,
       tag: 'Custom', tagClass: 'tag-custom',
       isCustom: true,
+      // §6.8 [L5] blurb stored in rule object; no longer uses BLURBS constant
+      blurb: 'Custom rule: ' + notation + '. Evolved for ' + steps + ' steps. Final graph: ' + finalNodes + ' nodes, ' + finalEdges + ' edges.',
     });
-    BLURBS[ruleId] = 'Custom rule: ' + notation + '. Evolved for ' + steps + ' steps. Final graph: ' + finalNodes + ' nodes, ' + result.stats[result.stats.length-1].num_edges + ' edges.';
 
     renderRuleCards();
     selectRule(ruleId);
