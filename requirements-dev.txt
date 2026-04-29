@@ -2,3 +2,7 @@
 # Install with: pip install -r requirements-dev.txt
 pytest>=8.0.0
 httpx>=0.27.0      # required by Starlette TestClient (>= 0.20)
+
+# Browser smoke tests (§7.2) — also run: playwright install chromium
+pytest-playwright>=0.5.0
+playwright>=1.44.0
