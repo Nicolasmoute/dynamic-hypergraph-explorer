@@ -8,6 +8,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server/ ./server/
 COPY client/ ./client/
 
+# Pre-create the cache directory so a volume mount at /app/data works cleanly
+# even on first run.  The server also calls CACHE_DIR.mkdir(parents=True) at
+# startup, but creating it here means the mount-point exists in the image layer.
+RUN mkdir -p /app/data/cache
+
 EXPOSE 8080
 
 # Use $PORT if injected by the host (e.g. Zeabur), otherwise default to 8080.

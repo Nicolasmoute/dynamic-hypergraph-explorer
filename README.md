@@ -68,9 +68,11 @@ pytest
 
 | File | What it covers | Count |
 |------|---------------|-------|
-| `tests/test_engine.py` | Engine unit tests (parse, match, evolve, lineage, hash, dimension) | 35 |
-| `tests/test_api.py`    | FastAPI endpoint integration tests (all routes + error paths) | 21 |
-| `tests/test_smoke.py`  | Serving-layer smoke tests (MIME types, /health, rules list) | 12 |
+| `tests/test_engine.py`       | Engine unit tests (parse, match, evolve, lineage, hash, dimension) | 35 |
+| `tests/test_api.py`          | FastAPI endpoint integration tests (all routes + error paths) | 21 |
+| `tests/test_smoke.py`        | Serving-layer smoke tests (MIME types, /health, rules list) | 12 |
+| `tests/test_dimension.py`    | Dimension estimation correctness (incidence-BFS metric) | 6 |
+| `tests/test_browser_smoke.py`| Playwright E2E browser tests — skipped by default; `--run-slow` to enable | 3 |
 
 ---
 
@@ -103,10 +105,31 @@ restarts — use **Recent rules** to recall without recomputation.
 ## Deploy (Zeabur)
 
 Push to `main`. Zeabur auto-builds from `Dockerfile` and injects `$PORT`
-at runtime (defaults to 8080 if unset). Configure a persistent volume
-on `data/` in the Zeabur service settings so the cache survives deploys.
+at runtime (defaults to 8080 if unset).
 
-Full deploy checklist: `knowledge/devx/deploy-verification-plan.md`
+### Persistent cache volume (required)
+
+The server caches computed results under `/app/data/cache/v2/`. Without a
+persistent volume this directory is lost on every deploy restart. Configure it
+once in the Zeabur dashboard:
+
+1. Open your service → **Storage** tab → **Add Volume**.
+2. Set **Mount path** to `/app/data`.
+3. Zeabur assigns a volume ID automatically — save it.
+
+From that point on, the cache survives container restarts and new deploys.
+
+### Optional environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DH_CACHE_DIR` | `./data/cache` | Override cache root path |
+| `DH_CORS_ORIGINS` | `*` | Comma-separated allowed origins (set to your Zeabur domain in production, e.g. `https://your-app.zeabur.app`) |
+| `DH_MULTIWAY_MAX_STEPS` | `4` | Multiway computation step limit |
+| `DH_MULTIWAY_MAX_STATES` | `300` | Multiway state count limit |
+| `DH_MULTIWAY_MAX_TIME_MS` | `3000` | Multiway time limit (ms) |
+
+Full deploy verification checklist: `knowledge/devx/deploy-verification-plan.md`
 
 ---
 
