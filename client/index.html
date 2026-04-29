@@ -338,6 +338,14 @@
         <span class="step-value" id="step-display">0</span>
         <button class="play-btn" style="width:26px;height:26px;font-size:16px;font-weight:700;" onclick="stepPlus1()">+</button>
       </div>
+      <!-- §6.9 [L6] Play-speed slider: 50 ms (fast) to 5000 ms (slow), default 1200 ms -->
+      <div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+        <label style="font-size:10px; color:var(--text-dim); white-space:nowrap;">Speed</label>
+        <input type="range" id="speed-slider" min="50" max="5000" step="50" value="1200"
+          oninput="setPlaySpeed(+this.value)"
+          style="flex:1; accent-color:var(--accent); -webkit-appearance:none; height:4px; border-radius:2px; background:var(--border);">
+        <span style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--text-dim); min-width:36px; text-align:right;" id="speed-display">1.2s</span>
+      </div>
     </div>
     <div class="sidebar-section">
       <h3>Statistics</h3>
