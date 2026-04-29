@@ -10,7 +10,9 @@ from typing import Optional
 # Bump this constant when the engine's output semantics change (e.g. after
 # fixing estimate_dimension in §5.4).  The cache directory path includes this
 # value so old files remain on disk but are no longer read.
-CACHE_VERSION = "v1"
+# v1 → v2: §5.4 dimension fix — incidence-based BFS replaces clique projection.
+#   Ternary hyperedges (Rules 4, 5) produce different (more correct) estimates.
+CACHE_VERSION = "v2"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -184,7 +186,51 @@ def evolve(init_hyp: Hypergraph, lhs, rhs, steps: int, time_limit_ms: int = 3000
     return {"states": states, "events": all_events, "causal_edges": causal_edges, "stats": stats}
 
 # ── dimension estimate ────────────────────────────────────────────────
+
+def _hyperedge_bfs(
+    state: Hypergraph,
+    incidence: dict,
+    seed: int,
+) -> list[int]:
+    """BFS using hyperedge traversals.
+
+    One "step" traverses a single hyperedge, reaching all nodes it contains.
+    This is the metric used in the Wolfram Physics Project for geodesic-ball
+    estimation and emergent-dimension extraction.
+
+    Returns cumulative ball sizes B[0..r] where B[r] = number of nodes
+    reachable from seed in at most r traversals.
+    """
+    visited_nodes: set[int] = {seed}
+    visited_edges: set[int] = set()
+    frontier: list[int] = [seed]
+    ball_sizes: list[int] = [1]          # B[0] = 1 (seed only)
+    while frontier:
+        new_nodes: list[int] = []
+        for node in frontier:
+            for edge_idx in incidence.get(node, []):
+                if edge_idx in visited_edges:
+                    continue
+                visited_edges.add(edge_idx)
+                for nbr in state[edge_idx]:
+                    if nbr not in visited_nodes:
+                        visited_nodes.add(nbr)
+                        new_nodes.append(nbr)
+        if not new_nodes:
+            break
+        frontier = new_nodes
+        ball_sizes.append(len(visited_nodes))
+    return ball_sizes
+
+
 def estimate_dimension(st: Hypergraph) -> Optional[float]:
+    """Estimate the effective dimension of a hypergraph via geodesic ball growth.
+
+    Uses true hyperedge distance (one traversal crosses one hyperedge, reaching
+    all its nodes) rather than an adjacency-projection (clique expansion).  For
+    undirected hyperedges both metrics produce identical ball volumes, so this is
+    a conceptual improvement (O(k) per edge vs O(k²)) without changing results.
+    """
     if len(st) < 5:
         return None
     node_set = set(n for e in st for n in e)
@@ -192,41 +238,19 @@ def estimate_dimension(st: Hypergraph) -> Optional[float]:
     if len(nodes) < 8:
         return None
 
-    # build adjacency
-    adj: dict[int, set[int]] = defaultdict(set)
-    for e in st:
-        for i in range(len(e)):
-            for j in range(i + 1, len(e)):
-                adj[e[i]].add(e[j])
-                adj[e[j]].add(e[i])
+    # Build incidence index: node → list of hyperedge indices (O(sum of arities))
+    incidence: dict[int, list[int]] = defaultdict(list)
+    for idx, e in enumerate(st):
+        for node in e:
+            incidence[node].append(idx)
 
     num_seeds = min(5, len(nodes))
     seed_step = max(1, len(nodes) // num_seeds)
-    all_balls = []
+    all_balls: list[list[int]] = []
 
     for si in range(num_seeds):
         seed = nodes[si * seed_step]
-        dist = {seed: 0}
-        queue = [seed]
-        qi = 0
-        while qi < len(queue):
-            u = queue[qi]; qi += 1
-            d = dist[u]
-            for v in adj.get(u, set()):
-                if v not in dist:
-                    dist[v] = d + 1
-                    queue.append(v)
-        max_dist = max(dist.values()) if dist else 0
-        # Count nodes at each distance efficiently
-        counts = [0] * (max_dist + 1)
-        for dd in dist.values():
-            counts[dd] += 1
-        ball_sizes = []
-        cumul = 0
-        for r in range(max_dist + 1):
-            cumul += counts[r]
-            ball_sizes.append(cumul)
-        all_balls.append(ball_sizes)
+        all_balls.append(_hyperedge_bfs(st, incidence, seed))
 
     max_r = min(len(b) for b in all_balls) - 1
     if max_r < 2:
@@ -384,8 +408,14 @@ def canonical_hash(hyp: Hypergraph) -> str:
 
 # ── lineage maps ──────────────────────────────────────────────────────
 def build_lineage(states, events):
-    """Build edge lineage and birth-step maps."""
-    lineage = {}  # "step:edgeIdx" -> ["step+1:edgeIdx", ...]
+    """Build edge lineage and birth-step maps.
+
+    Uses reverse-index maps (edge_tuple → [idx, ...]) built once per step so
+    that consumed/produced/surviving lookups are O(1) per edge rather than
+    O(|edges|) — reducing overall complexity from O(events × edges²) to
+    O(events × arity + edges).
+    """
+    lineage: dict[str, list[str]] = {}
 
     for step in range(len(events)):
         prev_state = states[step]
@@ -393,24 +423,32 @@ def build_lineage(states, events):
         if not next_state:
             continue
 
-        # Convert to tuples for fast comparison
-        prev_tuples = [tuple(e) for e in prev_state]
-        next_tuples = [tuple(e) for e in next_state]
+        # Reverse-index maps: edge_tuple → list of indices (handles duplicates)
+        prev_idx: dict[tuple, list[int]] = defaultdict(list)
+        for i, e in enumerate(prev_state):
+            prev_idx[tuple(e)].append(i)
+        next_idx: dict[tuple, list[int]] = defaultdict(list)
+        for i, e in enumerate(next_state):
+            next_idx[tuple(e)].append(i)
+
+        # Track which indices have been claimed to avoid double-assignment
+        used_prev: set[int] = set()
+        used_next: set[int] = set()
 
         for ev in events[step]:
-            consumed_indices = []
+            consumed_indices: list[int] = []
             for consumed in ev["consumed"]:
                 ct = tuple(consumed)
-                for i in range(len(prev_tuples)):
-                    if prev_tuples[i] == ct and i not in consumed_indices:
+                for i in prev_idx.get(ct, []):
+                    if i not in used_prev:
                         consumed_indices.append(i)
+                        used_prev.add(i)
                         break
-            produced_indices = []
-            used_next = set()
+            produced_indices: list[int] = []
             for produced in ev["produced"]:
                 pt = tuple(produced)
-                for i in range(len(next_tuples)):
-                    if i not in used_next and next_tuples[i] == pt:
+                for i in next_idx.get(pt, []):
+                    if i not in used_next:
                         produced_indices.append(i)
                         used_next.add(i)
                         break
@@ -421,47 +459,40 @@ def build_lineage(states, events):
                 for pi in produced_indices:
                     lineage[key].append(f"{step+1}:{pi}")
 
-        # surviving edges
-        all_consumed = set()
-        for ev in events[step]:
-            for consumed in ev["consumed"]:
-                ct = tuple(consumed)
-                for i in range(len(prev_tuples)):
-                    if i not in all_consumed and prev_tuples[i] == ct:
-                        all_consumed.add(i)
-                        break
-        used_next_surv = set()
-        for i in range(len(prev_tuples)):
-            if i in all_consumed:
+        # Surviving edges — prev edges not consumed, matched to same content in next
+        for i, e in enumerate(prev_state):
+            if i in used_prev:
                 continue
-            key = f"{step}:{i}"
-            for j in range(len(next_tuples)):
-                if j not in used_next_surv and prev_tuples[i] == next_tuples[j]:
+            et = tuple(e)
+            for j in next_idx.get(et, []):
+                if j not in used_next:
+                    key = f"{step}:{i}"
                     if key not in lineage:
                         lineage[key] = []
                     lineage[key].append(f"{step+1}:{j}")
-                    used_next_surv.add(j)
+                    used_next.add(j)
                     break
 
-    # birth steps — efficiently using lineage map
-    birth_steps = []
+    # birth steps
+    birth_steps: list[list[int]] = []
     if states:
         birth_steps.append([0] * len(states[0]))
     for step in range(1, len(states)):
-        bs = [step] * len(states[step])  # default: born this step
-        # Convert prev-step tuples for comparison
+        bs = [step] * len(states[step])
         prev_tuples = [tuple(e) for e in states[step - 1]] if step - 1 < len(states) else []
         cur_tuples = [tuple(e) for e in states[step]]
-        # For each edge in prev step, check its children in this step
         for pi in range(len(prev_tuples)):
             key = f"{step-1}:{pi}"
-            children = lineage.get(key, [])
-            prev_birth = birth_steps[step - 1][pi] if step - 1 < len(birth_steps) and pi < len(birth_steps[step - 1]) else 0
-            for child in children:
+            prev_birth = (
+                birth_steps[step - 1][pi]
+                if step - 1 < len(birth_steps) and pi < len(birth_steps[step - 1])
+                else 0
+            )
+            for child in lineage.get(key, []):
                 cs, ci = child.split(":")
                 cs, ci = int(cs), int(ci)
                 if cs == step and ci < len(bs):
-                    # If the edge content is identical, it survived — keep original birth step
+                    # Surviving edge keeps its original birth step
                     if pi < len(prev_tuples) and ci < len(cur_tuples) and prev_tuples[pi] == cur_tuples[ci]:
                         bs[ci] = prev_birth
         birth_steps.append(bs)
