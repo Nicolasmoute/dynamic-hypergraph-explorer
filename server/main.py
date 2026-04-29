@@ -2,6 +2,7 @@
 from __future__ import annotations
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -16,6 +17,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from server import engine
+
+# ── Logging setup ─────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("dh.server")
 
 # ── Process metadata (captured once at import time) ───────────────────
 _START_TIME: float = _time.time()
@@ -34,12 +42,24 @@ def _git_sha() -> str:
 _VERSION: str = _git_sha()
 
 # ── Persistent cache configuration ───────────────────────────────────
-# Cache root is configurable via env var DH_CACHE_DIR (default ./data/cache).
-# The actual cache directory includes the engine CACHE_VERSION so that bumping
-# the version in engine.py automatically routes new writes to a fresh directory
-# while old files remain intact under the previous version path.
+# Cache root: $DH_CACHE_DIR/v<CACHE_VERSION>/ (default ./data/cache/v1/).
+# Bump engine.CACHE_VERSION when engine output semantics change; the new
+# directory is created automatically; old data stays under the old path.
 _CACHE_ROOT: Path = Path(os.environ.get("DH_CACHE_DIR", "./data/cache"))
 CACHE_DIR: Path = _CACHE_ROOT / engine.CACHE_VERSION
+
+# ── Multiway limits (§5.1) ────────────────────────────────────────────
+# Override via env vars; documented defaults match the original hard-codes.
+_MW_MAX_STEPS: int = int(os.environ.get("DH_MULTIWAY_MAX_STEPS", "4"))
+_MW_MAX_STATES: int = int(os.environ.get("DH_MULTIWAY_MAX_STATES", "300"))
+_MW_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_MAX_TIME_MS", "3000"))
+
+# ── CORS (§5.5) ───────────────────────────────────────────────────────
+# Production recommendation: set DH_CORS_ORIGINS to your Zeabur domain,
+# e.g. "https://dynamic-hypergraph.zeabur.app".  Defaults to "*" for dev.
+_CORS_ORIGINS: list[str] = [
+    o.strip() for o in os.environ.get("DH_CORS_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
 
 # ── Preloaded rules ───────────────────────────────────────────────────
 RULES = [
@@ -120,6 +140,7 @@ def _disk_write(key: str, data: dict) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, separators=(",", ":")))
     os.replace(tmp, p)
+    logger.debug("cache write key=%s path=%s", key, p)
 
 
 def _disk_read(key: str) -> dict | None:
@@ -127,9 +148,13 @@ def _disk_read(key: str) -> dict | None:
     p = _disk_path(key)
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
+            logger.debug("cache hit (disk) key=%s", key)
+            return data
         except (json.JSONDecodeError, OSError):
+            logger.warning("cache corrupt key=%s path=%s — will recompute", key, p)
             return None
+    logger.debug("cache miss key=%s", key)
     return None
 
 
@@ -148,6 +173,7 @@ def get_rule_data(rule_id: str) -> dict:
     Read order: in-memory CACHE → disk JSON → recompute (then persist).
     """
     if rule_id in CACHE:
+        logger.debug("cache hit (memory) key=%s", rule_id)
         return CACHE[rule_id]
 
     lock = _get_lock(rule_id)
@@ -166,6 +192,7 @@ def get_rule_data(rule_id: str) -> dict:
         if not rule:
             raise HTTPException(404, f"Rule {rule_id} not found")
 
+        logger.info("computing rule_id=%s steps=%d", rule_id, rule["steps"])
         parsed = engine.parse_notation(rule["notation"])
         if not parsed:
             raise HTTPException(400, f"Cannot parse notation for {rule_id}")
@@ -183,6 +210,7 @@ def get_rule_data(rule_id: str) -> dict:
         }
         _disk_write(rule_id, data)
         CACHE[rule_id] = data
+        logger.info("computed rule_id=%s states=%d", rule_id, len(data["states"]))
         return data
 
 
@@ -193,6 +221,7 @@ def get_multiway(rule_id: str) -> dict:
     """
     cache_key = f"{rule_id}_multiway"
     if cache_key in CACHE:
+        logger.debug("cache hit (memory) key=%s", cache_key)
         return CACHE[cache_key]
 
     lock = _get_lock(cache_key)
@@ -211,10 +240,17 @@ def get_multiway(rule_id: str) -> dict:
         if not rule:
             raise HTTPException(404, f"Rule {rule_id} not found")
 
+        logger.info("computing multiway rule_id=%s", rule_id)
         parsed = engine.parse_notation(rule["notation"])
-        result = engine.compute_multiway(rule["init"], parsed["lhs"], parsed["rhs"])
+        result = engine.compute_multiway(
+            rule["init"], parsed["lhs"], parsed["rhs"],
+            max_steps=_MW_MAX_STEPS,
+            max_states=_MW_MAX_STATES,
+            max_time_ms=_MW_MAX_TIME_MS,
+        )
         _disk_write(cache_key, result)
         CACHE[cache_key] = result
+        logger.info("computed multiway rule_id=%s states=%d", rule_id, len(result.get("states", {})))
         return result
 
 
@@ -233,7 +269,7 @@ def _preload_disk_cache() -> int:
                 CACHE[key] = json.loads(p.read_text())
                 count += 1
             except (json.JSONDecodeError, OSError):
-                pass
+                logger.warning("skipping corrupt cache file path=%s", p)
     return count
 
 
@@ -243,31 +279,36 @@ def _preload_disk_cache() -> int:
 async def lifespan(app: FastAPI):
     """Pre-load disk cache then fill any missing entries in a background thread."""
     loaded = _preload_disk_cache()
-    print(f"Loaded {loaded} rule(s) from disk cache (CACHE_DIR={CACHE_DIR})")
+    logger.info("startup: loaded %d rule(s) from disk cache (CACHE_DIR=%s)", loaded, CACHE_DIR)
 
     def _precompute():
         for r in RULES:
-            print(f"Precomputing {r['id']}...")
+            logger.info("precompute start rule_id=%s", r["id"])
             try:
                 get_rule_data(r["id"])
-                print(f"  {r['id']} done: {len(CACHE[r['id']]['states'])} states")
+                logger.info("precompute done rule_id=%s states=%d", r["id"], len(CACHE[r["id"]]["states"]))
             except Exception as e:
-                print(f"  {r['id']} failed: {e}")
+                logger.error("precompute failed rule_id=%s error=%s", r["id"], e)
         for r in RULES:
-            print(f"Computing multiway for {r['id']}...")
+            logger.info("precompute multiway start rule_id=%s", r["id"])
             try:
                 get_multiway(r["id"])
-                print(f"  {r['id']} multiway done")
+                logger.info("precompute multiway done rule_id=%s", r["id"])
             except Exception as e:
-                print(f"  {r['id']} multiway failed: {e}")
-        print("All rules precomputed!")
+                logger.error("precompute multiway failed rule_id=%s error=%s", r["id"], e)
+        logger.info("precompute complete: all rules ready")
 
     threading.Thread(target=_precompute, daemon=True).start()
     yield
 
 
 app = FastAPI(title="Dynamic Hypergraph Explorer", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── API endpoints ─────────────────────────────────────────────────────
 
@@ -380,6 +421,7 @@ def run_custom_rule(req: CustomRuleRequest):
 
     # Serve from memory or disk if already computed
     if key in CACHE:
+        logger.debug("cache hit (memory) key=%s", key)
         return {"key": key, **CACHE[key]}
     disk = _disk_read(key)
     if disk is not None:
@@ -387,9 +429,15 @@ def run_custom_rule(req: CustomRuleRequest):
         return {"key": key, **disk}
 
     # Compute
+    logger.info("computing custom rule key=%s notation=%r steps=%d", key, req.notation, req.steps)
     result = engine.evolve(req.init, parsed["lhs"], parsed["rhs"], req.steps, time_limit_ms=time_limit_ms)
     lineage, birth_steps = engine.build_lineage(result["states"], result["events"])
-    multiway = engine.compute_multiway(req.init, parsed["lhs"], parsed["rhs"])
+    multiway = engine.compute_multiway(
+        req.init, parsed["lhs"], parsed["rhs"],
+        max_steps=_MW_MAX_STEPS,
+        max_states=_MW_MAX_STATES,
+        max_time_ms=_MW_MAX_TIME_MS,
+    )
 
     payload = {
         "states": result["states"],
@@ -409,6 +457,7 @@ def run_custom_rule(req: CustomRuleRequest):
     }
     _disk_write(key, payload)
     CACHE[key] = payload
+    logger.info("computed custom rule key=%s states=%d", key, len(payload["states"]))
 
     return {"key": key, **payload}
 
@@ -420,6 +469,7 @@ def recall_custom_rule(key: str):
     Does not recompute; 404 if the key is not in the cache.
     """
     if key in CACHE:
+        logger.debug("cache hit (memory) key=%s", key)
         return {"key": key, **CACHE[key]}
     disk = _disk_read(key)
     if disk is not None:
