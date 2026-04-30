@@ -188,6 +188,12 @@
   .canvas-area { flex: 1; position: relative; overflow: hidden; }
   .canvas-area svg { width: 100%; height: 100%; }
 
+  /* Force-layout control sliders */
+  .fp-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .fp-row label { font-size: 10px; color: var(--text-dim); white-space: nowrap; width: 58px; }
+  .fp-row input[type=range] { flex: 1; accent-color: var(--accent); -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); }
+  .fp-val { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-dim); min-width: 32px; text-align: right; }
+
   /* Compute loading overlay */
   #compute-overlay {
     position: absolute; inset: 0; display: none; pointer-events: none;
@@ -404,6 +410,28 @@
       <div class="option-row"><label>Hyperedge hulls</label><button class="toggle on" id="toggle-hulls" onclick="toggleOption('hulls')"></button></div>
       <div class="option-row"><label>Nudge mode</label><button class="toggle" id="toggle-nudge" onclick="toggleOption('nudge')"></button></div>
       <div style="font-size:10px; color:var(--text-dim); margin-top:4px; line-height:1.5;" id="nudge-hint" hidden>Click &amp; drag on empty space to push nearby nodes around</div>
+    </div>
+    <div class="sidebar-section">
+      <h3>Force Layout</h3>
+      <div class="fp-row">
+        <label>Link dist</label>
+        <input type="range" id="fp-dist" min="0.25" max="4" step="0.05" value="1"
+          oninput="setForceParam('linkDistMult', +this.value)">
+        <span class="fp-val" id="fp-dist-val">1.00</span>
+      </div>
+      <div class="fp-row">
+        <label>Repulsion</label>
+        <input type="range" id="fp-charge" min="0.25" max="4" step="0.05" value="1"
+          oninput="setForceParam('chargeMult', +this.value)">
+        <span class="fp-val" id="fp-charge-val">1.00</span>
+      </div>
+      <div class="fp-row">
+        <label>Link stiff</label>
+        <input type="range" id="fp-strength" min="0.05" max="1" step="0.05" value="0.3"
+          oninput="setForceParam('linkStrength', +this.value)">
+        <span class="fp-val" id="fp-strength-val">0.30</span>
+      </div>
+      <button class="editor-btn" style="margin-top:4px;" onclick="resetForceParams()">Reset defaults</button>
     </div>
     <div class="sidebar-section" style="border-bottom: none;">
       <h3>About This Rule</h3>

@@ -76,6 +76,37 @@ function retryActiveRule() {
 // promise-based delay
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Force-layout live controls ─────────────────────────────────────────────
+function applyForceParams() {
+  if (!simulation) return;
+  const n = Math.max(simulation.nodes().length, 1);
+  const baseDist = 20 + 200 / Math.sqrt(n);
+  simulation.force('link')
+    .distance(d => ((selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? baseDist * 0.2 : baseDist) * forceParams.linkDistMult)
+    .strength(d => (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? 1.0 : forceParams.linkStrength);
+  simulation.force('charge')
+    .strength((-30 - 2000 / n) * forceParams.chargeMult);
+  simulation.alpha(0.3).restart();
+}
+function setForceParam(key, val) {
+  forceParams[key] = val;
+  const labels = { linkDistMult: 'fp-dist-val', chargeMult: 'fp-charge-val', linkStrength: 'fp-strength-val' };
+  const el = document.getElementById(labels[key]);
+  if (el) el.textContent = val.toFixed(2);
+  applyForceParams();
+}
+function resetForceParams() {
+  forceParams = { linkDistMult: 1.0, chargeMult: 1.0, linkStrength: 0.3 };
+  const map = { 'fp-dist': 1, 'fp-charge': 1, 'fp-strength': 0.3,
+                'fp-dist-val': '1.00', 'fp-charge-val': '1.00', 'fp-strength-val': '0.30' };
+  Object.entries(map).forEach(([id, v]) => {
+    const el = document.getElementById(id);
+    if (el) typeof v === 'string' ? (el.textContent = v) : (el.value = v);
+  });
+  applyForceParams();
+}
+// ──────────────────────────────────────────────────────────────────────────
+
 // Poll GET /api/jobs/{job_id} every 2s (Ada's contract, t-2026-04-30-b365ed66).
 // Calls onProgress(poll) on each response. Returns terminal response
 // (status = done | failed | stale). Network errors are retried silently.
@@ -94,6 +125,9 @@ async function pollJobUntilDone(jobId, onProgress) {
 }
 let simulation = null;
 let isDark = true;
+
+// Force-layout user controls (live-adjustable via sidebar sliders)
+let forceParams = { linkDistMult: 1.0, chargeMult: 1.0, linkStrength: 0.3 };
 
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
@@ -646,9 +680,9 @@ function renderSpatial() {
   const baseDist = 20 + 200/Math.sqrt(nodes.length);
   simulation = d3.forceSimulation(nodes)
     .force('link', d3.forceLink(links).id(d => d.id)
-      .distance(d => (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? baseDist * 0.2 : baseDist)
-      .strength(d => (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? 1.0 : 0.3))
-    .force('charge', d3.forceManyBody().strength(-30 - 2000/nodes.length).distanceMax(300))
+      .distance(d => ((selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? baseDist * 0.2 : baseDist) * forceParams.linkDistMult)
+      .strength(d => (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? 1.0 : forceParams.linkStrength))
+    .force('charge', d3.forceManyBody().strength((-30 - 2000/nodes.length) * forceParams.chargeMult).distanceMax(300))
     .force('center', d3.forceCenter(width/2, height/2))
     .force('collision', d3.forceCollide(nodeR + 0.5))
     .on('tick', () => {
