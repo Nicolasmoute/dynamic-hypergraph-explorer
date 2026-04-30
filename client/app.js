@@ -111,10 +111,9 @@ function resetForceParams() {
 function updateExtendRow() {
   const row = document.getElementById('extend-row');
   if (!row) return;
-  // Extend is custom-rules only (built-ins are fixed server-side step counts)
-  // and only when data is fully loaded with a known cache key.
-  const isCustom = activeRule && activeRule.startsWith('custom_');
-  const hasKey   = isCustom && DATA[activeRule] && DATA[activeRule]._cacheKey;
+  // Show whenever data is loaded and we have a cache key (built-in or custom).
+  const hasKey = activeRule && DATA[activeRule] && DATA[activeRule]._cacheKey
+                 && !DATA[activeRule]._error;
   row.style.display = hasKey ? 'flex' : 'none';
 }
 
@@ -352,6 +351,8 @@ async function loadRuleData(ruleId) {
         stats: ruleData.stats,
         lineage: ruleData.lineage,
         birthSteps: ruleData.birthSteps,
+        // Built-in rules use their rule ID as the cache key for /api/extend.
+        _cacheKey: ruleData.key || ruleId,
       };
       _computeState[ruleId] = 'cached';
       if (activeRule === ruleId) {
