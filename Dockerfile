@@ -10,9 +10,12 @@ COPY client/ ./client/
 COPY start.sh ./
 RUN chmod +x start.sh
 
-# Do NOT pre-create /data here — the volume is mounted at /data so any image
-# layer content there would be shadowed by the mount anyway.  The server code
+# Cache directory configuration.
+# The persistent volume should be mounted at /data in the container.
+# Setting DH_CACHE_DIR here ensures the default is correct even if the
+# orchestrator env var is not explicitly configured — the server code
 # calls CACHE_DIR.mkdir(parents=True, exist_ok=True) on first write.
+ENV DH_CACHE_DIR=/data/cache
 
 EXPOSE 8080
 

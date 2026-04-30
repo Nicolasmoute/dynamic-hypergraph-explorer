@@ -36,7 +36,7 @@ the browser.
 
 ```bash
 docker build -t dhexplorer .
-docker run --rm -p 8080:8080 -v "$(pwd)/data:/app/data" dhexplorer
+docker run --rm -p 8080:8080 -v "$(pwd)/data:/data" dhexplorer
 # open http://localhost:8080
 ```
 
@@ -46,7 +46,7 @@ curl http://localhost:8080/health
 # {"status":"ok","uptime_s":3,"version":"3d48ba4"}
 ```
 
-The `-v "$(pwd)/data:/app/data"` flag mounts the cache directory so
+The `-v "$(pwd)/data:/data"` flag mounts the cache directory so
 computed results survive container restarts.
 
 ### Local dev (no Docker)
@@ -109,12 +109,12 @@ at runtime (defaults to 8080 if unset).
 
 ### Persistent cache volume (required)
 
-The server caches computed results under `/app/data/cache/v2/`. Without a
+The server caches computed results under `/data/cache/v2/`. Without a
 persistent volume this directory is lost on every deploy restart. Configure it
 once in the Zeabur dashboard:
 
 1. Open your service → **Storage** tab → **Add Volume**.
-2. Set **Mount path** to `/app/data`.
+2. Set **Mount path** to `/data`.
 3. Zeabur assigns a volume ID automatically — save it.
 
 From that point on, the cache survives container restarts and new deploys.
@@ -123,7 +123,7 @@ From that point on, the cache survives container restarts and new deploys.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DH_CACHE_DIR` | `./data/cache` | Override cache root path |
+| `DH_CACHE_DIR` | `/data/cache` (set in Dockerfile) | Override cache root path |
 | `DH_CORS_ORIGINS` | `*` | Comma-separated allowed origins (set to your Zeabur domain in production, e.g. `https://your-app.zeabur.app`) |
 | `DH_MULTIWAY_MAX_STEPS` | `4` | Multiway computation step limit |
 | `DH_MULTIWAY_MAX_STATES` | `300` | Multiway state count limit |
