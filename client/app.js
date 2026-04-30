@@ -31,7 +31,8 @@ let playIntervalMs = 1200; // §6.9 [L6] configurable play speed (50–5000 ms)
 const _computeStart = {};   // ruleId → timestamp when fetch started
 const _computeState = {};   // ruleId → 'running' | 'stale' | 'cached' | 'error'
 let   _computeTimer  = null;
-const STALE_MS = 45000;     // promote running→stale after 45 s with no result
+// Stale detection: server-derived for custom jobs (pollJobUntilDone);
+// built-in rules rely on the 30s AbortController timeout in apiFetch.
 
 function showComputeOverlay(state, msg) {
   const el = document.getElementById('compute-overlay');
@@ -51,12 +52,7 @@ function _tickComputeElapsed(ruleId) {
   const elapsed = Math.floor((Date.now() - (_computeStart[ruleId] || Date.now())) / 1000);
   const elEl = document.getElementById('co-elapsed');
   if (elEl) elEl.textContent = elapsed + 's elapsed';
-  // Promote to stale if threshold exceeded
-  if (_computeState[ruleId] === 'running' && elapsed * 1000 >= STALE_MS) {
-    _computeState[ruleId] = 'stale';
-    showComputeOverlay('stale', 'Computation appears stalled — click Retry to try again');
-    if (elEl) elEl.textContent = elapsed + 's elapsed';
-  }
+  // Stale promoted by server via pollJobUntilDone.
 }
 
 function startComputeTimer(ruleId) {
@@ -77,9 +73,25 @@ function retryActiveRule() {
   selectRule(activeRule);
 }
 
-// Stub: will be wired to Ada's /api/rules/{id}/status endpoint
-// (t-2026-04-30-b365ed66). Currently no-op.
-async function pollComputeStatus(ruleId) { /* TODO: wire to Ada's status endpoint */ }
+// promise-based delay
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Poll GET /api/jobs/{job_id} every 2s (Ada's contract, t-2026-04-30-b365ed66).
+// Calls onProgress(poll) on each response. Returns terminal response
+// (status = done | failed | stale). Network errors are retried silently.
+async function pollJobUntilDone(jobId, onProgress) {
+  while (true) {
+    await sleep(2000);
+    let poll;
+    try {
+      poll = await apiFetch('/api/jobs/' + jobId);
+    } catch (e) {
+      continue; // transient network error — retry
+    }
+    if (onProgress) onProgress(poll);
+    if (poll.status !== 'running') return poll;
+  }
+}
 let simulation = null;
 let isDark = true;
 
@@ -140,11 +152,11 @@ function toggleTheme() {
 // API helpers
 // =========================================================================
 // §6.10 [L7] AbortController timeout on apiFetch (30 s default)
-async function apiFetch(path, timeoutMs = 30000) {
+async function apiFetch(path, options = {}, timeoutMs = 30000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const resp = await fetch(path, { signal: ctrl.signal });
+    const resp = await fetch(path, { ...options, signal: ctrl.signal });
     if (!resp.ok) throw new Error(`API error ${resp.status}: ${await resp.text()}`);
     return resp.json();
   } catch (e) {
@@ -1243,16 +1255,54 @@ async function runCustomRule() {
     const notation = fmt(editorLHS) + ' \u2192 ' + fmt(editorRHS);
     const init = editorInit.map(e => e.map(v => parseInt(v)));
 
-    const resp = await fetch('/api/custom', {
+    // POST /api/custom — returns immediately: cached (status:'done') or new job
+    const jobResp = await apiFetch('/api/custom', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ notation, init, steps }),
     });
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.detail || 'Server error');
+
+    let result;
+    if (jobResp.status === 'done') {
+      result = jobResp; // cache hit — full payload already in response
+    } else {
+      // New job (status:'running') — show overlay and poll GET /api/jobs/{job_id}
+      showComputeOverlay('running', 'Computing…');
+      const jobStarted = Date.now();
+
+      // Client-side ticker fills the elapsed display between 2s poll intervals
+      const elapsedTicker = setInterval(() => {
+        const elEl = document.getElementById('co-elapsed');
+        if (elEl) elEl.textContent = ((Date.now() - jobStarted) / 1000).toFixed(1) + 's elapsed';
+      }, 1000);
+
+      const finalPoll = await pollJobUntilDone(jobResp.job_id, poll => {
+        // Server-authoritative step progress
+        const stepMsg = (poll.step > 0 && poll.total_steps > 0)
+          ? 'Computing… step ' + poll.step + ' / ' + poll.total_steps
+          : 'Computing…';
+        document.getElementById('co-msg').textContent = stepMsg;
+        const elEl = document.getElementById('co-elapsed');
+        if (elEl) elEl.textContent = poll.elapsed_s.toFixed(1) + 's elapsed';
+      });
+
+      clearInterval(elapsedTicker);
+
+      if (finalPoll.status !== 'done') {
+        if (finalPoll.status === 'stale') {
+          showComputeOverlay('stale', 'Server restarted mid-compute — click Retry to try again');
+        } else {
+          showComputeOverlay('error',
+            'Computation failed: ' + (finalPoll.error || 'server error') + ' — try again');
+        }
+        btn.textContent = 'Run Simulation';
+        btn.style.opacity = '1';
+        btn.disabled = false;
+        return;
+      }
+      result = finalPoll;
+      hideComputeOverlay();
     }
-    const result = await resp.json();
 
     customRuleCounter++;
     const ruleId = 'custom_' + customRuleCounter;
