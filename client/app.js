@@ -24,6 +24,62 @@ let currentView = 'spatial';
 let playing = false;
 let playTimer = null;
 let playIntervalMs = 1200; // §6.9 [L6] configurable play speed (50–5000 ms)
+
+// =========================================================================
+// COMPUTE LIVENESS — overlay state machine
+// =========================================================================
+const _computeStart = {};   // ruleId → timestamp when fetch started
+const _computeState = {};   // ruleId → 'running' | 'stale' | 'cached' | 'error'
+let   _computeTimer  = null;
+const STALE_MS = 45000;     // promote running→stale after 45 s with no result
+
+function showComputeOverlay(state, msg) {
+  const el = document.getElementById('compute-overlay');
+  if (!el) return;
+  el.className = 'visible' + (state === 'stale' ? ' stale' : state === 'error' ? ' error' : '');
+  document.getElementById('co-msg').textContent = msg || 'Server is computing…';
+  document.getElementById('co-elapsed').textContent = '';
+}
+
+function hideComputeOverlay() {
+  const el = document.getElementById('compute-overlay');
+  if (el) el.className = '';
+}
+
+function _tickComputeElapsed(ruleId) {
+  if (activeRule !== ruleId || _computeState[ruleId] === 'cached') return;
+  const elapsed = Math.floor((Date.now() - (_computeStart[ruleId] || Date.now())) / 1000);
+  const elEl = document.getElementById('co-elapsed');
+  if (elEl) elEl.textContent = elapsed + 's elapsed';
+  // Promote to stale if threshold exceeded
+  if (_computeState[ruleId] === 'running' && elapsed * 1000 >= STALE_MS) {
+    _computeState[ruleId] = 'stale';
+    showComputeOverlay('stale', 'Computation appears stalled — click Retry to try again');
+    if (elEl) elEl.textContent = elapsed + 's elapsed';
+  }
+}
+
+function startComputeTimer(ruleId) {
+  stopComputeTimer();
+  if (!_computeStart[ruleId]) _computeStart[ruleId] = Date.now();
+  _computeTimer = setInterval(() => _tickComputeElapsed(ruleId), 1000);
+}
+
+function stopComputeTimer() {
+  if (_computeTimer) { clearInterval(_computeTimer); _computeTimer = null; }
+}
+
+function retryActiveRule() {
+  if (!activeRule) return;
+  delete DATA[activeRule];
+  delete _computeState[activeRule];
+  delete _computeStart[activeRule];
+  selectRule(activeRule);
+}
+
+// Stub: will be wired to Ada's /api/rules/{id}/status endpoint
+// (t-2026-04-30-b365ed66). Currently no-op.
+async function pollComputeStatus(ruleId) { /* TODO: wire to Ada's status endpoint */ }
 let simulation = null;
 let isDark = true;
 
@@ -129,6 +185,10 @@ async function loadRuleData(ruleId) {
   if (DATA[ruleId]) return DATA[ruleId];
   if (_loading[ruleId]) return _loading[ruleId];
 
+  // Track compute start (may already be set if selectRule showed the overlay)
+  if (!_computeStart[ruleId]) _computeStart[ruleId] = Date.now();
+  _computeState[ruleId] = 'running';
+
   _loading[ruleId] = (async () => {
     try {
       const ruleData = await apiFetch('/api/rules/' + ruleId);
@@ -140,14 +200,22 @@ async function loadRuleData(ruleId) {
         lineage: ruleData.lineage,
         birthSteps: ruleData.birthSteps,
       };
-      if (activeRule === ruleId) renderCurrentView();
+      _computeState[ruleId] = 'cached';
+      if (activeRule === ruleId) {
+        stopComputeTimer();
+        hideComputeOverlay();
+        renderCurrentView();
+      }
       return DATA[ruleId];
     } catch (e) {
       console.warn('Failed to load rule', ruleId, e);
-      // Store error sentinel so the canvas shows an actionable message
-      // instead of "Computing…" forever. selectRule() clears this on retry.
       DATA[ruleId] = { _error: true, _errorMsg: e.message };
-      if (activeRule === ruleId) renderCurrentView();
+      _computeState[ruleId] = 'error';
+      if (activeRule === ruleId) {
+        stopComputeTimer();
+        showComputeOverlay('error',
+          'Failed to load: ' + (e.message || 'server error') + ' — click Retry');
+      }
       return null;
     } finally {
       delete _loading[ruleId];
@@ -252,15 +320,25 @@ function selectRule(ruleId) {
   const card = document.getElementById('card-' + ruleId);
   if (card) card.classList.add('active');
 
-  // Clear any previous error so clicking the card retries the fetch
-  if (DATA[ruleId] && DATA[ruleId]._error) delete DATA[ruleId];
+  // Clear previous error/stale so clicking the card always retries the fetch
+  if (DATA[ruleId] && DATA[ruleId]._error) {
+    delete DATA[ruleId];
+    delete _computeState[ruleId];
+    delete _computeStart[ruleId];
+  }
 
   const data = DATA[ruleId];
   if (!data) {
-    // Data not loaded yet — load it
+    // Data not loaded yet — show overlay and start loading
+    showComputeOverlay('running', 'Server is computing…');
+    startComputeTimer(ruleId);
     loadRuleData(ruleId);
     return;
   }
+
+  // Cached data available — hide overlay
+  stopComputeTimer();
+  hideComputeOverlay();
 
   const maxStep = (data.states || []).length - 1;
   const slider = document.getElementById('step-slider');
@@ -338,22 +416,16 @@ function setStepFromSlider(step) {
 function renderSpatial() {
   const data = DATA[activeRule];
   if (!data || !data.states || currentStep >= data.states.length) {
-    // Show loading message
     const svg = d3.select('#main-svg');
     svg.selectAll('*').remove();
-    const rect = document.getElementById('canvas-area').getBoundingClientRect();
-    let msg;
-    if (!data) {
-      msg = 'Computing… (server is crunching the numbers)';
-    } else if (data._error) {
-      msg = 'Failed to load rule data: ' + (data._errorMsg || 'server error') +
-            ' — click the rule card to retry';
-    } else {
-      msg = 'No data at this step';
+    // Loading and error states are handled by #compute-overlay.
+    // Only render SVG text for the valid-but-empty-step edge case.
+    if (data && !data._error && data.states && currentStep >= data.states.length) {
+      const rect = document.getElementById('canvas-area').getBoundingClientRect();
+      svg.append('text').attr('x', rect.width / 2).attr('y', rect.height / 2)
+        .attr('text-anchor', 'middle').attr('fill', isDark ? '#888' : '#666')
+        .attr('font-size', 13).text('No data at this step');
     }
-    svg.append('text').attr('x', rect.width/2).attr('y', rect.height/2)
-      .attr('text-anchor', 'middle').attr('fill', isDark ? '#e05050' : '#c03030')
-      .attr('font-size', data && data._error ? 13 : 14).text(msg);
     return;
   }
 
