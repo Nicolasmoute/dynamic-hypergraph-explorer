@@ -216,6 +216,19 @@ async function loadRuleData(ruleId) {
       if (activeRule === ruleId) {
         stopComputeTimer();
         hideComputeOverlay();
+        // Mirror the sidebar setup that selectRule skipped on early-return:
+        // slider range, blurb text, and multiway background load.
+        const _maxStep = (DATA[ruleId].states || []).length - 1;
+        const _slider = document.getElementById('step-slider');
+        if (_slider) {
+          _slider.max = _maxStep;
+          _slider.value = Math.min(currentStep, _maxStep);
+          currentStep = +_slider.value;
+        }
+        const _rule = RULES.find(r => r.id === ruleId);
+        const _blurbEl = document.getElementById('theory-blurb');
+        if (_blurbEl) _blurbEl.textContent = (_rule && _rule.blurb) || '';
+        if (!MULTIWAY[ruleId] && !ruleId.startsWith('custom_')) loadMultiway(ruleId);
         renderCurrentView();
       }
       return DATA[ruleId];
@@ -341,10 +354,11 @@ function selectRule(ruleId) {
 
   const data = DATA[ruleId];
   if (!data) {
-    // Data not loaded yet — show overlay and start loading
+    // Data not loaded yet — show overlay and clear any stale graph from prior rule
     showComputeOverlay('running', 'Server is computing…');
     startComputeTimer(ruleId);
     loadRuleData(ruleId);
+    renderCurrentView(); // clears old SVG content so it doesn't bleed through overlay
     return;
   }
 
