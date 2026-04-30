@@ -18,8 +18,9 @@ CACHE_VERSION = "v2"
 Edge = list[int]
 Hypergraph = list[Edge]
 
-# Thread-local node counter — each request/thread gets its own counter so
-# concurrent calls to evolve() or compute_multiway() cannot race.
+# Thread-local storage — node counter + cancel signal.
+# Using thread-local for the cancel signal lets find_matches.rec() observe
+# it without requiring signature changes on every inner function.
 _tls = threading.local()
 
 def reset(start: int = 0):
@@ -29,6 +30,11 @@ def fresh() -> int:
     n = _tls._next_node
     _tls._next_node += 1
     return n
+
+def _is_cancelled() -> bool:
+    """Return True if the current thread's cancel event has been set."""
+    ev = getattr(_tls, "_cancel_ev", None)
+    return ev is not None and ev.is_set()
 
 # ── pattern matching (undirected) ────────────────────────────────────
 from functools import lru_cache
@@ -54,6 +60,10 @@ def find_matches(hyp: Hypergraph, pattern: list[list[str]]) -> list[tuple[list[i
         edge_perms_cache[i] = _edge_perms(e)
 
     def rec(pi: int, matched: list[int], binding: dict, used: set):
+        # Check cancel at every recursion level so a mid-step abort request
+        # is observed promptly even when the graph is large (thousands of edges).
+        if _is_cancelled():
+            return
         if pi == len(pattern):
             results.append((matched[:], dict(binding)))
             return
@@ -168,8 +178,9 @@ def evolve(
                               Called after each step completes. Exceptions are silently
                               swallowed so a buggy callback never crashes the engine.
         cancel_event:         Optional threading.Event.  When set, the loop exits cleanly
-                              after the current step — allows cooperative cancellation
-                              without killing the thread.
+                              within the current step — the signal is propagated into
+                              find_matches via a thread-local so backtracking search
+                              yields promptly rather than waiting for the whole step.
         initial_ev_id:        Event ID counter starting value (use total events from a prior
                               run when extending a cached result so IDs stay globally unique).
         initial_flat_events:  Flat list of prior-run events to seed the causal-edge lookup.
@@ -177,6 +188,10 @@ def evolve(
     """
     max_n = max((n for e in init_hyp for n in e), default=0)
     reset(max_n)
+
+    # Expose cancel signal via thread-local so find_matches.rec() can observe
+    # it without needing a signature change.  Always clear in finally.
+    _tls._cancel_ev = cancel_event
 
     t0 = time.time()
     states = [[e[:] for e in init_hyp]]
@@ -187,34 +202,43 @@ def evolve(
     # Seed flat_events with prior events so we can find cross-boundary causal deps.
     flat_events: list = list(initial_flat_events) if initial_flat_events else []
 
-    for s in range(steps):
-        # Cooperative cancellation — check before each step
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        if time_limit_ms and (time.time() - t0) * 1000 > time_limit_ms:
-            break
-        nxt, step_evts = apply_all_non_overlapping(current, lhs, rhs)
-        for ev in step_evts:
-            ev["id"] = ev_id
-            ev_id += 1
+    try:
+        for s in range(steps):
+            # Cooperative cancellation — check before each step
+            if _is_cancelled():
+                break
+            if time_limit_ms and (time.time() - t0) * 1000 > time_limit_ms:
+                break
+            nxt, step_evts = apply_all_non_overlapping(current, lhs, rhs)
 
-        # causal edges — use tuple sets for fast lookup
-        for ev in step_evts:
-            c_set = {tuple(e) for e in ev["consumed"]}
-            for prev in flat_events:
-                if any(tuple(e) in c_set for e in prev["produced"]):
-                    causal_edges.append([prev["id"], ev["id"]])
+            # If cancel fired mid-step (inside find_matches), discard the
+            # partial result and exit without appending a corrupted state.
+            if _is_cancelled():
+                break
 
-        flat_events.extend(step_evts)
-        all_events.append([{"id": e["id"], "consumed": e["consumed"], "produced": e["produced"]} for e in step_evts])
-        states.append([e[:] for e in nxt])
-        current = nxt
+            for ev in step_evts:
+                ev["id"] = ev_id
+                ev_id += 1
 
-        if progress_cb is not None:
-            try:
-                progress_cb(s + 1, steps)
-            except Exception:
-                pass  # never let a callback crash the engine
+            # causal edges — use tuple sets for fast lookup
+            for ev in step_evts:
+                c_set = {tuple(e) for e in ev["consumed"]}
+                for prev in flat_events:
+                    if any(tuple(e) in c_set for e in prev["produced"]):
+                        causal_edges.append([prev["id"], ev["id"]])
+
+            flat_events.extend(step_evts)
+            all_events.append([{"id": e["id"], "consumed": e["consumed"], "produced": e["produced"]} for e in step_evts])
+            states.append([e[:] for e in nxt])
+            current = nxt
+
+            if progress_cb is not None:
+                try:
+                    progress_cb(s + 1, steps)
+                except Exception:
+                    pass  # never let a callback crash the engine
+    finally:
+        _tls._cancel_ev = None  # always clear so other uses of this thread aren't affected
 
     stats = []
     for i, st in enumerate(states):
