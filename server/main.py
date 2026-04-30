@@ -225,12 +225,27 @@ def _job_response(job_id: str) -> dict:
     status = job["status"]
     elapsed = round(now - job["started_at"], 1)
 
-    # Stale detection: running job with no heartbeat update
+    # Stale detection: running job with no heartbeat update.
+    # Before declaring stale, check the persistent cache — a long step (>45s)
+    # can complete and write its result while the heartbeat appears expired.
+    # Without this check a legitimate "done" job would be reported as "stale".
     if status == "running":
         age = now - job.get("heartbeat_at", job["started_at"])
         if age > _JOB_STALE_S:
-            status = "stale"
-            logger.warning("job stale job_id=%s heartbeat_age=%.1fs", job_id, age)
+            cached = CACHE.get(job_id)
+            if cached is None:
+                cached = _disk_read(job_id)
+            if cached is not None:
+                # Computation finished — reconcile in-memory job entry and
+                # return done so the client can render the result immediately.
+                CACHE[job_id] = cached
+                _update_job(job_id, status="done", result=cached,
+                            heartbeat_at=now)
+                status = "done"
+                logger.info("job stale-but-done (cache hit) job_id=%s", job_id)
+            else:
+                status = "stale"
+                logger.warning("job stale job_id=%s heartbeat_age=%.1fs", job_id, age)
 
     resp: dict = {
         "job_id": job_id,
