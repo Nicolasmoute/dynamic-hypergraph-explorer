@@ -745,7 +745,16 @@ def extend_cached_evolution(req: ExtendRequest):
 
     meta = src.get("_meta")
     if not meta or not meta.get("notation"):
-        raise HTTPException(422, "Source result has no _meta — cannot extend built-in rules via this endpoint")
+        # Built-in rules lack _meta; reconstruct it from the RULES list.
+        builtin = next((r for r in RULES if r["id"] == req.key), None)
+        if builtin:
+            meta = {
+                "notation": builtin["notation"],
+                "init": builtin["init"],
+                "steps": builtin["steps"],
+            }
+        else:
+            raise HTTPException(422, "Source result has no _meta — cannot extend this rule via this endpoint")
 
     notation = meta["notation"]
     orig_init = meta["init"]
