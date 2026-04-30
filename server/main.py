@@ -175,13 +175,17 @@ def _strip_meta(payload: dict) -> dict:
 # Tracks in-flight and recently-completed custom rule computations so the
 # client can poll for progress without blocking on a long HTTP request.
 #
-# Job lifecycle:  running → done | failed
+# Job lifecycle:  running → done | failed | cancelled
 # Stale detection: if status is "running" and heartbeat_at is older than
 #   _JOB_STALE_S seconds, the server almost certainly restarted mid-compute.
 #   The client should show an actionable error and let the user retry.
 #
 # job_id == cache key (sha256 hash of inputs) so GET /api/custom/{key}
 # continues to work as a recall path after a job completes.
+#
+# Cancellation: each running job stores a threading.Event in _jobs[key].
+#   DELETE /api/jobs/{job_id} sets the event; engine.evolve() checks it at
+#   the top of each step and exits the loop cooperatively.
 
 _JOB_STALE_S = 45  # seconds without a heartbeat → stale
 
@@ -238,7 +242,7 @@ def _job_response(job_id: str) -> dict:
     if status == "done":
         resp["key"] = job_id
         resp.update(_strip_meta(job.get("result", {})))
-    elif status in ("failed", "stale"):
+    elif status in ("failed", "stale", "cancelled"):
         if "error" in job:
             resp["error"] = job["error"]
     return resp
@@ -533,6 +537,7 @@ def run_custom_rule(req: CustomRuleRequest):
 
     # New job — register and start background thread
     now = _time.time()
+    cancel_event = threading.Event()
     with _jobs_lock:
         _jobs[key] = {
             "status": "running",
@@ -541,6 +546,7 @@ def run_custom_rule(req: CustomRuleRequest):
             "started_at": now,
             "heartbeat_at": now,
             "key": key,
+            "cancel_event": cancel_event,
         }
 
     notation = req.notation
@@ -559,7 +565,13 @@ def run_custom_rule(req: CustomRuleRequest):
                 init, parsed_lhs, parsed_rhs, steps,
                 time_limit_ms=time_limit_ms,
                 progress_cb=progress_cb,
+                cancel_event=cancel_event,
             )
+            # Cooperative cancellation: engine exited loop early
+            if cancel_event.is_set():
+                logger.info("job cancelled key=%s", key)
+                _update_job(key, status="cancelled", heartbeat_at=_time.time())
+                return
             lineage, birth_steps = engine.build_lineage(result["states"], result["events"])
             multiway = engine.compute_multiway(
                 init, parsed_lhs, parsed_rhs,
@@ -610,15 +622,255 @@ def get_job_status(job_id: str):
       {job_id, status, step, total_steps, elapsed_s}
 
     Status values:
-    - "running"  : actively computing; step/total_steps show progress.
-    - "done"     : complete; key + full payload fields are included.
-    - "failed"   : computation error; error field is included.
-    - "stale"    : no heartbeat for >45s — server likely restarted
-                   mid-compute.  Client should show a retry prompt.
+    - "running"   : actively computing; step/total_steps show progress.
+    - "done"      : complete; key + full payload fields are included.
+    - "failed"    : computation error; error field is included.
+    - "stale"     : no heartbeat for >45s — server likely restarted
+                    mid-compute.  Client should show a retry prompt.
+    - "cancelled" : job was cancelled via DELETE /api/jobs/{job_id}.
 
     A completed job can also be retrieved via GET /api/custom/{key}.
     """
     return _job_response(job_id)
+
+
+@app.delete("/api/jobs/{job_id}", status_code=200)
+def cancel_job(job_id: str):
+    """Request cooperative cancellation of a running job.
+
+    Sets the job's cancel_event so the engine exits after the current step.
+    The job status transitions to "cancelled" once the thread observes the
+    event (usually within one engine step, <1s for most rules).
+
+    Response: {job_id, status}
+    - 200 + {"job_id": ..., "status": "cancelling"} if the job was running.
+    - 404 if the job_id is not known to this server process.
+    - 409 if the job has already reached a terminal state (done/failed/cancelled/stale).
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            # Not in active tracker — check cache (completed before cancel reached it)
+            if job_id in CACHE or _disk_read(job_id) is not None:
+                raise HTTPException(409, f"Job '{job_id}' is already done")
+            raise HTTPException(404, f"Job '{job_id}' not found")
+        if job["status"] != "running":
+            raise HTTPException(409, f"Job '{job_id}' is already in terminal state: {job['status']}")
+        cancel_ev = job.get("cancel_event")
+
+    if cancel_ev is not None:
+        cancel_ev.set()
+    logger.info("cancel requested job_id=%s", job_id)
+    return {"job_id": job_id, "status": "cancelling"}
+
+
+# ── Extend endpoint ───────────────────────────────────────────────────
+
+class ExtendRequest(BaseModel):
+    key: str
+    extra_steps: int = 1
+
+
+def _merge_evolution(old: dict, ext: dict, old_steps: int, extra_steps: int) -> dict:
+    """Merge an extension result into an existing cached evolution dict.
+
+    Args:
+        old:         Full cached payload (states, events, causalEdges, stats,
+                     lineage, birthSteps, _meta).
+        ext:         Result from engine.evolve() starting at old's last state,
+                     with event IDs already offset via initial_ev_id.
+        old_steps:   Number of steps in the old result (= len(old["states"])-1).
+        extra_steps: Number of new steps requested.
+
+    Returns a merged dict ready to be persisted (without lineage/birthSteps —
+    those are rebuilt from the merged states+events by the caller).
+    """
+    # states: drop ext[0] (== old[-1], the shared boundary state)
+    merged_states = old["states"] + ext["states"][1:]
+
+    # events: straightforward append (IDs are already globally-offset)
+    merged_events = old["events"] + ext["events"]
+
+    # causal edges: append (ext edges already reference global IDs)
+    old_cedges = old.get("causalEdges", old.get("causal_edges", []))
+    merged_cedges = old_cedges + ext["causal_edges"]
+
+    # stats: drop ext[0] (re-stat of the boundary state already in old),
+    #        offset step numbers by old_steps
+    new_stats = []
+    for stat in ext["stats"][1:]:
+        new_stats.append({**stat, "step": stat["step"] + old_steps})
+    merged_stats = old["stats"] + new_stats
+
+    return {
+        "states": merged_states,
+        "events": merged_events,
+        "causal_edges": merged_cedges,
+        "stats": merged_stats,
+    }
+
+
+@app.post("/api/extend")
+def extend_cached_evolution(req: ExtendRequest):
+    """Extend a cached custom-rule evolution by additional steps.
+
+    Takes the last state of a cached result and continues the rewrite from
+    there, producing a new cached result with (old_steps + extra_steps) total
+    steps.  The new result is stored under a fresh cache key derived from
+    the same notation/init/new_total_steps triple — identical to what
+    POST /api/custom would produce if called with the larger step count,
+    so the caches are interchangeable.
+
+    Request body: {key: str, extra_steps: int = 1}
+      key         — cache key of an existing custom rule result (custom-...).
+                    Must have been stored with _meta (i.e. created via
+                    POST /api/custom or POST /api/extend).
+      extra_steps — number of additional rewrite steps to compute (1-10).
+
+    Response: same shape as POST /api/custom.
+      If the extended result is already cached: status "done" + full payload.
+      Otherwise: status "running"; poll GET /api/jobs/{job_id} for progress.
+    """
+    if req.extra_steps < 1 or req.extra_steps > 10:
+        raise HTTPException(400, "extra_steps must be 1-10")
+
+    # Resolve source from cache
+    src = CACHE.get(req.key)
+    if src is None:
+        src = _disk_read(req.key)
+        if src is not None:
+            CACHE[req.key] = src
+    if src is None:
+        raise HTTPException(404, f"Cache key '{req.key}' not found")
+
+    meta = src.get("_meta")
+    if not meta or not meta.get("notation"):
+        raise HTTPException(422, "Source result has no _meta — cannot extend built-in rules via this endpoint")
+
+    notation = meta["notation"]
+    orig_init = meta["init"]
+    old_steps = meta["steps"]
+    new_total = old_steps + req.extra_steps
+
+    if new_total > 30:
+        raise HTTPException(400, f"Total steps after extension ({new_total}) would exceed 30")
+
+    parsed = engine.parse_notation(notation)
+    if not parsed:
+        raise HTTPException(400, "Cannot re-parse notation from cached _meta")
+
+    time_limit_ms = min(15_000, _HARD_MAX_TIME_MS)
+    new_key = _custom_cache_key(notation, orig_init, new_total, time_limit_ms)
+
+    # Already cached at the extended size
+    ext_cached = CACHE.get(new_key) or _disk_read(new_key)
+    if ext_cached is not None:
+        CACHE[new_key] = ext_cached
+        logger.debug("extend cache hit key=%s", new_key)
+        return {"job_id": new_key, "status": "done", "key": new_key,
+                "step": new_total, "total_steps": new_total, "elapsed_s": 0.0,
+                **_strip_meta(ext_cached)}
+
+    # Dedup: already extending
+    with _jobs_lock:
+        existing = _jobs.get(new_key)
+        if existing and existing["status"] in ("running", "queued"):
+            return _job_response(new_key)
+
+    # Register new job
+    now = _time.time()
+    cancel_event = threading.Event()
+    with _jobs_lock:
+        _jobs[new_key] = {
+            "status": "running",
+            "step": 0,
+            "total_steps": req.extra_steps,
+            "started_at": now,
+            "heartbeat_at": now,
+            "key": new_key,
+            "cancel_event": cancel_event,
+        }
+
+    # Capture locals for thread closure
+    src_snapshot = src          # full old payload (already loaded above)
+    extra = req.extra_steps
+    parsed_lhs = parsed["lhs"]
+    parsed_rhs = parsed["rhs"]
+
+    def _run_extend():
+        def progress_cb(completed: int, total: int) -> None:
+            _update_job(new_key, step=completed, heartbeat_at=_time.time())
+
+        try:
+            last_state = src_snapshot["states"][-1]
+
+            # Build flat_events list from old serialised events for causal linkage
+            old_flat: list[dict] = [
+                ev for step_evts in src_snapshot.get("events", [])
+                for ev in step_evts
+            ]
+            initial_ev_id = len(old_flat)
+
+            logger.info(
+                "extend job start key=%s base=%s old_steps=%d extra=%d",
+                new_key, req.key, old_steps, extra,
+            )
+            ext_result = engine.evolve(
+                last_state, parsed_lhs, parsed_rhs, extra,
+                time_limit_ms=time_limit_ms,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                initial_ev_id=initial_ev_id,
+                initial_flat_events=old_flat,
+            )
+
+            if cancel_event.is_set():
+                logger.info("extend job cancelled key=%s", new_key)
+                _update_job(new_key, status="cancelled", heartbeat_at=_time.time())
+                return
+
+            merged = _merge_evolution(src_snapshot, ext_result, old_steps, extra)
+            lineage, birth_steps = engine.build_lineage(merged["states"], merged["events"])
+            multiway = engine.compute_multiway(
+                orig_init, parsed_lhs, parsed_rhs,
+                max_steps=_MW_MAX_STEPS,
+                max_states=_MW_MAX_STATES,
+                max_time_ms=_MW_MAX_TIME_MS,
+            )
+            payload = {
+                "states": merged["states"],
+                "events": merged["events"],
+                "causalEdges": merged["causal_edges"],
+                "stats": merged["stats"],
+                "lineage": lineage,
+                "birthSteps": birth_steps,
+                "multiway": multiway,
+                "_meta": {
+                    "notation": notation,
+                    "init": orig_init,
+                    "steps": new_total,
+                    "computed_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                    "extended_from": req.key,
+                },
+            }
+            _disk_write(new_key, payload)
+            CACHE[new_key] = payload
+            _update_job(new_key, status="done", step=extra, heartbeat_at=_time.time(),
+                        result=payload)
+            logger.info("extend job done key=%s states=%d", new_key, len(payload["states"]))
+        except Exception as e:
+            logger.error("extend job failed key=%s error=%s", new_key, e, exc_info=True)
+            _update_job(new_key, status="failed", error=str(e), heartbeat_at=_time.time())
+
+    threading.Thread(target=_run_extend, daemon=True).start()
+
+    return {
+        "job_id": new_key,
+        "status": "running",
+        "step": 0,
+        "total_steps": req.extra_steps,
+        "elapsed_s": 0.0,
+    }
 
 
 @app.get("/api/custom/{key}")

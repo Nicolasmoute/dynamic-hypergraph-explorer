@@ -152,18 +152,28 @@ def evolve(
     steps: int,
     time_limit_ms: int = 30000,
     progress_cb=None,
+    cancel_event=None,
+    initial_ev_id: int = 0,
+    initial_flat_events: Optional[list] = None,
 ):
     """Evolve init_hyp for up to *steps* rewrite steps.
 
     Args:
-        init_hyp:       Initial hypergraph state.
-        lhs:            Parsed left-hand-side pattern.
-        rhs:            Parsed right-hand-side pattern.
-        steps:          Maximum number of steps to run.
-        time_limit_ms:  Wall-clock cutoff in milliseconds (0 = unlimited).
-        progress_cb:    Optional callable(completed_steps: int, total_steps: int).
-                        Called after each step completes. Exceptions are silently
-                        swallowed so a buggy callback never crashes the engine.
+        init_hyp:             Initial hypergraph state.
+        lhs:                  Parsed left-hand-side pattern.
+        rhs:                  Parsed right-hand-side pattern.
+        steps:                Maximum number of steps to run.
+        time_limit_ms:        Wall-clock cutoff in milliseconds (0 = unlimited).
+        progress_cb:          Optional callable(completed_steps: int, total_steps: int).
+                              Called after each step completes. Exceptions are silently
+                              swallowed so a buggy callback never crashes the engine.
+        cancel_event:         Optional threading.Event.  When set, the loop exits cleanly
+                              after the current step — allows cooperative cancellation
+                              without killing the thread.
+        initial_ev_id:        Event ID counter starting value (use total events from a prior
+                              run when extending a cached result so IDs stay globally unique).
+        initial_flat_events:  Flat list of prior-run events to seed the causal-edge lookup.
+                              Enables correct cross-boundary causal edges when extending.
     """
     max_n = max((n for e in init_hyp for n in e), default=0)
     reset(max_n)
@@ -171,12 +181,16 @@ def evolve(
     t0 = time.time()
     states = [[e[:] for e in init_hyp]]
     all_events: list[list[dict]] = []
-    ev_id = 0
+    ev_id = initial_ev_id
     current = init_hyp
     causal_edges = []
-    flat_events = []
+    # Seed flat_events with prior events so we can find cross-boundary causal deps.
+    flat_events: list = list(initial_flat_events) if initial_flat_events else []
 
     for s in range(steps):
+        # Cooperative cancellation — check before each step
+        if cancel_event is not None and cancel_event.is_set():
+            break
         if time_limit_ms and (time.time() - t0) * 1000 > time_limit_ms:
             break
         nxt, step_evts = apply_all_non_overlapping(current, lhs, rhs)

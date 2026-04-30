@@ -294,6 +294,171 @@ class TestJobPolling:
         assert r.json()["key"] == key
 
 
+# ── DELETE /api/jobs/{job_id} (cancel) ───────────────────────────────
+
+class TestJobCancellation:
+    """Tests for cooperative job cancellation."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def test_cancel_unknown_job_returns_404(self):
+        r = self.client.delete("/api/jobs/custom-0000000000000000")
+        assert r.status_code == 404
+
+    def test_cancel_done_job_returns_409(self):
+        """Cancelling a job that already completed returns 409."""
+        r = self.client.post("/api/custom", json={
+            "notation": "{{x,y}} -> {{x,y},{y,z}}",
+            "init": [[0, 1]],
+            "steps": 2,
+        })
+        data = r.json()
+        job_id = data["job_id"]
+        # Wait for completion
+        if data["status"] != "done":
+            _wait_done(self.client, job_id)
+        # Now cancel a finished job
+        r2 = self.client.delete(f"/api/jobs/{job_id}")
+        assert r2.status_code == 409
+
+    def test_cancel_running_job_transitions(self):
+        """Cancelling a running job eventually results in cancelled or done status."""
+        # Use a fresh, uncached notation so we get a real running job.
+        # A 15-step rule should give us a window to cancel.
+        r = self.client.post("/api/custom", json={
+            "notation": "{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}",
+            "init": [[0, 0], [0, 0]],
+            "steps": 10,
+        })
+        data = r.json()
+        job_id = data["job_id"]
+        if data["status"] == "done":
+            pytest.skip("Job completed before cancel attempt — cache hit, skip test")
+
+        # Send cancel while running
+        rc = self.client.delete(f"/api/jobs/{job_id}")
+        assert rc.status_code in (200, 409)  # 409 if it finished first
+
+        # Final status must be a terminal state
+        final = _wait_done(self.client, job_id)
+        assert final["status"] in ("done", "cancelled")
+
+    def test_cancel_response_has_job_id(self):
+        """Cancel response includes job_id field."""
+        # Submit a fresh job
+        r = self.client.post("/api/custom", json={
+            "notation": "{{x,y,z},{z,u,v}} -> {{y,z,u},{v,w,x},{w,y,v}}",
+            "init": [[0,1,2],[2,3,4]],
+            "steps": 8,
+        })
+        data = r.json()
+        job_id = data["job_id"]
+        if data["status"] == "done":
+            pytest.skip("Already cached — no running job to cancel")
+        rc = self.client.delete(f"/api/jobs/{job_id}")
+        if rc.status_code == 200:
+            assert rc.json()["job_id"] == job_id
+
+
+# ── POST /api/extend ──────────────────────────────────────────────────
+
+class TestExtend:
+    """Tests for the extend-cached-evolution endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def _run_and_wait(self, notation, init, steps):
+        """POST /api/custom and return a done result dict."""
+        r = self.client.post("/api/custom", json={
+            "notation": notation, "init": init, "steps": steps,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        if data["status"] != "done":
+            data = _wait_done(self.client, data["job_id"])
+        assert data["status"] == "done"
+        return data
+
+    def test_extend_unknown_key_returns_404(self):
+        r = self.client.post("/api/extend", json={"key": "custom-0000000000000000", "extra_steps": 1})
+        assert r.status_code == 404
+
+    def test_extend_invalid_extra_steps_returns_400(self):
+        # First need a valid key
+        base = self._run_and_wait("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], 2)
+        key = base["key"]
+        r = self.client.post("/api/extend", json={"key": key, "extra_steps": 0})
+        assert r.status_code == 400
+        r2 = self.client.post("/api/extend", json={"key": key, "extra_steps": 11})
+        assert r2.status_code == 400
+
+    def test_extend_returns_job_fields(self):
+        """POST /api/extend returns job_id, status, step, total_steps, elapsed_s."""
+        base = self._run_and_wait("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], 3)
+        key = base["key"]
+        r = self.client.post("/api/extend", json={"key": key, "extra_steps": 1})
+        assert r.status_code == 200
+        data = r.json()
+        for field in ("job_id", "status", "step", "total_steps", "elapsed_s"):
+            assert field in data, f"Missing field: {field}"
+        assert data["status"] in ("running", "done")
+
+    def test_extend_result_has_more_states(self):
+        """Extended result has one more state than the base."""
+        base = self._run_and_wait("{{x,y}} -> {{x,z},{z,y}}", [[0, 1]], 3)
+        old_state_count = len(base["states"])
+        key = base["key"]
+
+        r = self.client.post("/api/extend", json={"key": key, "extra_steps": 1})
+        data = r.json()
+        if data["status"] != "done":
+            data = _wait_done(self.client, data["job_id"])
+        assert data["status"] == "done"
+
+        # Extended result has exactly one extra state
+        assert len(data["states"]) == old_state_count + 1
+
+    def test_extend_result_has_all_payload_fields(self):
+        """Completed extension has full payload: states, events, causalEdges, etc."""
+        base = self._run_and_wait("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], 2)
+        r = self.client.post("/api/extend", json={"key": base["key"], "extra_steps": 1})
+        data = r.json()
+        if data["status"] != "done":
+            data = _wait_done(self.client, data["job_id"])
+        for field in ("states", "events", "causalEdges", "stats", "lineage", "birthSteps", "multiway"):
+            assert field in data, f"Missing field: {field}"
+
+    def test_extend_is_idempotent(self):
+        """Calling extend twice with the same key+extra_steps returns same job_id."""
+        base = self._run_and_wait("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], 2)
+        key = base["key"]
+        r1 = self.client.post("/api/extend", json={"key": key, "extra_steps": 2})
+        r2 = self.client.post("/api/extend", json={"key": key, "extra_steps": 2})
+        assert r1.json()["job_id"] == r2.json()["job_id"]
+
+    def test_extend_result_retrievable_via_custom_key(self):
+        """Extended result cached under key == POST /api/custom with new step count."""
+        base = self._run_and_wait("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], 2)
+        r = self.client.post("/api/extend", json={"key": base["key"], "extra_steps": 1})
+        data = r.json()
+        if data["status"] != "done":
+            data = _wait_done(self.client, data["job_id"])
+        ext_key = data["key"]
+
+        # Should be retrievable via recall endpoint
+        r2 = self.client.get(f"/api/custom/{ext_key}")
+        assert r2.status_code == 200
+
+        # And identical to directly computing 3 steps from scratch
+        direct = self._run_and_wait("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], 3)
+        # Both have same number of states (2+1=3 steps → 4 states)
+        assert len(data["states"]) == len(direct["states"])
+
+
 # ── / (serve index.html) ──────────────────────────────────────────────
 
 class TestServeClient:
