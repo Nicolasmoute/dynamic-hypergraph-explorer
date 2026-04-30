@@ -316,8 +316,8 @@ function renderRuleCards() {
   const container = document.getElementById('rule-cards');
   // §6.5 [M5] Use escHtml for all user-controlled fields to prevent XSS
   container.innerHTML = RULES.map(r => `
-    <div class="rule-card ${r.id === activeRule ? 'active' : ''}" id="card-${escHtml(r.id)}" onclick="selectRule(${JSON.stringify(r.id)})">
-      ${r.isCustom ? `<button class="remove-custom" onclick="event.stopPropagation(); removeCustomRule(${JSON.stringify(r.id)})" title="Remove">&times;</button>` : ''}
+    <div class="rule-card ${r.id === activeRule ? 'active' : ''}" id="card-${escHtml(r.id)}" onclick="selectRule('${escHtml(r.id)}')">
+      ${r.isCustom ? `<button class="remove-custom" onclick="event.stopPropagation(); removeCustomRule('${escHtml(r.id)}')" title="Remove">&times;</button>` : ''}
       <div class="rule-name">${escHtml(r.name)}</div>
       <div class="rule-notation">${escHtml(r.notation)}</div>
       <div class="rule-desc">${escHtml(r.desc)}</div>
