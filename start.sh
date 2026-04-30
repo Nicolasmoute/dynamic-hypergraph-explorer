@@ -22,3 +22,4 @@ exec python -m uvicorn server.main:app \
     --host 0.0.0.0 \
     --port "${PORT:-8080}" \
     --log-level info
+# trigger redeploy: port web:8080 configured 2026-04-30T08:05:28Z
