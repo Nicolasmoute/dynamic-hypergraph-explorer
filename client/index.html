@@ -234,6 +234,15 @@
   .co-retry:hover { background: var(--border-bright); }
   #compute-overlay.stale .co-retry,
   #compute-overlay.error .co-retry { display: block; }
+  /* Abort button: shown only during active running state (not stale/error which show Retry) */
+  .co-abort {
+    display: none; padding: 6px 18px; border-radius: 6px;
+    background: var(--surface2); border: 1px solid var(--border-bright);
+    color: #e05050; font-size: 12px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .co-abort:hover { background: var(--border-bright); }
+  #compute-overlay.visible:not(.stale):not(.error) .co-abort { display: block; }
 
   .play-btn {
     background: var(--accent); border: none;
@@ -313,7 +322,7 @@
     z-index: 1000; flex-direction: column; gap: 16px;
   }
   .loading-overlay .spinner {
-    width: 40px; height: 40px; border: 3px solid var(--border);
+    width: 24px; height: 24px; border: 2px solid var(--border);
     border-top-color: var(--accent); border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
@@ -393,6 +402,11 @@
           style="flex:1; accent-color:var(--accent); -webkit-appearance:none; height:4px; border-radius:2px; background:var(--border);">
         <span style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--text-dim); min-width:36px; text-align:right;" id="speed-display">1.2s</span>
       </div>
+      <!-- Extend +1 step: visible only when data is loaded for the active rule -->
+      <div id="extend-row" style="display:none; align-items:center; gap:8px; margin-top:10px;">
+        <button class="editor-btn" id="extend-btn" onclick="extendOneStep()">+ Extend 1 step</button>
+        <span id="extend-status" style="font-size:10px; color:var(--text-dim);"></span>
+      </div>
     </div>
     <div class="sidebar-section">
       <h3>Statistics</h3>
@@ -450,6 +464,7 @@
       </svg>
       <div class="co-msg" id="co-msg">Server is computing…</div>
       <div class="co-elapsed" id="co-elapsed"></div>
+      <button class="co-abort" onclick="abortCurrentJob()">✕ Abort</button>
       <button class="co-retry" onclick="retryActiveRule()">↺ Retry</button>
     </div>
     <div class="lineage-bar" id="lineage-bar">

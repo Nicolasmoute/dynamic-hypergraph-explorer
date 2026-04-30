@@ -107,6 +107,96 @@ function resetForceParams() {
 }
 // ──────────────────────────────────────────────────────────────────────────
 
+// ── Extend +1 step & abort ────────────────────────────────────────────────
+function updateExtendRow() {
+  const row = document.getElementById('extend-row');
+  if (!row) return;
+  const loaded = activeRule && DATA[activeRule] && !DATA[activeRule]._error;
+  row.style.display = loaded ? 'flex' : 'none';
+}
+
+async function extendOneStep() {
+  if (!activeRule || !DATA[activeRule]) return;
+  const btn = document.getElementById('extend-btn');
+  const statusEl = document.getElementById('extend-status');
+  btn.disabled = true;
+  if (statusEl) statusEl.textContent = '';
+
+  showComputeOverlay('running', 'Extending by 1 step…');
+  startComputeTimer(activeRule);
+
+  try {
+    const resp = await apiFetch(
+      '/api/rules/' + encodeURIComponent(activeRule) + '/extend',
+      { method: 'POST' }
+    );
+
+    let result;
+    if (resp.status === 'done') {
+      result = resp;
+    } else if (resp.job_id) {
+      _currentJobId = resp.job_id;
+      const finalPoll = await pollJobUntilDone(resp.job_id, poll => {
+        const msg = poll.elapsed_s != null
+          ? 'Extending… ' + poll.elapsed_s.toFixed(1) + 's'
+          : 'Extending…';
+        document.getElementById('co-msg').textContent = msg;
+      });
+      _currentJobId = null;
+      if (finalPoll.status !== 'done') {
+        stopComputeTimer();
+        showComputeOverlay(
+          finalPoll.status === 'stale' ? 'stale' : 'error',
+          finalPoll.status === 'stale'
+            ? 'Server restarted mid-extend — click Retry'
+            : 'Extend failed: ' + (finalPoll.error || 'server error')
+        );
+        btn.disabled = false;
+        return;
+      }
+      result = finalPoll;
+    } else {
+      throw new Error('Unexpected response from extend endpoint');
+    }
+
+    // Merge the new step into DATA[activeRule]
+    const d = DATA[activeRule];
+    if (result.states)      d.states.push(...result.states);
+    if (result.events)      d.events.push(...result.events);
+    if (result.causal_edges) d.causal_edges.push(...result.causal_edges);
+    if (result.stats)       d.stats.push(...result.stats);
+    if (result.lineage)     Object.assign(d.lineage || (d.lineage = {}), result.lineage);
+    if (result.birthSteps)  Object.assign(d.birthSteps || (d.birthSteps = {}), result.birthSteps);
+
+    const newMax = (d.states || []).length - 1;
+    const slider = document.getElementById('step-slider');
+    if (slider) { slider.max = newMax; slider.value = newMax; }
+    currentStep = newMax;
+
+    stopComputeTimer();
+    hideComputeOverlay();
+    renderCurrentView();
+  } catch (e) {
+    stopComputeTimer();
+    showComputeOverlay('error', 'Extend failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    _currentJobId = null;
+  }
+}
+
+async function abortCurrentJob() {
+  const jobId = _currentJobId;
+  if (!jobId) return;
+  try {
+    await apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' });
+  } catch (_) { /* best-effort */ }
+  _currentJobId = null;
+  stopComputeTimer();
+  showComputeOverlay('error', 'Computation aborted — click Retry to restart');
+}
+// ──────────────────────────────────────────────────────────────────────────
+
 // Poll GET /api/jobs/{job_id} every 2s (Ada's contract, t-2026-04-30-b365ed66).
 // Calls onProgress(poll) on each response. Returns terminal response
 // (status = done | failed | stale). Network errors are retried silently.
@@ -125,6 +215,7 @@ async function pollJobUntilDone(jobId, onProgress) {
 }
 let simulation = null;
 let isDark = true;
+let _currentJobId = null; // job being polled — set so abortCurrentJob() can cancel it
 
 // Force-layout user controls (live-adjustable via sidebar sliders)
 let forceParams = { linkDistMult: 1.0, chargeMult: 1.0, linkStrength: 0.3 };
@@ -263,6 +354,7 @@ async function loadRuleData(ruleId) {
         const _blurbEl = document.getElementById('theory-blurb');
         if (_blurbEl) _blurbEl.textContent = (_rule && _rule.blurb) || '';
         if (!MULTIWAY[ruleId] && !ruleId.startsWith('custom_')) loadMultiway(ruleId);
+        updateExtendRow();
         renderCurrentView();
       }
       return DATA[ruleId];
@@ -400,6 +492,7 @@ function selectRule(ruleId) {
   const data = DATA[ruleId];
   if (!data) {
     // Data not loaded yet — show overlay and clear any stale graph from prior rule
+    updateExtendRow(); // hide extend button while loading
     showComputeOverlay('running', 'Server is computing…');
     startComputeTimer(ruleId);
     loadRuleData(ruleId);
@@ -429,6 +522,7 @@ function selectRule(ruleId) {
     loadMultiway(ruleId);
   }
 
+  updateExtendRow();
   renderCurrentView();
 }
 
@@ -1327,6 +1421,7 @@ async function runCustomRule() {
     } else {
       // New job (status:'running') — show overlay and poll GET /api/jobs/{job_id}
       showComputeOverlay('running', 'Computing…');
+      _currentJobId = jobResp.job_id;
       const jobStarted = Date.now();
 
       // Client-side ticker fills the elapsed display between 2s poll intervals
@@ -1346,6 +1441,7 @@ async function runCustomRule() {
       });
 
       clearInterval(elapsedTicker);
+      _currentJobId = null;
 
       if (finalPoll.status !== 'done') {
         if (finalPoll.status === 'stale') {
