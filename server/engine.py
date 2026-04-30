@@ -145,7 +145,26 @@ def apply_all_non_overlapping(hyp: Hypergraph, lhs, rhs):
 # ── full evolution ────────────────────────────────────────────────────
 import time
 
-def evolve(init_hyp: Hypergraph, lhs, rhs, steps: int, time_limit_ms: int = 30000):
+def evolve(
+    init_hyp: Hypergraph,
+    lhs,
+    rhs,
+    steps: int,
+    time_limit_ms: int = 30000,
+    progress_cb=None,
+):
+    """Evolve init_hyp for up to *steps* rewrite steps.
+
+    Args:
+        init_hyp:       Initial hypergraph state.
+        lhs:            Parsed left-hand-side pattern.
+        rhs:            Parsed right-hand-side pattern.
+        steps:          Maximum number of steps to run.
+        time_limit_ms:  Wall-clock cutoff in milliseconds (0 = unlimited).
+        progress_cb:    Optional callable(completed_steps: int, total_steps: int).
+                        Called after each step completes. Exceptions are silently
+                        swallowed so a buggy callback never crashes the engine.
+    """
     max_n = max((n for e in init_hyp for n in e), default=0)
     reset(max_n)
 
@@ -176,6 +195,12 @@ def evolve(init_hyp: Hypergraph, lhs, rhs, steps: int, time_limit_ms: int = 3000
         all_events.append([{"id": e["id"], "consumed": e["consumed"], "produced": e["produced"]} for e in step_evts])
         states.append([e[:] for e in nxt])
         current = nxt
+
+        if progress_cb is not None:
+            try:
+                progress_cb(s + 1, steps)
+            except Exception:
+                pass  # never let a callback crash the engine
 
     stats = []
     for i, st in enumerate(states):

@@ -166,6 +166,84 @@ def _custom_cache_key(notation: str, init: list, steps: int, time_limit_ms: int)
     return f"custom-{h}"
 
 
+def _strip_meta(payload: dict) -> dict:
+    """Return payload without the internal _meta key."""
+    return {k: v for k, v in payload.items() if k != "_meta"}
+
+
+# ── Job tracker ───────────────────────────────────────────────────────
+# Tracks in-flight and recently-completed custom rule computations so the
+# client can poll for progress without blocking on a long HTTP request.
+#
+# Job lifecycle:  running → done | failed
+# Stale detection: if status is "running" and heartbeat_at is older than
+#   _JOB_STALE_S seconds, the server almost certainly restarted mid-compute.
+#   The client should show an actionable error and let the user retry.
+#
+# job_id == cache key (sha256 hash of inputs) so GET /api/custom/{key}
+# continues to work as a recall path after a job completes.
+
+_JOB_STALE_S = 45  # seconds without a heartbeat → stale
+
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def _update_job(job_id: str, **kwargs) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(kwargs)
+
+
+def _job_response(job_id: str) -> dict:
+    """Build the canonical job-status response for a given job_id.
+
+    Checks _jobs first, then falls back to the disk/memory cache so that
+    jobs which completed before a server restart are still retrievable.
+    """
+    with _jobs_lock:
+        job = dict(_jobs[job_id]) if job_id in _jobs else None
+
+    now = _time.time()
+
+    if job is None:
+        # Not in in-process _jobs — check persistent cache (post-restart recall)
+        if job_id in CACHE:
+            return {"job_id": job_id, "status": "done", "key": job_id,
+                    **_strip_meta(CACHE[job_id])}
+        disk = _disk_read(job_id)
+        if disk is not None:
+            CACHE[job_id] = disk
+            return {"job_id": job_id, "status": "done", "key": job_id,
+                    **_strip_meta(disk)}
+        raise HTTPException(404, f"Job '{job_id}' not found")
+
+    status = job["status"]
+    elapsed = round(now - job["started_at"], 1)
+
+    # Stale detection: running job with no heartbeat update
+    if status == "running":
+        age = now - job.get("heartbeat_at", job["started_at"])
+        if age > _JOB_STALE_S:
+            status = "stale"
+            logger.warning("job stale job_id=%s heartbeat_age=%.1fs", job_id, age)
+
+    resp: dict = {
+        "job_id": job_id,
+        "status": status,
+        "step": job.get("step", 0),
+        "total_steps": job.get("total_steps", 0),
+        "elapsed_s": elapsed,
+    }
+    if status == "done":
+        resp["key"] = job_id
+        resp.update(_strip_meta(job.get("result", {})))
+    elif status in ("failed", "stale"):
+        if "error" in job:
+            resp["error"] = job["error"]
+    return resp
+
+
 # ── Core data accessors (memory → disk → compute) ─────────────────────
 
 def get_rule_data(rule_id: str) -> dict:
@@ -321,13 +399,17 @@ def health():
     - status        : always "ok" while the server is alive.
     - uptime_s      : integer seconds since the uvicorn process started.
     - version       : short git SHA of the deployed commit, or "dev".
-    - cache_version : engine.CACHE_VERSION, e.g. "v1".
+    - cache_version : engine.CACHE_VERSION, e.g. "v2".
+    - active_jobs   : number of custom rules currently being computed.
     """
+    with _jobs_lock:
+        active = sum(1 for j in _jobs.values() if j["status"] == "running")
     return {
         "status": "ok",
         "uptime_s": int(_time.time() - _START_TIME),
         "version": _VERSION,
         "cache_version": engine.CACHE_VERSION,
+        "active_jobs": active,
     }
 
 
@@ -400,11 +482,20 @@ class CustomRuleRequest(BaseModel):
 
 @app.post("/api/custom")
 def run_custom_rule(req: CustomRuleRequest):
-    """Run a custom rule and return evolution data plus a persistent cache key.
+    """Submit a custom rule for computation.
 
-    The returned `key` can be passed to GET /api/custom/{key} on future
-    requests (including after a server restart) to retrieve the same result
-    without recomputation.
+    Returns immediately.  If the result is already cached, status is "done"
+    and the full payload is included.  If computation is needed, status is
+    "running" and the client should poll GET /api/jobs/{job_id} for progress.
+
+    The job_id is the same as the persistent cache key, so
+    GET /api/custom/{key} also works once status is "done".
+
+    Response shape:
+    - Always: {job_id, status, step, total_steps, elapsed_s}
+    - When done: also includes {key, states, events, causalEdges, stats,
+                                lineage, birthSteps, multiway}
+    - When failed: also includes {error}
     """
     if req.steps < 1 or req.steps > 20:
         raise HTTPException(400, "Steps must be 1-20")
@@ -420,47 +511,114 @@ def run_custom_rule(req: CustomRuleRequest):
     time_limit_ms = min(15_000, _HARD_MAX_TIME_MS)
     key = _custom_cache_key(req.notation, req.init, req.steps, time_limit_ms)
 
-    # Serve from memory or disk if already computed
+    # Cached — return immediately with full payload
     if key in CACHE:
         logger.debug("cache hit (memory) key=%s", key)
-        return {"key": key, **CACHE[key]}
+        return {"job_id": key, "status": "done", "key": key,
+                "step": req.steps, "total_steps": req.steps, "elapsed_s": 0.0,
+                **_strip_meta(CACHE[key])}
     disk = _disk_read(key)
     if disk is not None:
         CACHE[key] = disk
-        return {"key": key, **disk}
+        return {"job_id": key, "status": "done", "key": key,
+                "step": req.steps, "total_steps": req.steps, "elapsed_s": 0.0,
+                **_strip_meta(disk)}
 
-    # Compute
-    logger.info("computing custom rule key=%s notation=%r steps=%d", key, req.notation, req.steps)
-    result = engine.evolve(req.init, parsed["lhs"], parsed["rhs"], req.steps, time_limit_ms=time_limit_ms)
-    lineage, birth_steps = engine.build_lineage(result["states"], result["events"])
-    multiway = engine.compute_multiway(
-        req.init, parsed["lhs"], parsed["rhs"],
-        max_steps=_MW_MAX_STEPS,
-        max_states=_MW_MAX_STATES,
-        max_time_ms=_MW_MAX_TIME_MS,
-    )
+    # Already computing — return current job status (deduplicates concurrent requests)
+    with _jobs_lock:
+        existing = _jobs.get(key)
+        if existing and existing["status"] in ("running", "queued"):
+            logger.debug("dedup job request key=%s", key)
+            return _job_response(key)
 
-    payload = {
-        "states": result["states"],
-        "events": result["events"],
-        "causalEdges": result["causal_edges"],
-        "stats": result["stats"],
-        "lineage": lineage,
-        "birthSteps": birth_steps,
-        "multiway": multiway,
-        # metadata stored in the cache file so GET /api/cache/custom can list it
-        "_meta": {
-            "notation": req.notation,
-            "init": req.init,
-            "steps": req.steps,
-            "computed_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-        },
+    # New job — register and start background thread
+    now = _time.time()
+    with _jobs_lock:
+        _jobs[key] = {
+            "status": "running",
+            "step": 0,
+            "total_steps": req.steps,
+            "started_at": now,
+            "heartbeat_at": now,
+            "key": key,
+        }
+
+    notation = req.notation
+    init = req.init
+    steps = req.steps
+    parsed_lhs = parsed["lhs"]
+    parsed_rhs = parsed["rhs"]
+
+    def _run():
+        def progress_cb(completed: int, total: int) -> None:
+            _update_job(key, step=completed, heartbeat_at=_time.time())
+
+        try:
+            logger.info("job start key=%s notation=%r steps=%d", key, notation, steps)
+            result = engine.evolve(
+                init, parsed_lhs, parsed_rhs, steps,
+                time_limit_ms=time_limit_ms,
+                progress_cb=progress_cb,
+            )
+            lineage, birth_steps = engine.build_lineage(result["states"], result["events"])
+            multiway = engine.compute_multiway(
+                init, parsed_lhs, parsed_rhs,
+                max_steps=_MW_MAX_STEPS,
+                max_states=_MW_MAX_STATES,
+                max_time_ms=_MW_MAX_TIME_MS,
+            )
+            payload = {
+                "states": result["states"],
+                "events": result["events"],
+                "causalEdges": result["causal_edges"],
+                "stats": result["stats"],
+                "lineage": lineage,
+                "birthSteps": birth_steps,
+                "multiway": multiway,
+                "_meta": {
+                    "notation": notation,
+                    "init": init,
+                    "steps": steps,
+                    "computed_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                },
+            }
+            _disk_write(key, payload)
+            CACHE[key] = payload
+            _update_job(key, status="done", step=steps, heartbeat_at=_time.time(),
+                        result=payload)
+            logger.info("job done key=%s states=%d", key, len(payload["states"]))
+        except Exception as e:
+            logger.error("job failed key=%s error=%s", key, e, exc_info=True)
+            _update_job(key, status="failed", error=str(e), heartbeat_at=_time.time())
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return {
+        "job_id": key,
+        "status": "running",
+        "step": 0,
+        "total_steps": req.steps,
+        "elapsed_s": 0.0,
     }
-    _disk_write(key, payload)
-    CACHE[key] = payload
-    logger.info("computed custom rule key=%s states=%d", key, len(payload["states"]))
 
-    return {"key": key, **payload}
+
+@app.get("/api/jobs/{job_id}")
+def get_job_status(job_id: str):
+    """Poll the status of a custom rule computation job.
+
+    Response shape (all states):
+      {job_id, status, step, total_steps, elapsed_s}
+
+    Status values:
+    - "running"  : actively computing; step/total_steps show progress.
+    - "done"     : complete; key + full payload fields are included.
+    - "failed"   : computation error; error field is included.
+    - "stale"    : no heartbeat for >45s — server likely restarted
+                   mid-compute.  Client should show a retry prompt.
+
+    A completed job can also be retrieved via GET /api/custom/{key}.
+    """
+    return _job_response(job_id)
 
 
 @app.get("/api/custom/{key}")
@@ -471,11 +629,11 @@ def recall_custom_rule(key: str):
     """
     if key in CACHE:
         logger.debug("cache hit (memory) key=%s", key)
-        return {"key": key, **CACHE[key]}
+        return {"key": key, **_strip_meta(CACHE[key])}
     disk = _disk_read(key)
     if disk is not None:
         CACHE[key] = disk
-        return {"key": key, **disk}
+        return {"key": key, **_strip_meta(disk)}
     raise HTTPException(404, f"Cache key '{key}' not found")
 
 
