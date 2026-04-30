@@ -314,16 +314,27 @@ function clearLineage() {
 // =========================================================================
 function renderRuleCards() {
   const container = document.getElementById('rule-cards');
-  // §6.5 [M5] Use escHtml for all user-controlled fields to prevent XSS
+  // §6.5 [M5] Use escHtml for all user-controlled fields to prevent XSS.
+  // Use data-* attributes + addEventListener (no inline JS string quoting)
+  // so IDs with any character content are safe.
   container.innerHTML = RULES.map(r => `
-    <div class="rule-card ${r.id === activeRule ? 'active' : ''}" id="card-${escHtml(r.id)}" onclick="selectRule('${escHtml(r.id)}')">
-      ${r.isCustom ? `<button class="remove-custom" onclick="event.stopPropagation(); removeCustomRule('${escHtml(r.id)}')" title="Remove">&times;</button>` : ''}
+    <div class="rule-card ${r.id === activeRule ? 'active' : ''}" id="card-${escHtml(r.id)}" data-rule-id="${escHtml(r.id)}">
+      ${r.isCustom ? `<button class="remove-custom" data-remove-id="${escHtml(r.id)}" title="Remove">&times;</button>` : ''}
       <div class="rule-name">${escHtml(r.name)}</div>
       <div class="rule-notation">${escHtml(r.notation)}</div>
       <div class="rule-desc">${escHtml(r.desc)}</div>
       <span class="rule-tag ${escHtml(r.tagClass)}">${escHtml(r.tag)}</span>
     </div>
   `).join('');
+  container.querySelectorAll('.rule-card').forEach(card => {
+    card.addEventListener('click', () => selectRule(card.dataset.ruleId));
+  });
+  container.querySelectorAll('.remove-custom').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      removeCustomRule(btn.dataset.removeId);
+    });
+  });
 }
 
 function removeCustomRule(ruleId) {
