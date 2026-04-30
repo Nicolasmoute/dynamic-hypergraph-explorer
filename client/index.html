@@ -192,25 +192,25 @@
   #compute-overlay {
     position: absolute; inset: 0; display: none; pointer-events: none;
     flex-direction: column; align-items: center; justify-content: center;
-    gap: 14px; z-index: 10;
+    gap: 10px; z-index: 10;
   }
   #compute-overlay.visible { display: flex; }
   #compute-overlay.stale,
   #compute-overlay.error { pointer-events: auto; }
   .co-spinner {
-    width: 44px; height: 44px;
+    width: 20px; height: 20px;
   }
   .co-spinner circle {
     fill: none; stroke: var(--accent); stroke-width: 3;
-    stroke-dasharray: 88 30; transform-origin: 50% 50%;
+    stroke-dasharray: 33 11; transform-origin: 50% 50%;
     animation: co-spin 1.1s linear infinite;
   }
   @keyframes co-spin { to { transform: rotate(360deg); } }
   #compute-overlay.stale .co-spinner circle { stroke: var(--orange); }
   #compute-overlay.error .co-spinner { display: none; }
   .co-msg {
-    font-size: 14px; color: var(--text); text-align: center;
-    max-width: 340px; line-height: 1.55;
+    font-size: 13px; color: var(--text-dim); text-align: center;
+    max-width: 320px; line-height: 1.5;
   }
   #compute-overlay.stale .co-msg { color: var(--orange); }
   #compute-overlay.error .co-msg { color: #e05050; font-size: 13px; }
@@ -417,8 +417,8 @@
     <div class="causal-overlay" id="multiway-view"><svg id="multiway-svg"></svg></div>
     <div id="growth-view" style="display:none; position:absolute; inset:0; background:var(--bg); overflow-y:auto; padding: 32px;"></div>
     <div id="compute-overlay">
-      <svg class="co-spinner" viewBox="0 0 44 44" aria-hidden="true">
-        <circle cx="22" cy="22" r="18"/>
+      <svg class="co-spinner" viewBox="0 0 20 20" aria-hidden="true">
+        <circle cx="10" cy="10" r="7"/>
       </svg>
       <div class="co-msg" id="co-msg">Server is computing…</div>
       <div class="co-elapsed" id="co-elapsed"></div>
