@@ -14,7 +14,8 @@ echo "[start] PORT env    : ${PORT:-<unset, will use 8080>}"
 echo "[start] python      : $(python --version 2>&1)"
 echo "[start] uvicorn     : $(python -m uvicorn --version 2>&1 | head -1)"
 echo "[start] client dir  : $(ls /app/client/ 2>/dev/null | tr '\n' ' ' || echo MISSING)"
-echo "[start] data dir    : $(ls /app/data/ 2>/dev/null | tr '\n' ' ' || echo not-yet-created)"
+echo "[start] DH_CACHE_DIR: ${DH_CACHE_DIR:-<unset, default ./data/cache>}"
+echo "[start] data dir    : $(ls /data/ 2>/dev/null | tr '\n' ' ' || echo not-yet-created)"
 echo "[start] ---"
 echo "[start] Starting uvicorn on 0.0.0.0:${PORT:-8080} ..."
 
@@ -22,4 +23,3 @@ exec python -m uvicorn server.main:app \
     --host 0.0.0.0 \
     --port "${PORT:-8080}" \
     --log-level info
-# trigger redeploy: port web:8080 configured 2026-04-30T08:05:28Z

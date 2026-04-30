@@ -10,10 +10,9 @@ COPY client/ ./client/
 COPY start.sh ./
 RUN chmod +x start.sh
 
-# Pre-create the cache directory so a volume mount at /app/data works cleanly
-# even on first run.  The server also calls CACHE_DIR.mkdir(parents=True) at
-# startup, but creating it here means the mount-point exists in the image layer.
-RUN mkdir -p /app/data/cache
+# Do NOT pre-create /data here — the volume is mounted at /data so any image
+# layer content there would be shadowed by the mount anyway.  The server code
+# calls CACHE_DIR.mkdir(parents=True, exist_ok=True) on first write.
 
 EXPOSE 8080
 
