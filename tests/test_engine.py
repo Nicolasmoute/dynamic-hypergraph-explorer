@@ -246,3 +246,165 @@ class TestEstimateDimension:
         dim = engine.estimate_dimension(path)
         # May return None if heuristics disagree, but should not raise
         assert dim is None or (0.5 < dim < 2.0)
+
+
+# ── Rec-1: lazy generator ─────────────────────────────────────────────
+
+class TestFindMatchesGen:
+    """_find_matches_gen must produce the same matches as find_matches."""
+
+    def _eager(self, hyp, pattern):
+        return engine.find_matches(hyp, pattern)
+
+    def _lazy(self, hyp, pattern):
+        return list(engine._find_matches_gen(hyp, pattern))
+
+    def _normalise(self, matches):
+        """Sort matches for order-invariant comparison."""
+        return sorted(
+            (tuple(mi), tuple(sorted(b.items()))) for mi, b in matches
+        )
+
+    def test_path_same_as_eager(self):
+        hyp = [[0, 1], [1, 2]]
+        pattern = [["x", "y"], ["y", "z"]]
+        assert self._normalise(self._lazy(hyp, pattern)) == \
+               self._normalise(self._eager(hyp, pattern))
+
+    def test_no_match_empty(self):
+        hyp = [[0, 1], [2, 3]]
+        pattern = [["x", "y"], ["y", "z"]]
+        assert self._lazy(hyp, pattern) == []
+
+    def test_single_edge(self):
+        hyp = [[0, 1]]
+        pattern = [["x", "y"]]
+        assert self._normalise(self._lazy(hyp, pattern)) == \
+               self._normalise(self._eager(hyp, pattern))
+
+    def test_no_duplicates(self):
+        hyp = [[0, 1], [1, 2], [2, 3]]
+        pattern = [["x", "y"], ["y", "z"]]
+        lazy = self._lazy(hyp, pattern)
+        keys = [(tuple(mi), tuple(sorted(b.items()))) for mi, b in lazy]
+        assert len(keys) == len(set(keys)), "duplicate matches from generator"
+
+    def test_larger_graph_matches_eager(self):
+        """5-step evolution: lazy generator must find same matches as eager."""
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=5)
+        # The last state is the interesting one — use it as input for matching.
+        state = result["states"][-1]
+        assert self._normalise(self._lazy(state, parsed["lhs"])) == \
+               self._normalise(self._eager(state, parsed["lhs"]))
+
+
+# ── Rec-1: apply_all_non_overlapping early-exit ───────────────────────
+
+class TestApplyAllNonOverlappingRec1:
+    """Verify that the lazy early-exit selection produces correct output."""
+
+    def setup_method(self):
+        engine.reset(1)
+
+    def test_result_matches_reference(self):
+        """Both eager and lazy paths should produce the same new hypergraph."""
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        state = [[0, 1], [1, 2], [2, 3], [3, 4]]
+        # Reference: restore find_matches eager path manually
+        all_matches = engine.find_matches(state, lhs)
+        used_ref: set = set()
+        selected_ref = []
+        for mi, bind in all_matches:
+            if any(i in used_ref for i in mi):
+                continue
+            selected_ref.append((mi, bind))
+            used_ref.update(mi)
+        # Optimised path
+        nxt, evts = engine.apply_all_non_overlapping(state, lhs, rhs)
+        assert len(evts) == len(selected_ref), (
+            f"Expected {len(selected_ref)} events, got {len(evts)}"
+        )
+
+    def test_no_match_returns_unchanged(self):
+        # Two-edge LHS pattern: {x,y},{y,z} requires connected edges.
+        # Disconnected pairs [0,1],[2,3] share no node so the pattern cannot match.
+        parsed = engine.parse_notation("{{x,y},{y,z}} -> {{x,z},{x,w},{y,w},{z,w}}")
+        state = [[0, 1], [2, 3]]  # disconnected — no path match
+        nxt, evts = engine.apply_all_non_overlapping(state, parsed["lhs"], parsed["rhs"])
+        assert evts == []
+        assert nxt == state
+
+
+# ── Rec-2: produced_index causal edges ───────────────────────────────
+
+class TestCausalIndexRec2:
+    """Verify produced_index produces correct causal edges."""
+
+    def setup_method(self):
+        engine.reset(1)
+
+    def test_causal_edges_present(self):
+        """A simple binary-tree rule should produce causal edges after step 1."""
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=3)
+        assert len(result["causal_edges"]) > 0
+
+    def test_causal_edge_ids_in_range(self):
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=4)
+        all_ev_ids = {ev["id"] for step_evs in result["events"] for ev in step_evs}
+        for src, dst in result["causal_edges"]:
+            assert src in all_ev_ids, f"causal src {src} not in event IDs"
+            assert dst in all_ev_ids, f"causal dst {dst} not in event IDs"
+
+    def test_cross_boundary_causal_edges(self):
+        """Extending with initial_flat_events must generate cross-boundary causal links.
+
+        Run step 0→2, then extend from step 2→4 seeding produced_index from
+        the first run's flat events.  Events in the extension that consume
+        edges produced in the first run must appear in the causal_edges of the
+        extension result.
+        """
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+
+        # First run: 2 steps
+        engine.reset(1)
+        run1 = engine.evolve([[0, 1]], lhs, rhs, steps=2)
+
+        # Collect flat_events from run1 for cross-boundary seeding
+        flat_run1 = [ev for step_evs in run1["events"] for ev in step_evs]
+        total_ev_count = len(flat_run1)
+
+        # Extension run: 2 more steps starting from last state of run1
+        engine.reset(max(n for e in run1["states"][-1] for n in e))
+        run2 = engine.evolve(
+            run1["states"][-1],
+            lhs,
+            rhs,
+            steps=2,
+            initial_ev_id=total_ev_count,
+            initial_flat_events=flat_run1,
+        )
+
+        # run2's event IDs start at total_ev_count; run1's are 0..total_ev_count-1
+        run1_ids = {ev["id"] for ev in flat_run1}
+        run2_ids = {ev["id"] for step_evs in run2["events"] for ev in step_evs}
+
+        # At least one causal edge must cross the boundary (run1 → run2)
+        cross_boundary = [
+            (s, d) for s, d in run2["causal_edges"]
+            if s in run1_ids and d in run2_ids
+        ]
+        assert len(cross_boundary) > 0, (
+            "No cross-boundary causal edges found — produced_index seeding may be broken"
+        )
+
+    def test_no_spurious_self_causality(self):
+        """An event should not be listed as causing itself."""
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=5)
+        for src, dst in result["causal_edges"]:
+            assert src != dst, f"self-causal edge detected: {src} -> {dst}"
