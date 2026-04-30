@@ -188,6 +188,47 @@
   .canvas-area { flex: 1; position: relative; overflow: hidden; }
   .canvas-area svg { width: 100%; height: 100%; }
 
+  /* Compute loading overlay */
+  #compute-overlay {
+    position: absolute; inset: 0; display: none; pointer-events: none;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; z-index: 10;
+  }
+  #compute-overlay.visible { display: flex; }
+  #compute-overlay.stale,
+  #compute-overlay.error { pointer-events: auto; }
+  .co-spinner {
+    width: 44px; height: 44px;
+  }
+  .co-spinner circle {
+    fill: none; stroke: var(--accent); stroke-width: 3;
+    stroke-dasharray: 88 30; transform-origin: 50% 50%;
+    animation: co-spin 1.1s linear infinite;
+  }
+  @keyframes co-spin { to { transform: rotate(360deg); } }
+  #compute-overlay.stale .co-spinner circle { stroke: var(--orange); }
+  #compute-overlay.error .co-spinner { display: none; }
+  .co-msg {
+    font-size: 14px; color: var(--text); text-align: center;
+    max-width: 340px; line-height: 1.55;
+  }
+  #compute-overlay.stale .co-msg { color: var(--orange); }
+  #compute-overlay.error .co-msg { color: #e05050; font-size: 13px; }
+  .co-elapsed {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--text-dim);
+  }
+  #compute-overlay.error .co-elapsed { display: none; }
+  .co-retry {
+    display: none; padding: 6px 18px; border-radius: 6px;
+    background: var(--surface2); border: 1px solid var(--border-bright);
+    color: var(--text); font-size: 12px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .co-retry:hover { background: var(--border-bright); }
+  #compute-overlay.stale .co-retry,
+  #compute-overlay.error .co-retry { display: block; }
+
   .play-btn {
     background: var(--accent); border: none;
     width: 32px; height: 32px; border-radius: 50%; color: #fff;
@@ -375,6 +416,14 @@
     <div class="causal-overlay" id="causal-view"><svg id="causal-svg"></svg></div>
     <div class="causal-overlay" id="multiway-view"><svg id="multiway-svg"></svg></div>
     <div id="growth-view" style="display:none; position:absolute; inset:0; background:var(--bg); overflow-y:auto; padding: 32px;"></div>
+    <div id="compute-overlay">
+      <svg class="co-spinner" viewBox="0 0 44 44" aria-hidden="true">
+        <circle cx="22" cy="22" r="18"/>
+      </svg>
+      <div class="co-msg" id="co-msg">Server is computing…</div>
+      <div class="co-elapsed" id="co-elapsed"></div>
+      <button class="co-retry" onclick="retryActiveRule()">↺ Retry</button>
+    </div>
     <div class="lineage-bar" id="lineage-bar">
       <span class="lineage-text">Edge lineage:</span>
       <span class="lineage-count" id="lineage-count">0 descendants</span>
