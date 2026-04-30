@@ -124,6 +124,7 @@ async function extendOneStep() {
   const statusEl = document.getElementById('extend-status');
   btn.disabled = true;
   if (statusEl) statusEl.textContent = '';
+  _jobAborted = false; // reset before starting a new job
 
   showComputeOverlay('running', 'Extending by 1 step…');
   startComputeTimer(activeRule);
@@ -152,6 +153,12 @@ async function extendOneStep() {
       _currentJobId = null;
       if (finalPoll.status !== 'done') {
         stopComputeTimer();
+        if (_jobAborted) {
+          // abortCurrentJob() already updated the overlay — just re-enable button.
+          _jobAborted = false;
+          btn.disabled = false;
+          return;
+        }
         showComputeOverlay(
           finalPoll.status === 'stale' ? 'stale' : 'error',
           finalPoll.status === 'stale'
@@ -198,17 +205,15 @@ async function extendOneStep() {
 async function abortCurrentJob() {
   const jobId = _currentJobId;
   if (!jobId) return;
-  try {
-    // DELETE /api/jobs/{job_id} — 200 cancelling, 404/409 are no-ops
-    await apiFetch('/api/jobs/' + jobId, { method: 'DELETE' });
-  } catch (e) {
-    // 409 (already terminal) or 404 (not found) — treat as no-op
-    const is409or404 = e.message && (e.message.includes('409') || e.message.includes('404'));
-    if (!is409or404) console.warn('abort error:', e.message);
-  }
   _currentJobId = null;
   stopComputeTimer();
   showComputeOverlay('error', 'Computation aborted — click Retry to restart');
+  // Fire-and-forget DELETE — UI already updated, don't block on the response.
+  apiFetch('/api/jobs/' + jobId, { method: 'DELETE' }).catch(e => {
+    // 409 (already terminal) or 404 (not found) — expected, treat as no-op.
+    const is409or404 = e.message && (e.message.includes('409') || e.message.includes('404'));
+    if (!is409or404) console.warn('abort error:', e.message);
+  });
 }
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -1437,6 +1442,7 @@ async function runCustomRule() {
       result = jobResp; // cache hit — full payload already in response
     } else {
       // New job (status:'running') — show overlay and poll GET /api/jobs/{job_id}
+      _jobAborted = false; // reset before starting new job
       showComputeOverlay('running', 'Computing…');
       _currentJobId = jobResp.job_id;
       const jobStarted = Date.now();
@@ -1461,6 +1467,14 @@ async function runCustomRule() {
       _currentJobId = null;
 
       if (finalPoll.status !== 'done') {
+        if (_jobAborted) {
+          // abortCurrentJob() already updated the overlay — just restore the button.
+          _jobAborted = false;
+          btn.textContent = 'Run Simulation';
+          btn.style.opacity = '1';
+          btn.disabled = false;
+          return;
+        }
         if (finalPoll.status === 'stale') {
           showComputeOverlay('stale', 'Server restarted mid-compute — click Retry to try again');
         } else {
