@@ -229,6 +229,31 @@ def _job_response(job_id: str) -> dict:
     if status == "running":
         age = now - job.get("heartbeat_at", job["started_at"])
         if age > _JOB_STALE_S:
+            # Before declaring stale, check if the job actually completed and cached its
+            # result.  A single rewrite step on a large graph can take longer than
+            # _JOB_STALE_S without firing any heartbeat (progress_cb fires only after a
+            # step completes), so the stale timer can trip while the thread is still
+            # working.  If the cache key is already present the job is done.
+            if job_id in CACHE:
+                logger.info("job appeared stale but result is cached — returning done job_id=%s", job_id)
+                return {
+                    "job_id": job_id, "status": "done", "key": job_id,
+                    "step": job.get("total_steps", 0),
+                    "total_steps": job.get("total_steps", 0),
+                    "elapsed_s": elapsed,
+                    **_strip_meta(CACHE[job_id]),
+                }
+            disk = _disk_read(job_id)
+            if disk is not None:
+                CACHE[job_id] = disk
+                logger.info("job appeared stale but disk cache found — returning done job_id=%s", job_id)
+                return {
+                    "job_id": job_id, "status": "done", "key": job_id,
+                    "step": job.get("total_steps", 0),
+                    "total_steps": job.get("total_steps", 0),
+                    "elapsed_s": elapsed,
+                    **_strip_meta(disk),
+                }
             status = "stale"
             logger.warning("job stale job_id=%s heartbeat_age=%.1fs", job_id, age)
 
