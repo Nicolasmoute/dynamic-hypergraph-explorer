@@ -205,6 +205,7 @@ async function extendOneStep() {
 async function abortCurrentJob() {
   const jobId = _currentJobId;
   if (!jobId) return;
+  _jobAborted   = true;  // tell callers to skip their own error overlay
   _currentJobId = null;
   stopComputeTimer();
   showComputeOverlay('error', 'Computation aborted — click Retry to restart');
@@ -235,7 +236,8 @@ async function pollJobUntilDone(jobId, onProgress) {
 }
 let simulation = null;
 let isDark = true;
-let _currentJobId = null; // job being polled — set so abortCurrentJob() can cancel it
+let _currentJobId = null;  // job being polled — set so abortCurrentJob() can cancel it
+let _jobAborted   = false; // set by abortCurrentJob(); callers skip their error overlay
 
 // Force-layout user controls (live-adjustable via sidebar sliders)
 let forceParams = { linkDistMult: 1.0, chargeMult: 1.0, linkStrength: 0.3 };
