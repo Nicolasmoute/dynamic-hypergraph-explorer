@@ -225,37 +225,27 @@ def _job_response(job_id: str) -> dict:
     status = job["status"]
     elapsed = round(now - job["started_at"], 1)
 
-    # Stale detection: running job with no heartbeat update
+    # Stale detection: running job with no heartbeat update.
+    # Before declaring stale, check the persistent cache — a long step (>45s)
+    # can complete and write its result while the heartbeat appears expired.
+    # Without this check a legitimate "done" job would be reported as "stale".
     if status == "running":
         age = now - job.get("heartbeat_at", job["started_at"])
         if age > _JOB_STALE_S:
-            # Before declaring stale, check if the job actually completed and cached its
-            # result.  A single rewrite step on a large graph can take longer than
-            # _JOB_STALE_S without firing any heartbeat (progress_cb fires only after a
-            # step completes), so the stale timer can trip while the thread is still
-            # working.  If the cache key is already present the job is done.
-            if job_id in CACHE:
-                logger.info("job appeared stale but result is cached — returning done job_id=%s", job_id)
-                return {
-                    "job_id": job_id, "status": "done", "key": job_id,
-                    "step": job.get("total_steps", 0),
-                    "total_steps": job.get("total_steps", 0),
-                    "elapsed_s": elapsed,
-                    **_strip_meta(CACHE[job_id]),
-                }
-            disk = _disk_read(job_id)
-            if disk is not None:
-                CACHE[job_id] = disk
-                logger.info("job appeared stale but disk cache found — returning done job_id=%s", job_id)
-                return {
-                    "job_id": job_id, "status": "done", "key": job_id,
-                    "step": job.get("total_steps", 0),
-                    "total_steps": job.get("total_steps", 0),
-                    "elapsed_s": elapsed,
-                    **_strip_meta(disk),
-                }
-            status = "stale"
-            logger.warning("job stale job_id=%s heartbeat_age=%.1fs", job_id, age)
+            cached = CACHE.get(job_id)
+            if cached is None:
+                cached = _disk_read(job_id)
+            if cached is not None:
+                # Computation finished — reconcile in-memory job entry and
+                # return done so the client can render the result immediately.
+                CACHE[job_id] = cached
+                _update_job(job_id, status="done", result=cached,
+                            heartbeat_at=now)
+                status = "done"
+                logger.info("job stale-but-done (cache hit) job_id=%s", job_id)
+            else:
+                status = "stale"
+                logger.warning("job stale job_id=%s heartbeat_age=%.1fs", job_id, age)
 
     resp: dict = {
         "job_id": job_id,

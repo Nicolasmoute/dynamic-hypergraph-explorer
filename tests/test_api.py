@@ -294,6 +294,44 @@ class TestJobPolling:
         assert r.json()["key"] == key
 
 
+# ── Stale-but-done recovery ──────────────────────────────────────────
+
+class TestStaleButDone:
+    """Stale detection recovers gracefully when job completed but heartbeat lagged."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def test_stale_but_done_returns_done(self):
+        """If a job's heartbeat is stale but the cache has the result, return done not stale."""
+        import threading
+        from server.main import CACHE, _jobs, _jobs_lock
+        # Submit and wait for a real completion
+        r = self.client.post("/api/custom", json={
+            "notation": "{{x,y}} -> {{x,y},{y,z}}",
+            "init": [[0, 1]],
+            "steps": 2,
+        })
+        data = r.json()
+        job_id = data["job_id"]
+        if data["status"] != "done":
+            data = _wait_done(self.client, job_id)
+        assert data["status"] == "done"
+        assert job_id in CACHE
+
+        # Simulate stale: patch heartbeat_at to be far in the past
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "running"
+                _jobs[job_id]["heartbeat_at"] = 0.0  # epoch — ancient
+
+        # Polling should recover "done" from cache, not return "stale"
+        r2 = self.client.get(f"/api/jobs/{job_id}")
+        assert r2.status_code == 200
+        assert r2.json()["status"] == "done"
+
+
 # ── DELETE /api/jobs/{job_id} (cancel) ───────────────────────────────
 
 class TestJobCancellation:
