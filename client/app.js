@@ -111,12 +111,16 @@ function resetForceParams() {
 function updateExtendRow() {
   const row = document.getElementById('extend-row');
   if (!row) return;
-  const loaded = activeRule && DATA[activeRule] && !DATA[activeRule]._error;
-  row.style.display = loaded ? 'flex' : 'none';
+  // Extend is custom-rules only (built-ins are fixed server-side step counts)
+  // and only when data is fully loaded with a known cache key.
+  const isCustom = activeRule && activeRule.startsWith('custom_');
+  const hasKey   = isCustom && DATA[activeRule] && DATA[activeRule]._cacheKey;
+  row.style.display = hasKey ? 'flex' : 'none';
 }
 
 async function extendOneStep() {
-  if (!activeRule || !DATA[activeRule]) return;
+  const d = DATA[activeRule];
+  if (!activeRule || !d || !d._cacheKey) return;
   const btn = document.getElementById('extend-btn');
   const statusEl = document.getElementById('extend-status');
   btn.disabled = true;
@@ -126,10 +130,14 @@ async function extendOneStep() {
   startComputeTimer(activeRule);
 
   try {
-    const resp = await apiFetch(
-      '/api/rules/' + encodeURIComponent(activeRule) + '/extend',
-      { method: 'POST' }
-    );
+    // POST /api/extend — body: {key, extra_steps:1}
+    // Returns same job shape as POST /api/custom (status:'done' or 'running'+job_id).
+    // Done response is the FULL evolution (replace, not append).
+    const resp = await apiFetch('/api/extend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: d._cacheKey, extra_steps: 1 }),
+    });
 
     let result;
     if (resp.status === 'done') {
@@ -156,17 +164,19 @@ async function extendOneStep() {
       }
       result = finalPoll;
     } else {
-      throw new Error('Unexpected response from extend endpoint');
+      throw new Error('Unexpected response from /api/extend');
     }
 
-    // Merge the new step into DATA[activeRule]
-    const d = DATA[activeRule];
-    if (result.states)      d.states.push(...result.states);
-    if (result.events)      d.events.push(...result.events);
-    if (result.causal_edges) d.causal_edges.push(...result.causal_edges);
-    if (result.stats)       d.stats.push(...result.stats);
-    if (result.lineage)     Object.assign(d.lineage || (d.lineage = {}), result.lineage);
-    if (result.birthSteps)  Object.assign(d.birthSteps || (d.birthSteps = {}), result.birthSteps);
+    // Full replace — server merges causal edges correctly server-side.
+    d.states       = result.states       || d.states;
+    d.events       = result.events       || d.events;
+    d.causal_edges = result.causalEdges  || d.causal_edges;
+    d.stats        = result.stats        || d.stats;
+    d.lineage      = result.lineage      || d.lineage;
+    d.birthSteps   = result.birthSteps   || d.birthSteps;
+    // Update cache key for the next extend call (server returns new key).
+    if (result.key) d._cacheKey = result.key;
+    if (result.multiway) MULTIWAY[activeRule] = result.multiway;
 
     const newMax = (d.states || []).length - 1;
     const slider = document.getElementById('step-slider');
@@ -175,6 +185,7 @@ async function extendOneStep() {
 
     stopComputeTimer();
     hideComputeOverlay();
+    updateExtendRow();
     renderCurrentView();
   } catch (e) {
     stopComputeTimer();
@@ -189,8 +200,13 @@ async function abortCurrentJob() {
   const jobId = _currentJobId;
   if (!jobId) return;
   try {
-    await apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' });
-  } catch (_) { /* best-effort */ }
+    // DELETE /api/jobs/{job_id} — 200 cancelling, 404/409 are no-ops
+    await apiFetch('/api/jobs/' + jobId, { method: 'DELETE' });
+  } catch (e) {
+    // 409 (already terminal) or 404 (not found) — treat as no-op
+    const is409or404 = e.message && (e.message.includes('409') || e.message.includes('404'));
+    if (!is409or404) console.warn('abort error:', e.message);
+  }
   _currentJobId = null;
   stopComputeTimer();
   showComputeOverlay('error', 'Computation aborted — click Retry to restart');
@@ -1470,6 +1486,8 @@ async function runCustomRule() {
       birthSteps: result.birthSteps,
       _customParsed: parseNotation(notation),
       _blurb: 'Custom rule: ' + notation,
+      // Cache key from server — used by POST /api/extend for subsequent +1 calls.
+      _cacheKey: result.key || null,
     };
 
     if (result.multiway) {
