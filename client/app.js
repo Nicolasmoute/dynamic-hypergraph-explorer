@@ -15,9 +15,9 @@ function escHtml(str) {
 
 // \u00a76.8 [L5] BLURBS removed \u2014 rule descriptions now come from server /api/rules blurb field
 
-// Feature flag: ?renderer=canvas enables the Canvas 2D path (Phase 2/3).
-// Default (no param or ?renderer=svg) keeps the existing SVG path unchanged.
-const USE_CANVAS = new URLSearchParams(location.search).get('renderer') === 'canvas';
+// Canvas renderer is now the default path (Phase 3 graduated).
+// Use ?renderer=svg to force the legacy SVG path as an escape hatch.
+const USE_CANVAS = new URLSearchParams(location.search).get('renderer') !== 'svg';
 
 let RULES = [];        // [{id, name, notation, desc, tag, tagClass}]
 let DATA = {};         // ruleId -> {states, events, causal_edges, stats, lineage, birthSteps}
@@ -1044,7 +1044,7 @@ function drawHulls(hullG, hyperedges, nodeById, birthColorFn) {
 }
 
 // =========================================================================
-// CANVAS RENDERER PATH  (?renderer=canvas)
+// CANVAS RENDERER PATH  (default; ?renderer=svg to opt out)
 // Phase 2: main-thread d3 simulation, canvas drawing, SVG hit-test overlay.
 // Phase 3 will replace the simulation with layout-worker.js postMessage ticks.
 // =========================================================================
