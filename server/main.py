@@ -55,6 +55,11 @@ _MW_MAX_STEPS: int = int(os.environ.get("DH_MULTIWAY_MAX_STEPS", "4"))
 _MW_MAX_STATES: int = int(os.environ.get("DH_MULTIWAY_MAX_STATES", "300"))
 _MW_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_MAX_TIME_MS", "3000"))
 
+# ── Multiway-causal limits (Phase B3) ────────────────────────────────
+_MWCAUSAL_MAX_STEPS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_STEPS", "4"))
+_MWCAUSAL_MAX_OCCURRENCES: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_OCCURRENCES", "5000"))
+_MWCAUSAL_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_TIME_MS", "5000"))
+
 # ── CORS (§5.5) ───────────────────────────────────────────────────────
 # Production recommendation: set DH_CORS_ORIGINS to your Zeabur domain,
 # e.g. "https://dynamic-hypergraph.zeabur.app".  Defaults to "*" for dev.
@@ -352,6 +357,68 @@ def get_multiway(rule_id: str) -> dict:
         return result
 
 
+def get_multiway_causal(
+    rule_id: str,
+    max_steps: int,
+    max_occurrences: int,
+    max_time_ms: int,
+) -> dict:
+    """Return multiway-causal-graph data for a built-in rule.
+
+    Cache key encodes all cap parameters so different cap settings produce
+    independent cache entries.  Read order: in-memory CACHE → disk JSON →
+    recompute (then persist).
+    """
+    cache_key = f"{rule_id}_mwcausal_{max_steps}_{max_occurrences}_{max_time_ms}"
+    if cache_key in CACHE:
+        logger.debug("cache hit (memory) key=%s", cache_key)
+        return CACHE[cache_key]
+
+    lock = _get_lock(cache_key)
+    with lock:
+        if cache_key in CACHE:        # double-checked
+            return CACHE[cache_key]
+
+        # Disk cache hit
+        cached = _disk_read(cache_key)
+        if cached is not None:
+            CACHE[cache_key] = cached
+            return cached
+
+        # Compute
+        rule = next((r for r in RULES if r["id"] == rule_id), None)
+        if not rule:
+            raise HTTPException(404, f"Rule {rule_id} not found")
+
+        logger.info(
+            "computing multiway-causal rule_id=%s max_steps=%d max_occurrences=%d",
+            rule_id, max_steps, max_occurrences,
+        )
+        parsed = engine.parse_notation(rule["notation"])
+        if not parsed:
+            raise HTTPException(400, f"Cannot parse notation for {rule_id}")
+
+        result = engine.multiway_causal_graph(
+            rule["init"], parsed["lhs"], parsed["rhs"],
+            max_steps=max_steps,
+            max_occurrences=max_occurrences,
+            max_time_ms=max_time_ms,
+        )
+        # Attach rule metadata for client display
+        result["meta"] = {
+            "rule_id": rule_id,
+            "rule_notation": rule["notation"],
+            "init_state": rule["init"],
+        }
+        _disk_write(cache_key, result)
+        CACHE[cache_key] = result
+        logger.info(
+            "computed multiway-causal rule_id=%s events=%d",
+            rule_id, len(result.get("events", [])),
+        )
+        return result
+
+
 def _preload_disk_cache() -> int:
     """Scan CACHE_DIR and pre-populate in-memory CACHE from disk.
 
@@ -462,6 +529,30 @@ def get_rule(rule_id: str):
 def get_rule_multiway(rule_id: str):
     """Get multiway system for a rule."""
     return get_multiway(rule_id)
+
+
+@app.get("/api/rules/{rule_id}/multiway-causal")
+def get_rule_multiway_causal(
+    rule_id: str,
+    max_steps: int = _MWCAUSAL_MAX_STEPS,
+    max_occurrences: int = _MWCAUSAL_MAX_OCCURRENCES,
+    max_time_ms: int = _MWCAUSAL_MAX_TIME_MS,
+):
+    """Get the multiway causal graph for a built-in rule.
+
+    Returns all update events across all branches of the multiway system
+    with cross-branch causal edges, per the multiway-causal-graph contract
+    (Phase B).
+
+    Query params:
+    - max_steps        : BFS depth cap (default 4).
+    - max_occurrences  : total occurrence cap (default 5000).
+    - max_time_ms      : wall-clock cap in ms (default 5000).
+
+    Response shape: see engine.multiway_causal_graph() docstring, plus:
+    - meta.rule_id, meta.rule_notation, meta.init_state
+    """
+    return get_multiway_causal(rule_id, max_steps, max_occurrences, max_time_ms)
 
 
 @app.get("/api/rules/{rule_id}/descendants")
@@ -627,6 +718,71 @@ def run_custom_rule(req: CustomRuleRequest):
         "total_steps": req.steps,
         "elapsed_s": 0.0,
     }
+
+
+class MultiwayCausalRequest(BaseModel):
+    notation: str
+    init: list[list[int]]
+    max_steps: int = 4
+    max_occurrences: int = 5000
+    max_time_ms: int = 5000
+
+
+@app.post("/api/custom/multiway-causal")
+def run_custom_multiway_causal(req: MultiwayCausalRequest):
+    """Compute the multiway causal graph for a custom rule (synchronous).
+
+    Unlike POST /api/custom which dispatches a background job, this
+    endpoint is synchronous — computation is bounded by req.max_time_ms
+    (hard-capped at _MWCAUSAL_MAX_TIME_MS) so it always returns within
+    the time budget.
+
+    Request body:
+    - notation       : rule in {{...}} → {{...}} notation (required).
+    - init           : initial hypergraph state (required).
+    - max_steps      : BFS depth cap (default 4, max 8).
+    - max_occurrences: total occurrence cap (default 5000, max 20000).
+    - max_time_ms    : wall-clock cap in ms (default 5000, hard cap applies).
+
+    Response shape: same as GET /api/rules/{id}/multiway-causal, plus
+    meta.rule_notation and meta.init_state.  Computation is never
+    cached on disk; successive calls with identical parameters recompute.
+    """
+    if req.max_steps < 1 or req.max_steps > 8:
+        raise HTTPException(400, "max_steps must be 1-8")
+    if req.max_occurrences < 1 or req.max_occurrences > 20_000:
+        raise HTTPException(400, "max_occurrences must be 1-20000")
+
+    parsed = engine.parse_notation(req.notation)
+    if not parsed:
+        raise HTTPException(400, "Cannot parse notation")
+    if not parsed["lhs"] or not parsed["rhs"]:
+        raise HTTPException(400, "LHS and RHS must be non-empty")
+    if not req.init:
+        raise HTTPException(400, "Initial state must be non-empty")
+
+    effective_time_ms = min(req.max_time_ms, _MWCAUSAL_MAX_TIME_MS)
+
+    logger.info(
+        "custom multiway-causal notation=%r max_steps=%d max_occurrences=%d",
+        req.notation, req.max_steps, req.max_occurrences,
+    )
+    try:
+        result = engine.multiway_causal_graph(
+            req.init, parsed["lhs"], parsed["rhs"],
+            max_steps=req.max_steps,
+            max_occurrences=req.max_occurrences,
+            max_time_ms=effective_time_ms,
+        )
+    except Exception as e:
+        logger.error("custom multiway-causal failed notation=%r error=%s", req.notation, e, exc_info=True)
+        raise HTTPException(500, f"Computation failed: {e}")
+
+    result["meta"] = {
+        "rule_notation": req.notation,
+        "init_state": req.init,
+    }
+    return result
 
 
 @app.get("/api/jobs/{job_id}")
