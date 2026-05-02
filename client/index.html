@@ -112,8 +112,35 @@
     border-right: 1px solid var(--border);
     display: flex; flex-direction: column;
     overflow-y: auto; flex-shrink: 0;
-    transition: background 0.3s;
+    transition: width 0.22s ease, background 0.3s, border-color 0.22s ease;
   }
+  .sidebar.collapsed {
+    width: 0;
+    min-width: 0;
+    overflow: hidden;
+    border-right-color: transparent;
+  }
+  #sidebar-toggle {
+    position: absolute;
+    top: 50%;
+    left: 6px;
+    transform: translateY(-50%);
+    z-index: 30;
+    width: 18px;
+    height: 40px;
+    padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--text-dim);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
+    user-select: none;
+  }
+  #sidebar-toggle:hover { background: var(--surface2); color: var(--text); }
   .sidebar-section { padding: 16px; border-bottom: 1px solid var(--border); }
   .sidebar-section h3 {
     font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px;
@@ -454,6 +481,7 @@
   </div>
 
   <div class="canvas-area" id="canvas-area">
+    <button id="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">&#9664;</button>
     <!-- canvas-renderer: sits below the SVG overlay; only shown in ?renderer=canvas mode -->
     <canvas id="main-canvas" style="display:none;position:absolute;inset:0;pointer-events:none;"></canvas>
     <svg id="main-svg"></svg>
@@ -481,5 +509,32 @@
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script src="static/canvas-renderer.js"></script>
 <script src="app.js"></script>
+<script>
+/* sidebar collapse — self-contained, no app.js dependency */
+(function () {
+  'use strict';
+  var STORAGE_KEY = 'dhx-sidebar-collapsed';
+  var btn     = document.getElementById('sidebar-toggle');
+  var sidebar = document.querySelector('.sidebar');
+  if (!btn || !sidebar) return;
+
+  function applyState(collapsed) {
+    sidebar.classList.toggle('collapsed', collapsed);
+    btn.innerHTML  = collapsed ? '&#9654;' : '&#9664;';   // ▶ / ◀
+    btn.title      = collapsed ? 'Expand sidebar'   : 'Collapse sidebar';
+    btn.setAttribute('aria-label', btn.title);
+    try { localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0'); } catch (_) {}
+  }
+
+  /* restore saved state */
+  try {
+    if (localStorage.getItem(STORAGE_KEY) === '1') applyState(true);
+  } catch (_) {}
+
+  btn.addEventListener('click', function () {
+    applyState(!sidebar.classList.contains('collapsed'));
+  });
+}());
+</script>
 </body>
 </html>
