@@ -1107,11 +1107,14 @@ function renderGrowthAnalysis() {
           <tbody>
             ${stats.filter(s => s.num_nodes !== undefined).map((s, i, arr) => {
               const growth = i > 0 ? ((s.num_nodes / arr[i-1].num_nodes - 1) * 100).toFixed(1) + '%' : '--';
+              const dimText = s.dimension_kind === 'exponential_growth'
+                ? 'exp.'
+                : (s.estimated_dimension != null ? s.estimated_dimension.toFixed(3) : '--');
               return `<tr style="border-bottom: 1px solid var(--border);">
                 <td style="padding: 6px; font-family: JetBrains Mono, monospace;">${s.step}</td>
                 <td style="padding: 6px; text-align: right; font-family: JetBrains Mono, monospace; color: var(--accent);">${s.num_nodes}</td>
                 <td style="padding: 6px; text-align: right; font-family: JetBrains Mono, monospace; color: var(--pink);">${s.num_edges}</td>
-                <td style="padding: 6px; text-align: right; font-family: JetBrains Mono, monospace; color: var(--green);">${s.estimated_dimension != null ? s.estimated_dimension.toFixed(3) : '--'}</td>
+                <td title="${escHtml(s.dimension_note || '')}" style="padding: 6px; text-align: right; font-family: JetBrains Mono, monospace; color: var(--green);">${dimText}</td>
                 <td style="padding: 6px; text-align: right; font-family: JetBrains Mono, monospace; color: var(--orange);">${growth}</td>
               </tr>`;
             }).join('')}
@@ -1249,9 +1252,16 @@ function updateStats() {
   document.getElementById('stat-edges').textContent = stats.num_edges || '--';
 
   const dim = stats.estimated_dimension;
-  document.getElementById('stat-dim').textContent = dim != null ? dim.toFixed(2) : '--';
-  document.getElementById('stat-dim-sub').textContent = dim != null ?
-    (dim < 1.2 ? '~ 1D structure' : dim < 1.7 ? '~ fractal' : dim < 2.3 ? '~ 2D space' : dim < 3.3 ? '~ 3D space' : 'high-dim') : '';
+  const rawDim = stats.raw_dimension_estimate;
+  if (stats.dimension_kind === 'exponential_growth') {
+    document.getElementById('stat-dim').textContent = 'exp.';
+    document.getElementById('stat-dim-sub').textContent = 'undefined finite dimension';
+  } else {
+    document.getElementById('stat-dim').textContent = dim != null ? dim.toFixed(2) : '--';
+    document.getElementById('stat-dim-sub').textContent = dim != null ?
+      (dim < 1.2 ? '~ 1D structure' : dim < 1.7 ? '~ fractal' : dim < 2.3 ? '~ 2D space' : dim < 3.3 ? '~ 3D space' : 'high-dim') :
+      (rawDim != null ? 'not power-law' : '');
+  }
 
   const prevStats = currentStep > 0 ? (data.stats || [])[currentStep - 1] : null;
   if (prevStats && prevStats.num_nodes && stats.num_nodes) {

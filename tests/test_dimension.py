@@ -7,7 +7,7 @@ the spec at knowledge/theory/2026-04-28-true-hyperedge-distance-spec.md.
 from __future__ import annotations
 import itertools
 import pytest
-from server.engine import estimate_dimension, evolve, parse_notation
+from server.engine import dimension_diagnostic, estimate_dimension, evolve, parse_notation
 
 
 def test_dimension_none_for_small():
@@ -86,3 +86,21 @@ def test_dimension_large_ring():
     d = estimate_dimension(ring)
     assert d is not None
     assert 0.85 < d < 1.15, f"50-node ring: expected ~1, got {d}"
+
+
+def test_dimension_diagnostic_flags_exponential_binary_tree():
+    """Rule 3 has exponential/tree-like growth, not a finite manifold dimension."""
+    parsed = parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+    result = evolve([[0, 1]], parsed["lhs"], parsed["rhs"], 12, time_limit_ms=0)
+    final_stats = result["stats"][-1]
+    assert final_stats["dimension_kind"] == "exponential_growth"
+    assert final_stats["estimated_dimension"] is None
+    assert final_stats["raw_dimension_estimate"] is not None
+
+
+def test_dimension_diagnostic_keeps_power_law_ring_dimension():
+    """A ring remains a normal power-law dimension estimate."""
+    ring = [[i, (i + 1) % 50] for i in range(50)]
+    raw = estimate_dimension(ring)
+    diag = dimension_diagnostic(ring, raw)
+    assert diag["kind"] == "power_law"

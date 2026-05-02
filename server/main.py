@@ -42,8 +42,8 @@ def _git_sha() -> str:
 _VERSION: str = _git_sha()
 
 # ── Persistent cache configuration ───────────────────────────────────
-# Cache root: $DH_CACHE_DIR/v<CACHE_VERSION>/ (default /data/cache/v2/ in
-# Docker via Dockerfile ENV; ./data/cache/v2/ in bare-Python local dev).
+# Cache root: $DH_CACHE_DIR/v<CACHE_VERSION>/ (default /data/cache/v3/ in
+# Docker via Dockerfile ENV; ./data/cache/v3/ in bare-Python local dev).
 # Bump engine.CACHE_VERSION when engine output semantics change; the new
 # directory is created automatically; old data stays under the old path.
 _CACHE_ROOT: Path = Path(os.environ.get("DH_CACHE_DIR", "./data/cache"))

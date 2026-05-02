@@ -104,6 +104,13 @@ class TestGetRule:
         stats = client.get("/api/rules/rule3").json()["stats"]
         assert isinstance(stats, list) and len(stats) > 0
 
+    def test_rule3_stats_flag_exponential_dimension(self, client):
+        stats = client.get("/api/rules/rule3").json()["stats"]
+        final = stats[-1]
+        assert final["dimension_kind"] == "exponential_growth"
+        assert final["estimated_dimension"] is None
+        assert final["raw_dimension_estimate"] is not None
+
     def test_invalid_rule_returns_404(self, client):
         assert client.get("/api/rules/doesnotexist").status_code == 404
 

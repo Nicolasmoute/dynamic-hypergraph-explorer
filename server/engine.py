@@ -11,8 +11,8 @@ from typing import Optional
 # fixing estimate_dimension in §5.4).  The cache directory path includes this
 # value so old files remain on disk but are no longer read.
 # v1 → v2: §5.4 dimension fix — incidence-based BFS replaces clique projection.
-#   Ternary hyperedges (Rules 4, 5) produce different (more correct) estimates.
-CACHE_VERSION = "v2"
+# v2 → v3: dimension diagnostics classify exponential/non-manifold growth.
+CACHE_VERSION = "v3"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -463,8 +463,19 @@ def evolve(
     stats = []
     for i, st in enumerate(states):
         ns = set(n for e in st for n in e)
-        dim = estimate_dimension(st)
-        stats.append({"step": i, "num_nodes": len(ns), "num_edges": len(st), "estimated_dimension": dim})
+        raw_dim = estimate_dimension(st)
+        dim_diag = dimension_diagnostic(st, raw_dim)
+        stats.append({
+            "step": i,
+            "num_nodes": len(ns),
+            "num_edges": len(st),
+            "estimated_dimension": (
+                raw_dim if dim_diag["kind"] == "power_law" else None
+            ),
+            "raw_dimension_estimate": raw_dim,
+            "dimension_kind": dim_diag["kind"],
+            "dimension_note": dim_diag["note"],
+        })
 
     return {"states": states, "events": all_events, "causal_edges": causal_edges, "stats": stats}
 
@@ -569,6 +580,43 @@ def estimate_dimension(st: Hypergraph) -> Optional[float]:
     num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     den = sum((x - mx) ** 2 for x in xs)
     return round(num / den, 4) if den > 0 else None
+
+
+def dimension_diagnostic(st: Hypergraph, raw_dimension: Optional[float]) -> dict:
+    """Classify whether a ball-growth dimension estimate is meaningful.
+
+    The log-log slope is only a finite Hausdorff-style diagnostic for polynomial
+    ball growth. Sparse binary trees can produce a large finite-window slope even
+    though their asymptotic volume growth is exponential, so report that case
+    explicitly instead of presenting it as ordinary finite dimension.
+    """
+    if len(st) > 20000:
+        return {
+            "kind": "skipped_large",
+            "note": "dimension skipped for large state",
+        }
+    if raw_dimension is None:
+        return {
+            "kind": "unavailable",
+            "note": "insufficient ball-growth data",
+        }
+
+    nodes = {n for e in st for n in e}
+    all_binary = all(len(e) == 2 for e in st)
+    sparse_tree_like = all_binary and len(st) <= len(nodes)
+    if sparse_tree_like and len(nodes) >= 64 and raw_dimension >= 2.5:
+        return {
+            "kind": "exponential_growth",
+            "note": (
+                "sparse binary tree-like growth; finite Hausdorff dimension "
+                "is not meaningful"
+            ),
+        }
+
+    return {
+        "kind": "power_law",
+        "note": "power-law ball growth estimate",
+    }
 
 # ── canonical hash (isomorphism-invariant) ────────────────────────────
 def canonical_hash(hyp: Hypergraph) -> str:
