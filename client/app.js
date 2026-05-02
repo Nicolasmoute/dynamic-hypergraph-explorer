@@ -1171,14 +1171,25 @@ function renderSpatialCanvas() {
   const warmstart = {};
   nodes.forEach(n => { if (n.x != null) warmstart[n.id] = [n.x, n.y]; });
 
-  // Edge list for worker (integer IDs, not resolved objects).
-  const workerEdges = links.map(l => ({
-    source: l.source.id != null ? l.source.id : l.source,
-    target: l.target.id != null ? l.target.id : l.target,
-    id:     l.edgeIdx,
-  }));
-  const workerHyperedges = hyperedges.map(h => ({ id: h.id, nodes: h.nodes }));
-  const workerNodes      = nodes.map(n => ({ id: n.id }));
+  // Build worker edge/hyperedge lists directly from state with NO overlap.
+  // Sofia HIGH: `links` contains both genuine binary edges AND chain pairs
+  // extracted from arity>2 hyperedges.  `workerHyperedges` sends those same
+  // hyperedges, and the worker expands them to chain links again — doubling
+  // every hyperedge's force contribution.  Fix: partition by arity.
+  //
+  //   workerEdges:      arity-2 non-self-loop only  → worker adds one link each
+  //   workerHyperedges: arity>2 only                → worker expands to chain
+  //   (self-loops and arity-1: no force links needed)
+  const workerEdges      = [];
+  const workerHyperedges = [];
+  state.forEach((edge, idx) => {
+    if (edge.length === 2 && edge[0] !== edge[1]) {
+      workerEdges.push({ source: edge[0], target: edge[1], id: idx });
+    } else if (edge.length > 2) {
+      workerHyperedges.push({ id: idx, nodes: edge.slice() });
+    }
+  });
+  const workerNodes = nodes.map(n => ({ id: n.id }));
 
   // ── Inner helpers (closed over current step's nodes/links/etc.) ──────────
 
