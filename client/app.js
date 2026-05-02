@@ -312,6 +312,13 @@ let _workerInitialized      = false;
 // MEDIUM-1: module-level slots for the LATEST pending tick (always updated, never dropped).
 let _pendingWorkerPositions = null;
 let _pendingWorkerNodeIds   = null;
+// PERF-SCRUB: during rapid slider scrub on large graphs, skip expensive D3 SVG overlay
+// DOM creation (join/remove ~4096 elements) and only do canvas rendering.  The overlay
+// is rebuilt 250 ms after the slider stops, restoring full click/drag interactivity.
+let _isScrubbing      = false;
+let _scrubEndTimer    = null;
+const _SCRUB_END_MS        = 250;  // ms after last slider move before overlay rebuild
+const _OVERLAY_NODE_THRESH = 200;  // node count above which scrub skip applies
 
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
@@ -676,6 +683,17 @@ function setStepFromSlider(step) {
   selectedPath = null;
   document.getElementById('step-display').textContent = step;
   if (selectedEdges.length > 0) recomputeLineage();
+  // PERF-SCRUB: mark as scrubbing so renderSpatialCanvas skips expensive SVG overlay
+  // rebuild on large graphs.  250 ms after the last slider move, rebuild the full overlay.
+  if (USE_CANVAS && !_canvasWorkerDisabled) {
+    _isScrubbing = true;
+    if (_scrubEndTimer) clearTimeout(_scrubEndTimer);
+    _scrubEndTimer = setTimeout(() => {
+      _isScrubbing = false;
+      _scrubEndTimer = null;
+      renderCurrentView();  // full rebuild including overlay now that scrub has stopped
+    }, _SCRUB_END_MS);
+  }
   if (_stepRafId !== null) cancelAnimationFrame(_stepRafId);
   _stepRafId = requestAnimationFrame(() => { _stepRafId = null; renderCurrentView(); });
 }
@@ -1223,10 +1241,15 @@ function renderSpatialCanvas() {
       nodes, nodeById, links, selfLoops, hyperedges,
       nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
     });
-    overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
-    overlayNodeG.selectAll('circle')
-      .attr('cx', d => d.x != null ? d.x : 0)
-      .attr('cy', d => d.y != null ? d.y : 0);
+    // PERF-SCRUB: skip SVG overlay attr updates while scrubbing large graphs.
+    // Overlay elements don't exist during scrub (see join section below), so
+    // these selections are empty and updating them wastes O(n) time for nothing.
+    if (!_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH) {
+      overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
+      overlayNodeG.selectAll('circle')
+        .attr('cx', d => d.x != null ? d.x : 0)
+        .attr('cy', d => d.y != null ? d.y : 0);
+    }
   }
 
   function _applyPositions(positions, node_ids) {
@@ -1386,93 +1409,100 @@ function renderSpatialCanvas() {
   }
 
   // ── SVG overlay — enter selections (event handlers wired once per step) ──
-  overlayEdgeG.selectAll('path')
-    .data(links, d => d.edgeIdx)
-    .join(
-      enter => enter.append('path')
-        .attr('stroke', 'transparent')
-        .attr('stroke-width', Math.max(6, baseEdgeWidth + 4))
-        .attr('fill', 'none')
-        .style('cursor', 'pointer')
-        .on('click', function(e, d) {
-          e.stopPropagation();
-          const existIdx = selectedEdges.findIndex(
-            s => s.step === currentStep && s.edgeIdx === d.edgeIdx);
-          if (existIdx >= 0) {
-            selectedEdges.splice(existIdx, 1);
-            lineageSets.splice(existIdx, 1);
-          } else {
-            if (selectedEdges.length >= 3) { selectedEdges.shift(); lineageSets.shift(); }
-            selectedEdges.push({ edgeIdx: d.edgeIdx, step: currentStep });
-          }
-          if (selectedEdges.length === 0) { clearLineage(); return; }
-          recomputeLineage();
-          // HIGH-2: forward selectedEdge to worker so it adjusts link forces for the
-          // selected edge (same effect as SVG path's inline applyForceParams logic).
-          if (_layoutWorker && _activeGraphId && _workerInitialized) {
-            const sel = selectedEdges[selectedEdges.length - 1];
-            const workerSel = sel ? {
-              edge_id:  sel.edgeIdx,
-              distance: (_workerOptions.linkDistance || 40) * 0.2,
-              strength: 1.0,
-            } : null;
-            _workerOptions.selectedEdge = workerSel;
-            _layoutWorker.postMessage({
-              type: 'update_options', protocol_version: 2,
-              graph_id: _activeGraphId, options: { selectedEdge: workerSel },
-            });
-          }
-          renderSpatialCanvas();
-        })
-    )
-    .attr('d', _overlayEdgePath);
+  // PERF-SCRUB: skip the D3 DOM join (create/remove up to n nodes + n edge paths)
+  // while the slider is being dragged on large graphs.  At 4096 elements the join
+  // takes 60–150 ms, making every step-change rAF miss the 33 ms frame budget.
+  // The overlay is rebuilt 250 ms after scrubbing stops (see setStepFromSlider).
+  // Small graphs (≤ _OVERLAY_NODE_THRESH) always get the full overlay immediately.
+  if (!_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH) {
+    overlayEdgeG.selectAll('path')
+      .data(links, d => d.edgeIdx)
+      .join(
+        enter => enter.append('path')
+          .attr('stroke', 'transparent')
+          .attr('stroke-width', Math.max(6, baseEdgeWidth + 4))
+          .attr('fill', 'none')
+          .style('cursor', 'pointer')
+          .on('click', function(e, d) {
+            e.stopPropagation();
+            const existIdx = selectedEdges.findIndex(
+              s => s.step === currentStep && s.edgeIdx === d.edgeIdx);
+            if (existIdx >= 0) {
+              selectedEdges.splice(existIdx, 1);
+              lineageSets.splice(existIdx, 1);
+            } else {
+              if (selectedEdges.length >= 3) { selectedEdges.shift(); lineageSets.shift(); }
+              selectedEdges.push({ edgeIdx: d.edgeIdx, step: currentStep });
+            }
+            if (selectedEdges.length === 0) { clearLineage(); return; }
+            recomputeLineage();
+            // HIGH-2: forward selectedEdge to worker so it adjusts link forces for the
+            // selected edge (same effect as SVG path's inline applyForceParams logic).
+            if (_layoutWorker && _activeGraphId && _workerInitialized) {
+              const sel = selectedEdges[selectedEdges.length - 1];
+              const workerSel = sel ? {
+                edge_id:  sel.edgeIdx,
+                distance: (_workerOptions.linkDistance || 40) * 0.2,
+                strength: 1.0,
+              } : null;
+              _workerOptions.selectedEdge = workerSel;
+              _layoutWorker.postMessage({
+                type: 'update_options', protocol_version: 2,
+                graph_id: _activeGraphId, options: { selectedEdge: workerSel },
+              });
+            }
+            renderSpatialCanvas();
+          })
+      )
+      .attr('d', _overlayEdgePath);
 
-  overlayNodeG.selectAll('circle')
-    .data(nodes, d => d.id)
-    .join(
-      enter => enter.append('circle')
-        .attr('r', nodeR + 2)
-        .attr('fill', 'transparent')
-        .style('cursor', 'pointer')
-        .on('mouseenter', (ev, d) => showTooltip(ev, `Node ${d.id}`))
-        .on('mouseleave', hideTooltip)
-        .call(d3.drag()
-          .on('start', (e, d) => {
-            d.fx = d.x; d.fy = d.y;
-            // Reheat the worker so it keeps ticking during the drag.
-            if (_layoutWorker && _activeGraphId) {
-              _layoutWorker.postMessage({
-                type: 'reheat', protocol_version: 2,
-                graph_id: _activeGraphId, alpha: 0.3,
-              });
-            }
-          })
-          .on('drag', (e, d) => {
-            // Update local position immediately so canvas reflects the drag.
-            d.fx = e.x; d.fy = e.y;
-            d.x  = e.x; d.y  = e.y;
-            // Schedule a canvas redraw for this drag frame (coalesced).
-            if (!_workerRafId) {
-              _workerRafId = requestAnimationFrame(() => {
-                _workerRafId = null;
-                _drawTick();
-              });
-            }
-          })
-          .on('end', (e, d) => {
-            d.fx = null; d.fy = null;
-            // Let the worker re-settle from the released position.
-            if (_layoutWorker && _activeGraphId) {
-              _layoutWorker.postMessage({
-                type: 'reheat', protocol_version: 2,
-                graph_id: _activeGraphId, alpha: 0.15,
-              });
-            }
-          })
-        )
-    )
-    .attr('cx', d => d.x != null ? d.x : 0)
-    .attr('cy', d => d.y != null ? d.y : 0);
+    overlayNodeG.selectAll('circle')
+      .data(nodes, d => d.id)
+      .join(
+        enter => enter.append('circle')
+          .attr('r', nodeR + 2)
+          .attr('fill', 'transparent')
+          .style('cursor', 'pointer')
+          .on('mouseenter', (ev, d) => showTooltip(ev, `Node ${d.id}`))
+          .on('mouseleave', hideTooltip)
+          .call(d3.drag()
+            .on('start', (e, d) => {
+              d.fx = d.x; d.fy = d.y;
+              // Reheat the worker so it keeps ticking during the drag.
+              if (_layoutWorker && _activeGraphId) {
+                _layoutWorker.postMessage({
+                  type: 'reheat', protocol_version: 2,
+                  graph_id: _activeGraphId, alpha: 0.3,
+                });
+              }
+            })
+            .on('drag', (e, d) => {
+              // Update local position immediately so canvas reflects the drag.
+              d.fx = e.x; d.fy = e.y;
+              d.x  = e.x; d.y  = e.y;
+              // Schedule a canvas redraw for this drag frame (coalesced).
+              if (!_workerRafId) {
+                _workerRafId = requestAnimationFrame(() => {
+                  _workerRafId = null;
+                  _drawTick();
+                });
+              }
+            })
+            .on('end', (e, d) => {
+              d.fx = null; d.fy = null;
+              // Let the worker re-settle from the released position.
+              if (_layoutWorker && _activeGraphId) {
+                _layoutWorker.postMessage({
+                  type: 'reheat', protocol_version: 2,
+                  graph_id: _activeGraphId, alpha: 0.15,
+                });
+              }
+            })
+          )
+      )
+      .attr('cx', d => d.x != null ? d.x : 0)
+      .attr('cy', d => d.y != null ? d.y : 0);
+  }
 }
 
 // =========================================================================
