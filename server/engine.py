@@ -858,6 +858,330 @@ def compute_multiway(init_state: Hypergraph, lhs, rhs, max_steps=4, max_states=3
         "defaultPathHashes": list(default_path_hashes),
     }
 
+# ── per-occurrence multiway BFS (Phase B1) ───────────────────────────
+
+def _normalize_new_nodes(
+    parent_nodes: set[int],
+    result_state: Hypergraph,
+    produced: list[list[int]],
+) -> tuple[Hypergraph, list[list[int]]]:
+    """Remap fresh nodes to sequential IDs starting from max(parent_nodes)+1.
+
+    ``apply_rule_once`` uses thread-local ``fresh()`` to allocate IDs for new
+    variables.  The specific IDs depend on how many earlier expansions ran in
+    the same BFS pass, so two structurally identical application paths end up
+    with different node labels.  This breaks match-index stability across paths.
+
+    By remapping every node that was NOT in the parent state to sequential IDs
+    (max_parent+1, max_parent+2, …) in order of first appearance in the result
+    state, we make the child state deterministic given only (parent_state,
+    match_idx).  Both the BFS expansion and the sequential replay in
+    ``causal_graph_for_path`` produce the SAME state — so ``branch_path``
+    indices reliably select the same structural matches on replay.
+
+    Args:
+        parent_nodes: Set of node IDs present in the parent state.
+        result_state: New state from ``apply_rule_once`` (remaining + produced).
+        produced:     Produced edges from the rewrite event (subset of result_state).
+
+    Returns:
+        ``(normalized_state, normalized_produced)`` where every fresh node has
+        been remapped to a canonical sequential ID.
+    """
+    max_parent = max(parent_nodes, default=-1)
+    mapping: dict[int, int] = {}
+    next_id = max_parent + 1
+
+    norm_state: Hypergraph = []
+    for edge in result_state:
+        new_edge: list[int] = []
+        for n in edge:
+            if n not in parent_nodes:
+                if n not in mapping:
+                    mapping[n] = next_id
+                    next_id += 1
+                new_edge.append(mapping[n])
+            else:
+                new_edge.append(n)
+        norm_state.append(new_edge)
+
+    # Apply the same mapping to the event's produced list.
+    # Remaining edges only contain parent nodes (no remapping needed), so
+    # ``mapping.get(n, n)`` is an identity for them.
+    norm_produced = [[mapping.get(n, n) for n in edge] for edge in produced]
+    return norm_state, norm_produced
+
+
+def compute_multiway_occurrences(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    max_steps: int = 4,
+    max_occurrences: int = 5000,
+    max_time_ms: int = 5000,
+) -> dict:
+    """BFS over the multiway system tracking every history occurrence separately.
+
+    Unlike ``compute_multiway()`` which merges isomorphic states by canonical
+    hash, this function tracks each distinct *history path* as its own
+    occurrence.  Every occurrence carries a ``branch_path`` — the exact
+    sequence of match indices applied to the freshly-replayed state at each
+    step — which is a replay-stable path token.
+
+    **Why branch_path is replay-stable (fixes Phase A)**
+
+    Phase A exposed ``match_idx`` from the *quotient* multiway edges: the index
+    was relative to whichever representative state happened to be stored for a
+    canonical hash, not to the actual replayed state.  After an isomorphic
+    merge, re-playing that index from the initial state could select a different
+    match and land in a different canonical state (empirically: 70/108 BFS paths
+    mismatched for rule1, 227/299 for rule5).
+
+    Here each occurrence records the match index applied to its *own* parent's
+    exact state.  ``branch_path = parent.branch_path + [match_idx]``, built
+    incrementally during the BFS.  Replaying ``branch_path`` from ``init_state``
+    via ``causal_graph_for_path()`` always reproduces the same canonical hash as
+    ``occurrence["canonical_hash"]`` — by construction.
+
+    **Caps**
+
+    Occurrence count can grow much faster than state count (up to
+    ``product of match-count-per-step`` vs ``number of distinct canonical
+    hashes``).  Two caps prevent unbounded growth:
+
+    * ``max_occurrences`` (default 5 000): stop expanding once the total
+      occurrence count reaches this limit; set ``truncated=True`` with
+      ``truncation_reason="max_occurrences"``.
+    * ``max_time_ms`` (default 5 000 ms): wall-clock cap; set
+      ``truncation_reason="max_time_ms"`` when exceeded.
+
+    When truncated, the returned occurrences are a valid prefix of the full
+    BFS tree (all provenance links are consistent within the returned set).
+
+    **Memory note**
+
+    Each occurrence stores its full state internally during the BFS (needed to
+    compute matches for the next level).  States are stripped from the returned
+    payload to keep it compact.  To replay a specific path use
+    ``causal_graph_for_path(init_state, lhs, rhs, occ["branch_path"])``.
+
+    Args:
+        init_state:       Initial hypergraph.
+        lhs:              Parsed LHS pattern (from ``parse_notation``).
+        rhs:              Parsed RHS pattern.
+        max_steps:        Maximum BFS depth (rewrite steps from root).
+        max_occurrences:  Total occurrence cap including the root.
+        max_time_ms:      Wall-clock cap in milliseconds.
+
+    Returns::
+
+        {
+          "occurrences": [
+            {
+              "occ_id":         int,            # unique; 0 = root
+              "step":           int,            # depth from root (0 for root)
+              "canonical_hash": str,            # canonical hash of state
+              "parent_occ_id":  int | None,     # None for root
+              "match_idx":      int | None,     # match applied to parent state
+              "branch_path":    list[int],      # replay-stable path from root
+              "consumed":       list[list[int]],# edges consumed ([] for root)
+              "produced":       list[list[int]],# edges produced ([] for root)
+            },
+            ...
+          ],
+          "root_hash":         str,    # canonical hash of init_state
+          "truncated":         bool,
+          "truncation_reason": str | None,  # "max_occurrences"|"max_time_ms"|None
+        }
+    """
+    max_n = max((n for e in init_state for n in e), default=0)
+    reset(max_n)
+
+    t0 = time.time()
+    root_hash = canonical_hash(init_state)
+
+    # Root occurrence — no parent, no rewrite event.
+    root: dict = {
+        "occ_id": 0,
+        "step": 0,
+        "canonical_hash": root_hash,
+        "parent_occ_id": None,
+        "match_idx": None,
+        "branch_path": [],
+        "consumed": [],
+        "produced": [],
+        "_state": [e[:] for e in init_state],  # internal; stripped before return
+    }
+
+    occurrences: list[dict] = [root]
+    frontier: list[dict] = [root]
+    next_occ_id: int = 1
+    truncated: bool = False
+    truncation_reason: Optional[str] = None
+
+    for _step in range(1, max_steps + 1):
+        if not frontier:
+            break
+        if (time.time() - t0) * 1000 > max_time_ms:
+            truncated = True
+            truncation_reason = "max_time_ms"
+            break
+
+        new_frontier: list[dict] = []
+        for parent in frontier:
+            parent_state: Hypergraph = parent["_state"]
+            matches = find_matches(parent_state, lhs)
+            if not matches:
+                continue
+
+            for mi_idx in range(len(matches)):
+                if len(occurrences) >= max_occurrences:
+                    truncated = True
+                    truncation_reason = "max_occurrences"
+                    break
+                if (time.time() - t0) * 1000 > max_time_ms:
+                    truncated = True
+                    truncation_reason = "max_time_ms"
+                    break
+
+                result = apply_rule_once([e[:] for e in parent_state], lhs, rhs, mi_idx)
+                if result is None:
+                    continue  # match_idx out of range (shouldn't happen)
+
+                # Normalize fresh node IDs so branch_path indices are replay-
+                # stable regardless of BFS expansion order.  See _normalize_new_nodes.
+                parent_nodes: set[int] = set(n for e in parent_state for n in e)
+                norm_state, norm_produced = _normalize_new_nodes(
+                    parent_nodes, result["state"], result["event"]["produced"]
+                )
+
+                child_hash = canonical_hash(norm_state)
+                occ: dict = {
+                    "occ_id": next_occ_id,
+                    "step": _step,
+                    "canonical_hash": child_hash,
+                    "parent_occ_id": parent["occ_id"],
+                    "match_idx": mi_idx,
+                    "branch_path": parent["branch_path"] + [mi_idx],
+                    "consumed": result["event"]["consumed"],
+                    "produced": norm_produced,
+                    "_state": norm_state,
+                }
+                next_occ_id += 1
+                occurrences.append(occ)
+                new_frontier.append(occ)
+
+            if truncated:
+                break
+
+        if truncated:
+            break
+        frontier = new_frontier
+
+    # Strip internal _state field before returning (keep payload compact).
+    public_occs = [{k: v for k, v in occ.items() if k != "_state"} for occ in occurrences]
+
+    return {
+        "occurrences": public_occs,
+        "root_hash": root_hash,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+    }
+
+
+# ── selected-path causal replay (Phase A helper — reused by B) ────────
+
+def causal_graph_for_path(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    match_indices: list[int],
+) -> dict:
+    """Compute the causal graph for a specific history through the multiway system.
+
+    Each ``match_indices[k]`` selects which match to apply at step k, starting
+    from ``init_state``.  This replays a concrete linear history — one valid
+    branch of the multiway exploration — and returns its causal graph.
+
+    The ``match_indices`` here should come from ``occurrence["branch_path"]``
+    returned by ``compute_multiway_occurrences()``, NOT from the quotient
+    ``match_idx`` on ``compute_multiway()`` edges.  ``branch_path`` values are
+    replay-stable (they were recorded relative to the exact replayed state at
+    each step); quotient-edge match indices are not (they are relative to an
+    arbitrary isomorphic representative after canonical merging).
+
+    Causal attribution uses ``defaultdict(list)`` FIFO queues — same approach
+    as ``evolve()`` — so duplicate hyperedge instances trace to their own
+    distinct producers.
+
+    Args:
+        init_state:    Initial hypergraph.
+        lhs:           Parsed LHS pattern.
+        rhs:           Parsed RHS pattern.
+        match_indices: Replay-stable path token (use ``occ["branch_path"]``).
+
+    Returns::
+
+        {
+          "events":       [{id, consumed, produced}, ...],  # one per step
+          "causal_edges": [[src_id, dst_id], ...],
+          "states":       [state_0, state_after_step_0, ...],  # len = steps+1
+        }
+
+    Raises:
+        ValueError: if ``match_indices[k]`` is out of range at step k.
+    """
+    max_n = max((n for e in init_state for n in e), default=0)
+    reset(max_n)
+
+    state: Hypergraph = [e[:] for e in init_state]
+    events: list[dict] = []
+    causal_edges: list[list[int]] = []
+    states: list[Hypergraph] = [[e[:] for e in state]]
+    produced_index: dict[tuple, list[int]] = defaultdict(list)
+
+    for step, match_idx in enumerate(match_indices):
+        result = apply_rule_once(state, lhs, rhs, match_idx)
+        if result is None:
+            raise ValueError(
+                f"step {step}: match_idx {match_idx} is out of range "
+                f"(only {len(find_matches(state, lhs))} matches available)"
+            )
+
+        # Apply the same normalization used in compute_multiway_occurrences so
+        # that node IDs are identical between BFS expansion and replay.
+        state_nodes: set[int] = set(n for e in state for n in e)
+        norm_state, norm_produced = _normalize_new_nodes(
+            state_nodes, result["state"], result["event"]["produced"]
+        )
+
+        ev_id = len(events)
+        ev = {
+            "id": ev_id,
+            "consumed": result["event"]["consumed"],
+            "produced": norm_produced,
+        }
+
+        # FIFO pop — each duplicate instance traces to its own distinct producer.
+        seen_cause_ids: set[int] = set()
+        for consumed_edge in ev["consumed"]:
+            q = produced_index[tuple(consumed_edge)]
+            if q:
+                cause_id = q.pop(0)
+                if cause_id not in seen_cause_ids:
+                    seen_cause_ids.add(cause_id)
+                    causal_edges.append([cause_id, ev_id])
+
+        for produced_edge in norm_produced:
+            produced_index[tuple(produced_edge)].append(ev_id)
+
+        events.append(ev)
+        state = norm_state
+        states.append([e[:] for e in state])
+
+    return {"events": events, "causal_edges": causal_edges, "states": states}
+
+
 # ── notation parser ───────────────────────────────────────────────────
 import re
 
