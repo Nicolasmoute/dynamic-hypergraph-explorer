@@ -1567,27 +1567,19 @@ function renderCausal() {
   const width = rect.width, height = rect.height;
   svg.attr('width', width).attr('height', height);
 
-  let allEvNodes = [];
-  let allCausalEdges = [];
-  let eventInfo = {};
-  // produced-edge lookup: JSON(edge) → [eventId, ...] — replaces the O(n²)
-  // inner scan when computing causal edges for alternative matches.
-  const producedEdgeIndex = new Map();
-
-  function _indexProduced(evId, produced) {
-    for (const e of (produced || [])) {
-      const k = JSON.stringify(e);
-      if (!producedEdgeIndex.has(k)) producedEdgeIndex.set(k, []);
-      producedEdgeIndex.get(k).push(evId);
-    }
-  }
+  // Render only real server-provided causal events and edges.
+  // (The synthetic alternative-match overlay was removed — see Sofia's investigation
+  //  report: knowledge/reports/2026-05-02-causal-green-dots-investigation.md.
+  //  Alternatives belong in the multiway view, not here.)
+  const allEvNodes = [];
+  const allCausalEdges = [];
+  const eventInfo = {};
 
   let greedyStep = 0;
   for (const stepEvents of (data.events || [])) {
     for (const ev of stepEvents) {
-      allEvNodes.push({ id: ev.id, step: greedyStep, consumed: ev.consumed, produced: ev.produced, onPath: true });
+      allEvNodes.push({ id: ev.id, step: greedyStep, consumed: ev.consumed, produced: ev.produced });
       eventInfo[ev.id] = ev;
-      _indexProduced(ev.id, ev.produced);
     }
     greedyStep++;
   }
@@ -1595,54 +1587,8 @@ function renderCausal() {
     allCausalEdges.push({ source: a, target: b });
   }
 
-  // Alternative matches using lightweight client-side matching
-  const ruleDef = RULES.find(r => r.id === activeRule);
-  let parsedRule = null;
-  if (ruleDef) parsedRule = parseNotation(ruleDef.notation);
-  else if (data._customParsed) parsedRule = data._customParsed;
-
-  if (parsedRule && data.states) {
-    let altId = 100000;
-    const maxAltStep = Math.min((data.states || []).length - 1, currentStep);
-
-    for (let s = 0; s < maxAltStep; s++) {
-      const state = data.states[s];
-      if (!state) continue;
-      const matches = HGEngine.findMatches(state, parsedRule.lhs);
-
-      const greedyConsumedSigs = new Set();
-      const stepEvts = (data.events[s] || []);
-      for (const ev of stepEvts) {
-        greedyConsumedSigs.add(JSON.stringify(ev.consumed));
-      }
-
-      for (const [matchedIndices, binding] of matches) {
-        const consumed = matchedIndices.map(i => state[i]);
-        const sig = JSON.stringify(consumed);
-        if (greedyConsumedSigs.has(sig)) continue;
-
-        const node = { id: altId, step: s, consumed, produced: [], onPath: false };
-        allEvNodes.push(node);
-        eventInfo[altId] = node;
-
-        // O(consumed_edges) lookup instead of O(all_events) scan
-        const seen = new Set();
-        for (const ce of consumed) {
-          for (const prevId of (producedEdgeIndex.get(JSON.stringify(ce)) || [])) {
-            if (!seen.has(prevId) && eventInfo[prevId] && eventInfo[prevId].step < s) {
-              seen.add(prevId);
-              allCausalEdges.push({ source: prevId, target: altId });
-            }
-          }
-        }
-        altId++;
-      }
-    }
-  }
-
   const visibleEvents = allEvNodes.filter(e => e.step < currentStep);
   const visibleIds = new Set(visibleEvents.map(e => e.id));
-  const pathEventIds = new Set(visibleEvents.filter(e => e.onPath).map(e => e.id));
   const filteredEdges = allCausalEdges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
 
   const eventStep = {};
@@ -1668,47 +1614,29 @@ function renderCausal() {
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.2);
 
   g.append('defs').append('marker')
-    .attr('id', 'arrow').attr('viewBox', '0 -3 6 6').attr('refX', 8)
-    .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
-    .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', isDark ? '#4cdd8a60' : '#1a9f5c80');
-
-  g.append('defs').append('marker')
-    .attr('id', 'arrow-red').attr('viewBox', '0 -3 6 6').attr('refX', 8)
+    .attr('id', 'arrow-causal').attr('viewBox', '0 -3 6 6').attr('refX', 8)
     .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
     .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', '#ff4444');
 
   const link = g.append('g').selectAll('line').data(filteredEdges).join('line')
-    .attr('stroke', d => {
-      const s = typeof d.source === 'object' ? d.source.id : d.source;
-      const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return (pathEventIds.has(s) && pathEventIds.has(t)) ? '#ff444480' : (isDark ? '#4cdd8a40' : '#1a9f5c50');
-    })
-    .attr('stroke-width', d => {
-      const s = typeof d.source === 'object' ? d.source.id : d.source;
-      const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return (pathEventIds.has(s) && pathEventIds.has(t)) ? 2 : 0.8;
-    })
-    .attr('marker-end', d => {
-      const s = typeof d.source === 'object' ? d.source.id : d.source;
-      const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return (pathEventIds.has(s) && pathEventIds.has(t)) ? 'url(#arrow-red)' : 'url(#arrow)';
-    });
+    .attr('stroke', '#ff444480')
+    .attr('stroke-width', 2)
+    .attr('marker-end', 'url(#arrow-causal)');
 
   const node_el = g.append('g').selectAll('circle').data(nodes).join('circle')
-    .attr('r', d => pathEventIds.has(d.id) ? nodeR * 1.5 : nodeR)
-    .attr('fill', d => pathEventIds.has(d.id) ? '#ff4444' : (isDark ? '#4cdd8a' : '#1a9f5c'))
-    .attr('fill-opacity', d => pathEventIds.has(d.id) ? 1 : 0.5)
-    .attr('stroke', d => pathEventIds.has(d.id) ? '#ff444480' : (isDark ? '#08080c' : '#fff'))
-    .attr('stroke-width', d => pathEventIds.has(d.id) ? 2 : 0.5)
+    .attr('r', nodeR * 1.5)
+    .attr('fill', '#ff4444')
+    .attr('fill-opacity', 1)
+    .attr('stroke', '#ff444480')
+    .attr('stroke-width', 2)
     .style('cursor', 'pointer')
     .on('mouseenter', (ev, d) => {
       const info = eventInfo[d.id];
       if (!info) { showTooltip(ev, `Event ${d.id} (step ${eventStep[d.id] || '?'})`); return; }
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
-      const onPath = pathEventIds.has(d.id) ? ' \u2714 on displayed path' : ' (alternative branch)';
       showTooltip(ev,
-        `Event #${d.id}  (step ${eventStep[d.id] || '?'})${onPath}\n` +
+        `Event #${d.id}  (step ${eventStep[d.id] || '?'})\n` +
         `Consumed: ${consumed || 'none'}\n` +
         `Produced: ${produced || 'none'}`
       );
