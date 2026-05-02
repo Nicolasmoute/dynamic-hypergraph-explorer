@@ -124,6 +124,178 @@ class TestGetMultiway:
         assert client.get("/api/rules/ghost/multiway").status_code == 404
 
 
+# ── /api/rules/{rule_id}/multiway-causal ─────────────────────────────
+
+class TestGetMultiwayCausal:
+    """Tests for GET /api/rules/{rule_id}/multiway-causal."""
+
+    def test_valid_rule_returns_200(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal")
+        assert r.status_code == 200
+
+    def test_response_has_required_keys(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal").json()
+        for key in ("events", "causal_edges", "default_path_event_ids",
+                    "truncated", "truncation_reason", "meta"):
+            assert key in data, f"Missing key: {key}"
+
+    def test_meta_has_rule_fields(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal").json()
+        meta = data["meta"]
+        assert meta["rule_id"] == "rule3"
+        assert "rule_notation" in meta
+        assert "init_state" in meta
+
+    def test_events_are_list(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal").json()
+        assert isinstance(data["events"], list)
+        assert len(data["events"]) > 0
+
+    def test_event_fields_present(self, client):
+        events = client.get("/api/rules/rule3/multiway-causal").json()["events"]
+        for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
+                      "consumed", "produced", "branch_path"):
+            assert field in events[0], f"Missing event field: {field}"
+
+    def test_causal_edges_reference_valid_ids(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal").json()
+        event_ids = {ev["id"] for ev in data["events"]}
+        for src, dst in data["causal_edges"]:
+            assert src in event_ids, f"Causal edge src {src} not a valid event id"
+            assert dst in event_ids, f"Causal edge dst {dst} not a valid event id"
+
+    def test_default_path_event_ids_subset_of_events(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal").json()
+        event_ids = {ev["id"] for ev in data["events"]}
+        for eid in data["default_path_event_ids"]:
+            assert eid in event_ids, f"Default path event {eid} not in events"
+
+    def test_truncated_field_is_bool(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal").json()
+        assert isinstance(data["truncated"], bool)
+
+    def test_low_max_occurrences_triggers_truncation(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_occurrences=5&max_steps=4")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["truncated"] is True
+
+    def test_invalid_rule_returns_404(self, client):
+        r = client.get("/api/rules/ghost/multiway-causal")
+        assert r.status_code == 404
+
+    def test_cap_params_accepted(self, client):
+        """Custom cap query params are accepted without error."""
+        r = client.get("/api/rules/rule3/multiway-causal?max_steps=2&max_occurrences=100&max_time_ms=2000")
+        assert r.status_code == 200
+
+    def test_different_caps_produce_independent_cache_entries(self, client):
+        """Two requests with different caps can differ in truncated state."""
+        r_small = client.get("/api/rules/rule3/multiway-causal?max_occurrences=10")
+        r_large = client.get("/api/rules/rule3/multiway-causal?max_occurrences=5000")
+        assert r_small.status_code == 200
+        assert r_large.status_code == 200
+        # Small cap should be truncated; large cap may not be
+        assert r_small.json()["truncated"] is True
+
+
+# ── POST /api/custom/multiway-causal ─────────────────────────────────
+
+class TestCustomMultiwayCausal:
+    """Tests for POST /api/custom/multiway-causal (synchronous)."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def _post(self, **kwargs):
+        defaults = {
+            "notation": "{{x,y}} -> {{x,y},{y,z}}",
+            "init": [[0, 1]],
+            "max_steps": 3,
+            "max_occurrences": 500,
+            "max_time_ms": 5000,
+        }
+        defaults.update(kwargs)
+        return self.client.post("/api/custom/multiway-causal", json=defaults)
+
+    def test_returns_200(self):
+        assert self._post().status_code == 200
+
+    def test_response_has_required_keys(self):
+        data = self._post().json()
+        for key in ("events", "causal_edges", "default_path_event_ids",
+                    "truncated", "truncation_reason", "meta"):
+            assert key in data, f"Missing key: {key}"
+
+    def test_meta_has_notation_and_init(self):
+        data = self._post().json()
+        assert "rule_notation" in data["meta"]
+        assert "init_state" in data["meta"]
+
+    def test_events_non_empty(self):
+        data = self._post().json()
+        assert isinstance(data["events"], list)
+        assert len(data["events"]) > 0
+
+    def test_causal_edges_reference_valid_ids(self):
+        data = self._post().json()
+        event_ids = {ev["id"] for ev in data["events"]}
+        for src, dst in data["causal_edges"]:
+            assert src in event_ids
+            assert dst in event_ids
+
+    def test_truncated_field_is_bool(self):
+        data = self._post().json()
+        assert isinstance(data["truncated"], bool)
+
+    def test_low_max_occurrences_triggers_truncation(self):
+        data = self._post(max_occurrences=3, max_steps=4).json()
+        assert data["truncated"] is True
+
+    def test_bad_notation_returns_400(self):
+        r = self._post(notation="not a rule")
+        assert r.status_code == 400
+
+    def test_empty_init_returns_400(self):
+        r = self._post(init=[])
+        assert r.status_code == 400
+
+    def test_max_steps_zero_returns_400(self):
+        r = self._post(max_steps=0)
+        assert r.status_code == 400
+
+    def test_max_steps_too_large_returns_400(self):
+        r = self._post(max_steps=9)
+        assert r.status_code == 400
+
+    def test_max_occurrences_too_large_returns_400(self):
+        r = self._post(max_occurrences=20_001)
+        assert r.status_code == 400
+
+    def test_unicode_arrow_notation(self):
+        r = self._post(notation="{{x,y}} → {{x,y},{y,z}}")
+        assert r.status_code == 200
+
+    def test_ternary_rule(self):
+        r = self._post(
+            notation="{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}",
+            init=[[0, 1, 2]],
+            max_steps=2,
+            max_occurrences=200,
+        )
+        assert r.status_code == 200
+
+    def test_default_path_non_empty(self):
+        data = self._post().json()
+        assert len(data["default_path_event_ids"]) > 0
+
+    def test_response_is_synchronous_no_job_id(self):
+        """POST /api/custom/multiway-causal returns direct payload, not a job handle."""
+        data = self._post().json()
+        assert "job_id" not in data
+
+
 # ── /api/custom ───────────────────────────────────────────────────────
 
 class TestCustomRule:
