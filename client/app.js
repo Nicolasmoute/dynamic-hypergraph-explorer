@@ -461,7 +461,7 @@ function clearLineage() {
   selectedEdges = [];
   lineageSets = [];
   document.getElementById('lineage-bar').classList.remove('active');
-  renderSpatial();
+  renderCurrentView();   // renderer-aware: routes to canvas or SVG path
 }
 
 // =========================================================================
@@ -1032,6 +1032,10 @@ function renderSpatialCanvas() {
   // ── SVG as hit-test overlay (no visual paint, transparent shapes only) ────
   const svg = d3.select('#main-svg');
   svg.selectAll('*').remove();
+
+  // Nudge mode: wire the same repulsion interaction onto the overlay SVG.
+  // 'line' tags don't appear in the overlay (edge paths are <path>), so
+  // skip interaction on <circle> and <path> elements only.
   svg.on('mousedown.nudge', null).on('mousemove.nudge', null).on('mouseup.nudge', null);
   svg.on('click', function(e) { if (e.target === this) clearLineage(); });
 
@@ -1062,6 +1066,38 @@ function renderSpatialCanvas() {
     });
   });
   svg.call(zoomBehavior);
+
+  // ── Nudge mode (canvas path) ──────────────────────────────────────────────
+  // Near-copy of the SVG nudge block; overlay elements are <circle>/<path>
+  // (not <line>), so we skip those and activate only on bare SVG background.
+  if (opts.nudge) {
+    svg.style('cursor', 'crosshair');
+    svg.on('mousedown.zoom', null);  // disable zoom while nudging
+    const nudgeRadius = 140, nudgeStrength = 2.0;
+    let nudging = false;
+    svg.on('mousedown.nudge', function(e) {
+      const tag = e.target.tagName;
+      if (tag === 'circle' || tag === 'path') return;
+      nudging = true;
+    });
+    svg.on('mousemove.nudge', function(e) {
+      if (!nudging) return;
+      const transform = d3.zoomTransform(svg.node());
+      const mx = (e.offsetX - transform.x) / transform.k;
+      const my = (e.offsetY - transform.y) / transform.k;
+      nodes.forEach(n => {
+        const dx = n.x - mx, dy = n.y - my;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < nudgeRadius && dist > 1) {
+          const force = nudgeStrength * (1 - dist / nudgeRadius);
+          n.vx += (dx / dist) * force * 10;
+          n.vy += (dy / dist) * force * 10;
+        }
+      });
+      simulation.alpha(0.3).restart();
+    });
+    svg.on('mouseup.nudge', () => { nudging = false; });
+  }
 
   // ── Force simulation (main-thread, Phase 2) ───────────────────────────────
   if (simulation) {
