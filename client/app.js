@@ -321,9 +321,15 @@ const _SCRUB_END_MS        = 250;  // ms after last slider move before overlay r
 const _OVERLAY_NODE_THRESH = 200;  // node count above which scrub skip applies
 // LEVER-1: throttle SVG overlay setAttribute storm to ≤10fps during worker ticks.
 // setAttribute accounts for 8-19% of CPU at spec scale (CDP profile 2026-05-02).
+// Overlay positions are intentionally up to 100ms stale; pointermove keeps them fresher
+// during hover intent so the gap at click time is bounded by the rAF interval (≤16ms).
 let _lastOverlayUpdateMs          = 0;
-let _overlayNeedsImmediateUpdate  = false; // set on pointerdown → click targets stay fresh
+let _overlayNeedsImmediateUpdate  = false;
 const _OVERLAY_UPDATE_INTERVAL_MS = 100;   // 10fps maximum for overlay attr updates
+// LEVER-4: hull cache invalidation key — covers ALL topology-change callers, not only
+// slider input.  Key encodes (rule, step, multiwayNode, edgeCount); renderSpatialCanvas()
+// compares and calls CanvasRenderer.invalidateHullCache() whenever it changes.
+let _hullCacheKey = '';
 // LEVER-2: cache canvas-area bounding rect (invalidated by ResizeObserver).
 // Eliminates getBoundingClientRect() call on every step change (2-3% during scrub).
 let _canvasAreaRect = { width: 0, height: 0 };
@@ -713,9 +719,9 @@ function setStepFromSlider(step) {
   if (selectedEdges.length > 0) recomputeLineage();
   // PERF-SCRUB: mark as scrubbing so renderSpatialCanvas skips expensive SVG overlay
   // rebuild on large graphs.  250 ms after the last slider move, rebuild the full overlay.
-  // LEVER-4: invalidate hull cache on every step change so new topology gets fresh hulls.
+  // Hull cache invalidation is handled by the _hullCacheKey check inside renderSpatialCanvas(),
+  // which covers all callers (slider, setStep, rule change, multiway state change).
   if (USE_CANVAS && !_canvasWorkerDisabled) {
-    CanvasRenderer.invalidateHullCache();
     _isScrubbing = true;
     if (_scrubEndTimer) clearTimeout(_scrubEndTimer);
     _scrubEndTimer = setTimeout(() => {
@@ -1060,6 +1066,15 @@ function renderSpatialCanvas() {
     ? mw.states[selectedMultiwayNode].state
     : data.states[currentStep];
 
+  // LEVER-4: invalidate hull cache whenever topology identity changes.
+  // Covers ALL entry points: slider, setStep() (play/keyboard), selectRule(),
+  // multiway-node selection, and explicit invalidation (hulls toggle-on, key reset).
+  const _nextHullKey = `${activeRule}:${currentStep}:${selectedMultiwayNode || ''}:${(state || []).length}`;
+  if (_nextHullKey !== _hullCacheKey) {
+    _hullCacheKey = _nextHullKey;
+    CanvasRenderer.invalidateHullCache();
+  }
+
   // ── Build graph topology (same as renderSpatial) ─────────────────────────
   // LEVER-3: reuse pre-allocated arrays (clear + push) to reduce per-step GC pressure.
   const nodeSet  = new Set();
@@ -1174,9 +1189,13 @@ function renderSpatialCanvas() {
   // skip interaction on <circle> and <path> elements only.
   svg.on('mousedown.nudge', null).on('mousemove.nudge', null).on('mouseup.nudge', null);
   svg.on('click', function(e) { if (e.target === this) clearLineage(); });
-  // LEVER-1: force an immediate overlay position refresh on the next _drawTick()
-  // before any pointerdown event resolves to a click, ensuring hit-test accuracy.
-  svg.on('pointerdown.overlayRefresh', () => { _overlayNeedsImmediateUpdate = true; });
+  // LEVER-1: on pointermove, flag an immediate overlay refresh so that hover intent
+  // keeps overlay positions fresh.  By the time the user clicks (mouse movement has
+  // stopped), the overlay was refreshed within the last rAF cycle (≤16ms stale rather
+  // than up to 100ms).  Note: browser hit-testing is resolved before any JS runs, so
+  // no JS-side handler can change the already-chosen click target — the ≤16ms bound
+  // is the best achievable accuracy with this throttle approach.
+  svg.on('pointermove.overlayRefresh', () => { _overlayNeedsImmediateUpdate = true; });
 
   const overlayG     = svg.append('g');
   const overlayEdgeG = overlayG.append('g');  // edges below nodes (z-order)
@@ -1897,6 +1916,10 @@ function stepPlus1() {
 function toggleOption(opt) {
   opts[opt] = !opts[opt];
   document.getElementById('toggle-' + opt).classList.toggle('on', opts[opt]);
+  // LEVER-4: when hulls are toggled on, reset the cache key so renderSpatialCanvas()
+  // recomputes fresh convex hulls on the next draw (cache may hold stale polygon data
+  // from a previous topology if hulls were off while the step/rule changed).
+  if (opt === 'hulls' && opts.hulls) _hullCacheKey = '';
   if (opt === 'nudge') {
     const hint = document.getElementById('nudge-hint');
     hint.hidden = !opts.nudge;
