@@ -393,14 +393,19 @@ def evolve(
     causal_edges = []
 
     # Rec-2: causal index — O(1) lookup replaces O(N) linear scan over flat_events.
-    # Maps edge_tuple → id of the event that most recently produced that edge.
+    # Maps edge_tuple → ordered list of event IDs that produced instances of that
+    # edge content (FIFO queue).  A list is required — not a plain dict — because
+    # multiple events can produce edges with identical node-ID content (duplicate
+    # hyperedge instances).  Using a single int would overwrite earlier producers,
+    # mis-attributing every consumer of those duplicates to the last writer.
+    # On consume we pop the front (FIFO); on produce we append to the back.
     # Seeded from initial_flat_events so cross-boundary causal links are correct
     # when extending a cached evolution (extend endpoint path).
-    produced_index: dict[tuple, int] = {}
+    produced_index: dict[tuple, list[int]] = defaultdict(list)
     if initial_flat_events:
         for pev in initial_flat_events:
             for edge in pev["produced"]:
-                produced_index[tuple(edge)] = pev["id"]
+                produced_index[tuple(edge)].append(pev["id"])
 
     try:
         for s in range(steps):
@@ -422,18 +427,23 @@ def evolve(
 
             # Causal edges — O(k) per event via produced_index.
             # First pass: look up consumed edges → cause event IDs.
+            #   For each consumed edge, pop the front of its queue (FIFO).
+            #   Popping ensures each duplicate instance is attributed to its own
+            #   distinct producer rather than the most-recent one.
             # Second pass: register produced edges in the index.
             # Keeping passes separate avoids intra-step self-causality.
             for ev in step_evts:
                 seen_cause_ids: set[int] = set()
                 for consumed_edge in ev["consumed"]:
-                    cause_id = produced_index.get(tuple(consumed_edge))
-                    if cause_id is not None and cause_id not in seen_cause_ids:
-                        seen_cause_ids.add(cause_id)
-                        causal_edges.append([cause_id, ev["id"]])
+                    q = produced_index[tuple(consumed_edge)]
+                    if q:
+                        cause_id = q.pop(0)
+                        if cause_id not in seen_cause_ids:
+                            seen_cause_ids.add(cause_id)
+                            causal_edges.append([cause_id, ev["id"]])
             for ev in step_evts:
                 for produced_edge in ev["produced"]:
-                    produced_index[tuple(produced_edge)] = ev["id"]
+                    produced_index[tuple(produced_edge)].append(ev["id"])
 
             all_events.append([{"id": e["id"], "consumed": e["consumed"], "produced": e["produced"]} for e in step_evts])
             states.append([e[:] for e in nxt])

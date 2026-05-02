@@ -452,3 +452,90 @@ class TestCausalIndexRec2:
         result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=5)
         for src, dst in result["causal_edges"]:
             assert src != dst, f"self-causal edge detected: {src} -> {dst}"
+
+    def test_duplicate_edge_instances_get_distinct_causal_attribution(self):
+        """Each duplicate hyperedge instance must trace to its own producer.
+
+        The identity rule {x,y}->{x,y} on a state with two copies of [1,2]
+        fires twice in step 1 (event 0 and event 1), each producing one [1,2].
+        In step 2 (events 2 and 3), each consumer should be attributed to its
+        own distinct step-1 producer.
+
+        Old code (dict): produced_index[(1,2)] is overwritten to 1 after step 1,
+        so both step-2 events incorrectly attribute to event 1 only.
+
+        New code (list/queue): produced_index[(1,2)] = [0, 1]; pop-FIFO gives
+        event 2 → cause 0 and event 3 → cause 1.
+        """
+        engine.reset(0)
+        lhs = [["x", "y"]]
+        rhs = [["x", "y"]]  # identity — produces identical edge content
+
+        result = engine.evolve([[1, 2], [1, 2]], lhs, rhs, steps=2)
+
+        step1_evts = result["events"][0]
+        step2_evts = result["events"][1]
+        assert len(step1_evts) == 2, "expected 2 events in step 1"
+        assert len(step2_evts) == 2, "expected 2 events in step 2"
+
+        ev0_id = step1_evts[0]["id"]
+        ev1_id = step1_evts[1]["id"]
+        ev2_id = step2_evts[0]["id"]
+        ev3_id = step2_evts[1]["id"]
+
+        causal = result["causal_edges"]
+        causes_of_ev2 = {s for s, d in causal if d == ev2_id}
+        causes_of_ev3 = {s for s, d in causal if d == ev3_id}
+
+        # Each step-2 event must be caused by exactly one step-1 event
+        assert len(causes_of_ev2) == 1, f"ev2 has {len(causes_of_ev2)} causes, expected 1"
+        assert len(causes_of_ev3) == 1, f"ev3 has {len(causes_of_ev3)} causes, expected 1"
+
+        # The two causes must be DIFFERENT — each duplicate instance has its own producer
+        assert causes_of_ev2 != causes_of_ev3, (
+            "Both step-2 events attributed to the same producer "
+            f"({causes_of_ev2}) — duplicate-edge causal-attribution bug"
+        )
+        # Both must be valid step-1 IDs
+        assert causes_of_ev2 <= {ev0_id, ev1_id}
+        assert causes_of_ev3 <= {ev0_id, ev1_id}
+
+    def test_same_step_duplicate_producers_attributed_correctly(self):
+        """When two events in the same step produce the same edge content,
+        the next step's consumers each trace to their own producer.
+
+        Uses a two-edge rule that merges two separate chains into the same
+        output node IDs via a hardcoded variable.  Specifically: the state
+        contains [[1,2],[3,4]], and the rule {x,y} -> {x,y} fires on both
+        edges simultaneously (step 1), producing [1,2] and [3,4].  That is
+        the straightforward single-step case above; here we add a *second*
+        step to verify the queue drains correctly across multiple steps.
+        """
+        engine.reset(0)
+        # Rule: identity
+        lhs = [["x", "y"]]
+        rhs = [["x", "y"]]
+        # Three copies of [1,2] to stress the queue over 2 steps
+        result = engine.evolve([[1, 2], [1, 2], [1, 2]], lhs, rhs, steps=2)
+
+        step2_evts = result["events"][1]
+        assert len(step2_evts) == 3, "expected 3 events in step 2"
+
+        step1_ids = {ev["id"] for ev in result["events"][0]}
+
+        causal = result["causal_edges"]
+        # Every step-2 event must have exactly one cause, and all causes
+        # must be distinct (no two step-2 events share the same producer)
+        causes = []
+        for ev in step2_evts:
+            cause_ids = {s for s, d in causal if d == ev["id"]}
+            assert len(cause_ids) == 1, (
+                f"event {ev['id']} has {len(cause_ids)} causes, expected 1"
+            )
+            cause = next(iter(cause_ids))
+            assert cause in step1_ids
+            causes.append(cause)
+
+        assert len(set(causes)) == 3, (
+            f"step-2 events share producers: {causes} — queue not draining correctly"
+        )
