@@ -16,6 +16,7 @@
 !client/
 !client/index.html
 !client/app.js
+!client/canvas-renderer.js
 
 # Docs
 !README.md

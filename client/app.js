@@ -15,6 +15,10 @@ function escHtml(str) {
 
 // \u00a76.8 [L5] BLURBS removed \u2014 rule descriptions now come from server /api/rules blurb field
 
+// Feature flag: ?renderer=canvas enables the Canvas 2D path (Phase 2/3).
+// Default (no param or ?renderer=svg) keeps the existing SVG path unchanged.
+const USE_CANVAS = new URLSearchParams(location.search).get('renderer') === 'canvas';
+
 let RULES = [];        // [{id, name, notation, desc, tag, tagClass}]
 let DATA = {};         // ruleId -> {states, events, causal_edges, stats, lineage, birthSteps}
 let MULTIWAY = {};     // ruleId -> server multiway data
@@ -560,6 +564,7 @@ function setView(view, el) {
   if (el) el.classList.add('active');
 
   document.getElementById('main-svg').style.display = view === 'spatial' ? '' : 'none';
+  if (USE_CANVAS) document.getElementById('main-canvas').style.display = view === 'spatial' ? '' : 'none';
   document.getElementById('causal-view').className = 'causal-overlay' + (view === 'causal' ? ' active' : '');
   document.getElementById('multiway-view').className = 'causal-overlay' + (view === 'multiway' ? ' active' : '');
   document.getElementById('growth-view').style.display = view === 'growth' ? '' : 'none';
@@ -568,7 +573,7 @@ function setView(view, el) {
 }
 
 function renderCurrentView() {
-  if (currentView === 'spatial') renderSpatial();
+  if (currentView === 'spatial') { if (USE_CANVAS) renderSpatialCanvas(); else renderSpatial(); }
   else if (currentView === 'causal') renderCausal();
   else if (currentView === 'multiway') renderMultiway();
   else if (currentView === 'growth') renderGrowthAnalysis();
@@ -906,6 +911,225 @@ function drawHulls(hullG, hyperedges, nodeById, birthColorFn) {
       if (pts.length < 3) return '';
       const hull = d3.polygonHull(pts);
       return hull ? 'M' + hull.join('L') + 'Z' : '';
+    });
+}
+
+// =========================================================================
+// CANVAS RENDERER PATH  (?renderer=canvas)
+// Phase 2: main-thread d3 simulation, canvas drawing, SVG hit-test overlay.
+// Phase 3 will replace the simulation with layout-worker.js postMessage ticks.
+// =========================================================================
+function renderSpatialCanvas() {
+  const data = DATA[activeRule];
+  if (!data || !data.states || currentStep >= data.states.length) {
+    // Clear canvas + overlay on empty/error state
+    const canvasEl = document.getElementById('main-canvas');
+    if (canvasEl) {
+      const ctx = canvasEl.getContext('2d');
+      ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    }
+    d3.select('#main-svg').selectAll('*').remove();
+    return;
+  }
+
+  const mw = MULTIWAY[activeRule];
+  const state = (selectedMultiwayNode && mw && mw.states && mw.states[selectedMultiwayNode])
+    ? mw.states[selectedMultiwayNode].state
+    : data.states[currentStep];
+
+  // ── Build graph topology (same as renderSpatial) ─────────────────────────
+  const nodeSet  = new Set();
+  const links    = [];
+  const selfLoops = [];
+  const hyperedges = [];
+  state.forEach((edge, idx) => {
+    edge.forEach(n => nodeSet.add(n));
+    hyperedges.push({ id: idx, nodes: edge });
+    if (edge.length === 2 && edge[0] === edge[1]) {
+      selfLoops.push({ node: edge[0], edgeIdx: idx });
+    } else if (edge.length === 2) {
+      links.push({ source: edge[0], target: edge[1], edgeIdx: idx });
+    } else {
+      for (let i = 0; i < edge.length - 1; i++) {
+        links.push({ source: edge[i], target: edge[i + 1], edgeIdx: idx });
+      }
+    }
+  });
+
+  // Curve offsets for parallel edges
+  const pairCount = {};
+  links.forEach(l => {
+    const key = l.source + '-' + l.target;
+    pairCount[key] = (pairCount[key] || 0) + 1;
+    l._pairKey = key; l._pairIdx = pairCount[key] - 1;
+  });
+  links.forEach(l => {
+    const total = pairCount[l._pairKey];
+    if (total <= 1) { l._curve = 0; }
+    else {
+      const i = l._pairIdx;
+      const sign = (i % 2 === 0) ? 1 : -1;
+      l._curve = sign * Math.ceil((i + 1) / 2) * 18;
+    }
+  });
+
+  // Warmstart node positions
+  const nodes = Array.from(nodeSet).map(id => {
+    const prev = _prevNodePositions.get(id);
+    return prev ? { id, x: prev.x, y: prev.y } : { id };
+  });
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+
+  const nodeR = Math.max(0.5, Math.min(2, 60 / Math.sqrt(nodes.length)));
+  const baseEdgeWidth = Math.max(0.8, 2.5 - nodes.length / 400);
+
+  // ── Birth-step colour helpers ─────────────────────────────────────────────
+  const birthSteps = (data.birthSteps && data.birthSteps[currentStep]) || [];
+  function edgeBirthColor(edgeIdx) {
+    const birth = birthSteps[edgeIdx] !== undefined ? birthSteps[edgeIdx] : 0;
+    return getPalette()[birth % getPalette().length];
+  }
+  const nodeBirthMap = {};
+  state.forEach((edge, idx) => {
+    const birth = birthSteps[idx] !== undefined ? birthSteps[idx] : 0;
+    edge.forEach(n => {
+      if (nodeBirthMap[n] === undefined || birth < nodeBirthMap[n]) nodeBirthMap[n] = birth;
+    });
+  });
+  function nodeBirthColor(nodeId) {
+    const birth = nodeBirthMap[nodeId] !== undefined ? nodeBirthMap[nodeId] : 0;
+    return getPalette()[birth % getPalette().length];
+  }
+
+  // Precompute base colours onto data objects (canvas renderer reads these)
+  const palette = getPalette();
+  nodes.forEach((n, i) => {
+    n._fill = opts.colors ? nodeBirthColor(n.id) : palette[i % palette.length];
+  });
+  links.forEach(l => {
+    l._stroke = opts.colors ? edgeBirthColor(l.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
+  });
+  selfLoops.forEach(sl => {
+    sl._stroke = opts.colors ? edgeBirthColor(sl.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
+  });
+  hyperedges.forEach(h => { h._color = edgeBirthColor(h.id); });
+
+  // Self-loop stacking indices
+  const loopIdxByNode = {};
+  selfLoops.forEach(sl => {
+    sl._loopIdx = loopIdxByNode[sl.node] || 0;
+    loopIdxByNode[sl.node] = sl._loopIdx + 1;
+  });
+
+  // ── Canvas setup ──────────────────────────────────────────────────────────
+  const canvasEl = document.getElementById('main-canvas');
+  const rect = document.getElementById('canvas-area').getBoundingClientRect();
+  const width = rect.width, height = rect.height;
+  canvasEl.style.display = '';
+  CanvasRenderer.init(canvasEl);
+  CanvasRenderer.resize(width, height);
+
+  // ── SVG as hit-test overlay (no visual paint, transparent shapes only) ────
+  const svg = d3.select('#main-svg');
+  svg.selectAll('*').remove();
+  svg.on('mousedown.nudge', null).on('mousemove.nudge', null).on('mouseup.nudge', null);
+  svg.on('click', function(e) { if (e.target === this) clearLineage(); });
+
+  const overlayG     = svg.append('g');
+  const overlayEdgeG = overlayG.append('g');  // edges below nodes (z-order)
+  const overlayNodeG = overlayG.append('g');
+
+  // Helper: compute edge path string for overlay (same formula as renderSpatial tick)
+  function _overlayEdgePath(d) {
+    const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
+    if (!sx && sx !== 0) return '';
+    if (d._curve === 0) return `M${sx},${sy}L${tx},${ty}`;
+    const mx = (sx + tx) / 2, my = (sy + ty) / 2;
+    const dx = tx - sx, dy = ty - sy;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    const cx = mx + nx * d._curve, cy = my + ny * d._curve;
+    return `M${sx},${sy}Q${cx},${cy} ${tx},${ty}`;
+  }
+
+  // ── Zoom behaviour ────────────────────────────────────────────────────────
+  const zoomBehavior = d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => {
+    overlayG.attr('transform', e.transform);
+    CanvasRenderer.setTransform(e.transform);
+    CanvasRenderer.drawFrame({
+      nodes, nodeById, links, selfLoops, hyperedges,
+      nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
+    });
+  });
+  svg.call(zoomBehavior);
+
+  // ── Force simulation (main-thread, Phase 2) ───────────────────────────────
+  if (simulation) {
+    simulation.nodes().forEach(n => {
+      if (n.x != null) _prevNodePositions.set(n.id, { x: n.x, y: n.y });
+    });
+    simulation.stop();
+  }
+  const baseDist = 20 + 200 / Math.sqrt(nodes.length);
+  simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id)
+      .distance(d => ((selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? baseDist * 0.2 : baseDist) * forceParams.linkDistMult)
+      .strength(d => (selectedEdges.length > 0 && getEdgeSelColor(d.edgeIdx)) ? 1.0 : forceParams.linkStrength))
+    .force('charge', d3.forceManyBody().strength((-30 - 2000 / nodes.length) * forceParams.chargeMult).distanceMax(300))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide(nodeR + 0.5))
+    .on('tick', () => {
+      // ── Draw canvas frame ─────────────────────────────────────────────────
+      CanvasRenderer.drawFrame({
+        nodes, nodeById, links, selfLoops, hyperedges,
+        nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
+      });
+
+      // ── Rebuild SVG overlay (transparent hit-test geometry) ───────────────
+      // Edge overlay paths (for lineage clicking)
+      overlayEdgeG.selectAll('path')
+        .data(links, d => d.edgeIdx)
+        .join(
+          enter => enter.append('path')
+            .attr('stroke', 'transparent')
+            .attr('stroke-width', Math.max(6, baseEdgeWidth + 4))
+            .attr('fill', 'none')
+            .style('cursor', 'pointer')
+            .on('click', function(e, d) {
+              e.stopPropagation();
+              const existIdx = selectedEdges.findIndex(s => s.step === currentStep && s.edgeIdx === d.edgeIdx);
+              if (existIdx >= 0) {
+                selectedEdges.splice(existIdx, 1);
+                lineageSets.splice(existIdx, 1);
+              } else {
+                if (selectedEdges.length >= 3) { selectedEdges.shift(); lineageSets.shift(); }
+                selectedEdges.push({ edgeIdx: d.edgeIdx, step: currentStep });
+              }
+              if (selectedEdges.length === 0) { clearLineage(); return; }
+              recomputeLineage();
+              renderSpatialCanvas();
+            })
+        )
+        .attr('d', _overlayEdgePath);
+
+      // Node overlay circles (for hover / drag)
+      overlayNodeG.selectAll('circle')
+        .data(nodes, d => d.id)
+        .join(
+          enter => enter.append('circle')
+            .attr('r', nodeR + 2)
+            .attr('fill', 'transparent')
+            .style('cursor', 'pointer')
+            .on('mouseenter', (ev, d) => showTooltip(ev, `Node ${d.id}`))
+            .on('mouseleave', hideTooltip)
+            .call(d3.drag()
+              .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+              .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+              .on('end',   (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; })
+            )
+        )
+        .attr('cx', d => d.x)
+        .attr('cy', d => d.y);
     });
 }
 
