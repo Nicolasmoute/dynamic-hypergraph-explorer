@@ -369,6 +369,16 @@ class TestApplyAllNonOverlappingRec1:
         assert len(evts) == 3   # all 3 edges consumed
         assert len(nxt) == 9   # 3 × 3 produced edges
 
+    def test_single_edge_fast_path_respects_repeated_variables(self):
+        """A repeated variable in one edge requires equal node labels."""
+        parsed = engine.parse_notation("{{x,x}} -> {{x,y}}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        state = [[0, 1], [2, 2]]
+        nxt, evts = engine.apply_all_non_overlapping(state, lhs, rhs)
+        assert len(evts) == 1
+        assert evts[0]["consumed"] == [[2, 2]]
+        assert [0, 1] in nxt
+
     def test_single_edge_fast_path_preserves_evolution_semantics(self):
         """Fast path must produce identical step count and node growth as general path."""
         # Use rule3 for 5 steps and verify states/events structure is intact.

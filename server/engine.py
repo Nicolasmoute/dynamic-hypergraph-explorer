@@ -46,6 +46,16 @@ def _edge_perms_cached(e_tuple: tuple) -> list[list[int]]:
 def _edge_perms(e: Edge) -> list[list[int]]:
     return _edge_perms_cached(tuple(e))
 
+def _bind_edge_pattern(pattern_edge: list[str], edge_perm: list[int]) -> Optional[dict]:
+    """Return a variable binding for one edge permutation, or None on conflict."""
+    binding: dict = {}
+    for var, val in zip(pattern_edge, edge_perm):
+        bound = binding.get(var)
+        if bound is not None and bound != val:
+            return None
+        binding[var] = val
+    return binding
+
 def find_matches(hyp: Hypergraph, pattern: list[list[str]]) -> list[tuple[list[int], dict]]:
     results: list[tuple[list[int], dict]] = []
 
@@ -94,18 +104,17 @@ def find_matches(hyp: Hypergraph, pattern: list[list[str]]) -> list[tuple[list[i
                 continue
             for perm in edge_perms_cache[i]:
                 nb = dict(binding)
-                ok = True
-                for j in range(pe_len):
-                    var = pe[j]
-                    val = perm[j]
+                edge_binding = _bind_edge_pattern(pe, perm)
+                if edge_binding is None:
+                    continue
+                conflict = False
+                for var, val in edge_binding.items():
                     bound = nb.get(var)
-                    if bound is not None:
-                        if bound != val:
-                            ok = False
-                            break
-                    else:
-                        nb[var] = val
-                if not ok:
+                    if bound is not None and bound != val:
+                        conflict = True
+                        break
+                    nb[var] = val
+                if conflict:
                     continue
                 matched.append(i)
                 used.add(i)
@@ -284,9 +293,13 @@ def apply_all_non_overlapping(hyp: Hypergraph, lhs, rhs):
             # Cooperative cancellation — check every 1024 edges.
             if i & 1023 == 0 and _is_cancelled():
                 break
-            perms = _edge_perms(e)
-            # Use the first permutation to form the binding.
-            bind = dict(zip(pe, perms[0]))
+            bind = None
+            for perm in _edge_perms(e):
+                bind = _bind_edge_pattern(pe, perm)
+                if bind is not None:
+                    break
+            if bind is None:
+                continue
             for v in nv:
                 bind[v] = fresh()
             produced = [[bind[v] for v in re] for re in rhs]
