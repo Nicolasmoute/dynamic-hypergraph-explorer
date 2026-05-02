@@ -106,7 +106,7 @@ function _buildWorkerOptions(N, centerX, centerY) {
 function applyForceParams() {
   if (USE_CANVAS) {
     // Canvas path: send update_options to worker (partial merge is fine here).
-    if (_layoutWorker && _activeGraphId) {
+    if (_layoutWorker && _activeGraphId && _workerInitialized) {
       const opts_ = _buildWorkerOptions(
         (_workerOptions && _workerOptions._N) || 1,
         (_workerOptions && _workerOptions.centerX) || 0,
@@ -118,6 +118,12 @@ function applyForceParams() {
         protocol_version: 2,
         graph_id:         _activeGraphId,
         options:          opts_,
+      });
+      // MEDIUM-4: reheat settled simulations so the new force params take effect.
+      // Mirrors SVG path's simulation.alpha(0.3).restart() after slider changes.
+      _layoutWorker.postMessage({
+        type: 'reheat', protocol_version: 2,
+        graph_id: _activeGraphId, alpha: 0.3,
       });
     }
     return;
@@ -299,6 +305,13 @@ let _workerActiveRule  = null;   // rule for which the current worker was spawne
 // The canonical option set the main thread forwards to the worker on every
 // init / update_graph.  Slider changes update this and post update_options.
 let _workerOptions     = {};     // {centerX, centerY, linkDistance, chargeStrength, ...}
+// HIGH-1: set true on first fallback; prevents renderCurrentView() re-routing to canvas.
+let _canvasWorkerDisabled   = false;
+// MEDIUM-2: true only after 'init' has been posted (post-ready); guards update_graph.
+let _workerInitialized      = false;
+// MEDIUM-1: module-level slots for the LATEST pending tick (always updated, never dropped).
+let _pendingWorkerPositions = null;
+let _pendingWorkerNodeIds   = null;
 
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
@@ -514,6 +527,14 @@ function clearLineage() {
   selectedEdges = [];
   lineageSets = [];
   document.getElementById('lineage-bar').classList.remove('active');
+  // HIGH-2: clear selectedEdge in worker so force params reset to un-emphasised defaults.
+  if (USE_CANVAS && _layoutWorker && _activeGraphId && _workerInitialized) {
+    _workerOptions.selectedEdge = null;
+    _layoutWorker.postMessage({
+      type: 'update_options', protocol_version: 2,
+      graph_id: _activeGraphId, options: { selectedEdge: null },
+    });
+  }
   renderCurrentView();   // renderer-aware: routes to canvas or SVG path
 }
 
@@ -626,7 +647,8 @@ function setView(view, el) {
 }
 
 function renderCurrentView() {
-  if (currentView === 'spatial') { if (USE_CANVAS) renderSpatialCanvas(); else renderSpatial(); }
+  // HIGH-1: once _canvasWorkerDisabled is set, never re-route to canvas for this session.
+  if (currentView === 'spatial') { if (USE_CANVAS && !_canvasWorkerDisabled) renderSpatialCanvas(); else renderSpatial(); }
   else if (currentView === 'causal') renderCausal();
   else if (currentView === 'multiway') renderMultiway();
   else if (currentView === 'growth') renderGrowthAnalysis();
@@ -1145,9 +1167,12 @@ function renderSpatialCanvas() {
       const transform = d3.zoomTransform(svg.node());
       const mx = (e.offsetX - transform.x) / transform.k;
       const my = (e.offsetY - transform.y) / transform.k;
-      // Phase 3: worker owns the simulation; just reheat it.
-      // (Directional per-node force not available without worker-side support.)
-      if (_layoutWorker && _activeGraphId) {
+      // MEDIUM-3 (accepted gap): canvas nudge only reheats the simulation; the
+      // directional repulsion (nudgeRadius/nudgeStrength) is intentionally not
+      // applied because the worker owns the simulation — per-node custom forces
+      // would require a new worker message type (e.g. 'nudge':{x,y,r,strength}).
+      // Tracked for a future worker protocol extension; reheat is a useful fallback.
+      if (_layoutWorker && _activeGraphId && _workerInitialized) {
         _layoutWorker.postMessage({
           type: 'reheat', protocol_version: 2,
           graph_id: _activeGraphId, alpha: 0.3,
@@ -1216,6 +1241,12 @@ function renderSpatialCanvas() {
 
   function _fallbackToSvg(reason) {
     console.warn('[canvas-worker] falling back to SVG renderer:', reason);
+    // HIGH-1: disable canvas for this session so future renderCurrentView() calls
+    // go to the SVG path instead of re-entering renderSpatialCanvas().
+    _canvasWorkerDisabled = true;
+    _workerInitialized    = false;
+    const _canvasEl = document.getElementById('main-canvas');
+    if (_canvasEl) _canvasEl.style.display = 'none';
     if (_workerReadyTimer) { clearTimeout(_workerReadyTimer); _workerReadyTimer = null; }
     if (_workerRafId)      { cancelAnimationFrame(_workerRafId); _workerRafId = null; }
     if (_layoutWorker) {
@@ -1238,14 +1269,16 @@ function renderSpatialCanvas() {
     if (msg.graph_id !== _activeGraphId) return;  // stale tick from old step/rule
 
     if (msg.type === 'tick' || msg.type === 'settled') {
-      // Copy typed arrays BEFORE rAF: transferable buffers are neutered after postMessage.
-      const positions = msg.positions.slice();
-      const node_ids  = msg.node_ids.slice();
-      // rAF coalescing: never queue more than one frame per tick burst.
+      // MEDIUM-1: always copy to module-level slots so the rAF draws the LATEST tick,
+      // not the first one to arrive (old code dropped ticks while rAF was pending).
+      // Transferable buffers are neutered after postMessage — slice before rAF.
+      _pendingWorkerPositions = msg.positions.slice();
+      _pendingWorkerNodeIds   = msg.node_ids.slice();
+      // rAF coalescing: if one is already queued it will pick up the updated slots.
       if (_workerRafId) return;
       _workerRafId = requestAnimationFrame(() => {
         _workerRafId = null;
-        _applyPositions(positions, node_ids);
+        _applyPositions(_pendingWorkerPositions, _pendingWorkerNodeIds);
         _drawTick();
         // Save positions for warmstart on next step change.
         nodes.forEach(n => {
@@ -1271,7 +1304,9 @@ function renderSpatialCanvas() {
       _layoutWorker = null;
     }
     if (_workerRafId) { cancelAnimationFrame(_workerRafId); _workerRafId = null; }
-    _workerActiveRule = activeRule;
+    _workerActiveRule  = activeRule;
+    // MEDIUM-2: mark uninitialized until 'ready' arrives and 'init' is posted.
+    _workerInitialized = false;
 
     // Mint a new graph_id before spawning so the 'ready' callback can use it.
     _activeGraphId = 'g-' + Date.now() + '-' + Math.random().toString(36).slice(2);
@@ -1318,6 +1353,8 @@ function renderSpatialCanvas() {
           options:          workerOpts,
           warmstart:        warmstart,
         });
+        // MEDIUM-2: mark initialized so update_graph / update_options can now be sent.
+        _workerInitialized = true;
       } else if (msg.type === 'error') {
         console.error('[canvas-worker] pre-ready error:', msg.reason, msg.detail);
         _fallbackToSvg('worker error before ready: ' + msg.reason);
@@ -1326,6 +1363,10 @@ function renderSpatialCanvas() {
 
   } else {
     // Same rule, new step: mint a fresh graph_id and send update_graph.
+    // MEDIUM-2: guard against the race where the worker is spawned but has not yet
+    // received 'init' (e.g. slider moved during the 5 s ready window).
+    // Posting update_graph before init triggers a worker error → fallback to SVG.
+    if (!_workerInitialized) return;
     // r3: always include current slider state (workerOpts) so the worker
     // doesn't snap back to defaults after a step change.
     if (_workerRafId) { cancelAnimationFrame(_workerRafId); _workerRafId = null; }
@@ -1366,6 +1407,21 @@ function renderSpatialCanvas() {
           }
           if (selectedEdges.length === 0) { clearLineage(); return; }
           recomputeLineage();
+          // HIGH-2: forward selectedEdge to worker so it adjusts link forces for the
+          // selected edge (same effect as SVG path's inline applyForceParams logic).
+          if (_layoutWorker && _activeGraphId && _workerInitialized) {
+            const sel = selectedEdges[selectedEdges.length - 1];
+            const workerSel = sel ? {
+              edge_id:  sel.edgeIdx,
+              distance: (_workerOptions.linkDistance || 40) * 0.2,
+              strength: 1.0,
+            } : null;
+            _workerOptions.selectedEdge = workerSel;
+            _layoutWorker.postMessage({
+              type: 'update_options', protocol_version: 2,
+              graph_id: _activeGraphId, options: { selectedEdge: workerSel },
+            });
+          }
           renderSpatialCanvas();
         })
     )
