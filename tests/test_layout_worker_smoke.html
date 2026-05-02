@@ -1,11 +1,10 @@
 <!DOCTYPE html>
 <!--
   tests/test_layout_worker_smoke.html
-  Smoke-test harness for client/layout-worker.js (protocol v1).
+  Smoke-test harness for client/layout-worker.js (protocol v1, contract r2).
 
-  Open this file in a browser served from the project root (so the worker URL
-  '../client/layout-worker.js' resolves correctly), or run via the Playwright
-  helper in tests/test_browser_smoke.py.
+  Open this file from a server rooted at the project directory so the worker
+  URL '../client/layout-worker.js' resolves correctly.
 
   Usage (from repo root):
     python -m http.server 8080
@@ -16,7 +15,7 @@
   <meta charset="utf-8">
   <title>layout-worker smoke tests</title>
   <style>
-    body  { font-family: 'Courier New', monospace; padding: 24px; background:#fafafa; }
+    body  { font-family: 'Courier New', monospace; padding: 24px; background: #fafafa; }
     h2    { margin-bottom: 16px; }
     .pass { color: #196; }
     .fail { color: #c22; font-weight: bold; }
@@ -37,11 +36,11 @@
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-const WORKER_URL   = '../client/layout-worker.js';
-const PROTO        = 1;
-const TIMEOUT_MS   = 10000;
+const WORKER_URL = '../client/layout-worker.js';
+const PROTO      = 1;
+const TIMEOUT_MS = 10000;
 
-const log = document.getElementById('results');
+const log     = document.getElementById('results');
 const summary = document.getElementById('summary');
 
 let passed = 0, failed = 0;
@@ -49,7 +48,8 @@ let passed = 0, failed = 0;
 function _result(label, ok, detail) {
   const li = document.createElement('li');
   li.className = ok ? 'pass' : 'fail';
-  li.textContent = (ok ? '✓ ' : '✗ ') + label + (detail ? '  — ' + detail : '');
+  li.textContent = (ok ? '✓ ' : '✗ ') + label +
+                   (detail ? '  — ' + detail : '');
   log.appendChild(li);
   ok ? passed++ : failed++;
 }
@@ -61,8 +61,7 @@ function _info(text) {
   log.appendChild(li);
 }
 
-/** Return a Promise that resolves with the next message from worker, or
- *  rejects after timeoutMs. */
+/** Resolve with next message from worker, or reject after timeoutMs. */
 function nextMsg(worker, timeoutMs) {
   timeoutMs = timeoutMs || TIMEOUT_MS;
   return new Promise(function (resolve, reject) {
@@ -78,14 +77,14 @@ function nextMsg(worker, timeoutMs) {
   });
 }
 
-/** Collect N messages from worker (or until timeout). */
+/** Collect exactly n messages, or reject on timeout. */
 function collectN(worker, n, timeoutMs) {
   timeoutMs = timeoutMs || TIMEOUT_MS;
   return new Promise(function (resolve, reject) {
     const msgs = [];
     const timer = setTimeout(function () {
       worker.onmessage = null;
-      if (msgs.length > 0) resolve(msgs);  // partial is OK for some tests
+      if (msgs.length > 0) resolve(msgs);
       else reject(new Error('timeout: got 0 messages'));
     }, timeoutMs);
     worker.onmessage = function (evt) {
@@ -99,14 +98,14 @@ function collectN(worker, n, timeoutMs) {
   });
 }
 
-/** Collect messages until a predicate is satisfied, with timeout. */
+/** Collect messages until pred(lastMsg, allMsgs) returns true, or timeout. */
 function collectUntil(worker, pred, timeoutMs) {
   timeoutMs = timeoutMs || TIMEOUT_MS;
   return new Promise(function (resolve, reject) {
     const msgs = [];
     const timer = setTimeout(function () {
       worker.onmessage = null;
-      reject(new Error('timeout: collected ' + msgs.length + ' messages without satisfying predicate'));
+      reject(new Error('timeout: ' + msgs.length + ' msgs, predicate never satisfied'));
     }, timeoutMs);
     worker.onmessage = function (evt) {
       msgs.push(evt.data);
@@ -119,7 +118,9 @@ function collectUntil(worker, pred, timeoutMs) {
   });
 }
 
-// Minimal graph fixture (triangle: nodes 0,1,2; edges 0→1, 1→2, 0→2)
+// ── graph fixtures ─────────────────────────────────────────────────────────
+
+// Triangle: 3 nodes, 3 binary edges
 const NODES3 = [{ id: 0 }, { id: 1 }, { id: 2 }];
 const EDGES3 = [
   { source: 0, target: 1 },
@@ -127,63 +128,113 @@ const EDGES3 = [
   { source: 0, target: 2 },
 ];
 
-// Larger fixture with a hyperedge (nodes 0..4, hyperedge spanning 2,3,4)
-const NODES5     = [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
-const EDGES5     = [{ source: 0, target: 1 }, { source: 1, target: 2 }];
+// 5 nodes with a 3-member hyperedge and 2 binary edges
+const NODES5      = [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+const EDGES5      = [{ source: 0, target: 1 }, { source: 1, target: 2 }];
 const HYPEREDGES5 = [{ id: 10, nodes: [2, 3, 4] }];
 
 // ── test suite ─────────────────────────────────────────────────────────────
 
 async function runAll() {
+
   // ── T1: ready message ─────────────────────────────────────────────────
   try {
     const w = new Worker(WORKER_URL);
     const msg = await nextMsg(w);
-    _result('T1 — ready message has type="ready" and protocol_version=1',
+    _result('T1 — ready: type="ready", protocol_version=1',
       msg.type === 'ready' && msg.protocol_version === PROTO,
       JSON.stringify(msg));
     w.terminate();
   } catch (e) { _result('T1 — ready message', false, e.message); }
 
-  // ── T2: init → receive tick ───────────────────────────────────────────
+  // ── T2: init → first tick ────────────────────────────────────────────
   let tickMsg = null;
   let tickWorker = null;
   try {
     const w = tickWorker = new Worker(WORKER_URL);
     await nextMsg(w);  // drain ready
-
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: EDGES3, hyperedges: [] });
     const msg = await nextMsg(w);
     tickMsg = msg;
-    _result('T2 — init triggers a tick message',
-      msg.type === 'tick',
+    _result('T2 — init triggers a tick message', msg.type === 'tick',
       'type=' + msg.type);
-    // keep w alive for T3
-  } catch (e) { _result('T2 — init triggers tick', false, e.message); if (tickWorker) tickWorker.terminate(); }
+  } catch (e) {
+    _result('T2 — init triggers tick', false, e.message);
+    if (tickWorker) { tickWorker.terminate(); tickWorker = null; }
+  }
 
   // ── T3: tick payload types and sizes ─────────────────────────────────
   try {
     if (!tickMsg) throw new Error('no tick from T2');
-    const N = NODES3.length;
+    const N      = NODES3.length;
     const posOk  = tickMsg.positions instanceof Float32Array &&
                    tickMsg.positions.length === 2 * N;
     const idsOk  = tickMsg.node_ids  instanceof Int32Array  &&
                    tickMsg.node_ids.length  === N;
     const alphaOk = typeof tickMsg.alpha === 'number' &&
                     tickMsg.alpha >= 0 && tickMsg.alpha <= 1;
-    _result('T3 — positions is Float32Array(2*N), node_ids is Int32Array(N), alpha in [0,1]',
+    _result('T3 — positions=Float32Array(2N), node_ids=Int32Array(N), alpha∈[0,1]',
       posOk && idsOk && alphaOk,
       'pos.len=' + (tickMsg.positions ? tickMsg.positions.length : 'n/a') +
       ' ids.len=' + (tickMsg.node_ids  ? tickMsg.node_ids.length  : 'n/a') +
-      ' alpha='  + (tickMsg.alpha));
+      ' alpha='  + tickMsg.alpha);
     if (tickWorker) { tickWorker.terminate(); tickWorker = null; }
-  } catch (e) { _result('T3 — payload types/sizes', false, e.message); if (tickWorker) { tickWorker.terminate(); tickWorker = null; } }
+  } catch (e) {
+    _result('T3 — payload types/sizes', false, e.message);
+    if (tickWorker) { tickWorker.terminate(); tickWorker = null; }
+  }
 
-  // ── T4: alpha decreases across ticks ─────────────────────────────────
+  // ── T4: graph_id is echoed on tick/settled ────────────────────────────
   try {
     const w = new Worker(WORKER_URL);
     await nextMsg(w);  // ready
+    const GID = 'step-42';
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: GID,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alphaDecay: 0.1 } });
+    // Collect until settled to check graph_id on both tick and settled
+    const msgs = await collectUntil(w,
+      function (m) { return m.type === 'settled'; }, 8000);
+    const ticks   = msgs.filter(function (m) { return m.type === 'tick'; });
+    const settled = msgs.find(function (m)   { return m.type === 'settled'; });
+    const tickGidOk    = ticks.every(function (m) { return m.graph_id === GID; });
+    const settledGidOk = settled && settled.graph_id === GID;
+    _result('T4 — graph_id echoed on tick and settled',
+      tickGidOk && settledGidOk,
+      'ticks=' + ticks.length +
+      ' tick_gid_ok=' + tickGidOk +
+      ' settled_gid=' + (settled ? settled.graph_id : 'n/a'));
+    w.terminate();
+  } catch (e) { _result('T4 — graph_id echoed', false, e.message); }
+
+  // ── T5: graph_id changes after update_graph ───────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    const GID1 = 'step-1', GID2 = 'step-2';
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: GID1,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [] });
+    const firstTick = await nextMsg(w);
+    w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    graph_id: GID2,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [] });
+    // Collect until we see a tick with GID2
+    const msgs = await collectUntil(w,
+      function (m) { return m.type === 'tick' && m.graph_id === GID2; }, 5000);
+    const updated = msgs[msgs.length - 1];
+    _result('T5 — graph_id updates after update_graph',
+      firstTick.graph_id === GID1 && updated.graph_id === GID2,
+      'init_gid=' + firstTick.graph_id + ' update_gid=' + updated.graph_id);
+    w.terminate();
+  } catch (e) { _result('T5 — graph_id updates', false, e.message); }
+
+  // ── T6: alpha is non-increasing across ticks ──────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: EDGES3, hyperedges: [],
                     options: { alpha: 0.5, alphaDecay: 0.05 } });
@@ -193,44 +244,40 @@ async function runAll() {
     for (let i = 1; i < ticks.length; i++) {
       if (ticks[i].alpha > ticks[i - 1].alpha + 0.01) { decreasing = false; break; }
     }
-    _result('T4 — alpha is non-increasing across ticks',
+    _result('T6 — alpha non-increasing across ticks',
       decreasing,
       'alphas=' + ticks.map(function (m) { return m.alpha.toFixed(4); }).join(', '));
     w.terminate();
-  } catch (e) { _result('T4 — alpha decreasing', false, e.message); }
+  } catch (e) { _result('T6 — alpha decreasing', false, e.message); }
 
-  // ── T5: settled message received ─────────────────────────────────────
+  // ── T7: settled fires with typed-array payloads ───────────────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
-    // Use fast decay so it settles quickly
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: EDGES3, hyperedges: [],
                     options: { alpha: 0.3, alphaDecay: 0.1 } });
     const msgs = await collectUntil(w,
-      function (m) { return m.type === 'settled'; },
-      8000);
-    const settledMsg = msgs[msgs.length - 1];
-    const ok = settledMsg.type === 'settled' &&
-               settledMsg.positions instanceof Float32Array &&
-               settledMsg.node_ids instanceof Int32Array;
-    _result('T5 — settled message received with typed-array payloads', ok,
-      'ticks before settle=' + (msgs.length - 1));
+      function (m) { return m.type === 'settled'; }, 8000);
+    const s = msgs[msgs.length - 1];
+    _result('T7 — settled has Float32Array positions, Int32Array node_ids',
+      s.type === 'settled' &&
+      s.positions instanceof Float32Array &&
+      s.node_ids  instanceof Int32Array,
+      'ticks_before=' + (msgs.length - 1));
     w.terminate();
-  } catch (e) { _result('T5 — settled message', false, e.message); }
+  } catch (e) { _result('T7 — settled payload', false, e.message); }
 
-  // ── T6: warm-start preserves positions across update_graph ───────────
+  // ── T8: warm-start preserves positions across update_graph ────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
-
-    // Init with 3 nodes, collect first tick to get initial positions
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
-                    nodes: NODES3, edges: EDGES3, hyperedges: [],
-                    options: { alpha: 0.3 } });
-    const firstTick = await nextMsg(w);  // first tick
+                    graph_id: 'ws-init',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [] });
+    const firstTick = await nextMsg(w);
 
-    // Extract positions from first tick as our warmstart
+    // Snapshot positions from first tick as explicit warmstart
     const warmstart = {};
     const N = NODES3.length;
     for (let i = 0; i < N; i++) {
@@ -240,149 +287,186 @@ async function runAll() {
       ];
     }
 
-    // Freeze to capture stable positions, then update_graph with warmstart
     w.postMessage({ type: 'freeze', protocol_version: PROTO });
     await new Promise(function (r) { setTimeout(r, 50); });
 
     w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    graph_id: 'ws-update',
                     nodes: NODES3, edges: EDGES3, hyperedges: [],
                     warmstart: warmstart });
-
-    const afterUpdate = await nextMsg(w);  // first tick after update
+    const afterUpdate = await nextMsg(w);
     w.terminate();
 
-    // Positions for nodes that were in warmstart should be very close
+    const TOL = 1.0;  // positions may shift slightly on first d3 tick
     let allClose = true;
-    const TOL = 1.0;  // positions may shift slightly due to force application
     for (let i = 0; i < afterUpdate.node_ids.length; i++) {
       const id = afterUpdate.node_ids[i];
-      if (warmstart[id] == null) continue;
+      if (!warmstart[id]) continue;
       const dx = afterUpdate.positions[2 * i]     - warmstart[id][0];
       const dy = afterUpdate.positions[2 * i + 1] - warmstart[id][1];
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist > TOL) {
         allClose = false;
-        _info('  node ' + id + ': warmstart=[' +
-          warmstart[id].map(function (v) { return v.toFixed(2); }) + ']' +
-          ' after_update=[' + [afterUpdate.positions[2*i], afterUpdate.positions[2*i+1]]
-            .map(function (v) { return v.toFixed(2); }) + ']' +
+        _info('  node ' + id + ': warmstart=' +
+          JSON.stringify(warmstart[id].map(function (v) { return +v.toFixed(2); })) +
+          ' after=' + [afterUpdate.positions[2*i], afterUpdate.positions[2*i+1]]
+            .map(function (v) { return v.toFixed(2); }).join(',') +
           ' dist=' + dist.toFixed(3));
       }
     }
-    _result('T6 — update_graph with warmstart: positions within tolerance=' + TOL + 'px',
-      allClose, allClose ? 'all nodes placed correctly' : 'some nodes drifted');
-  } catch (e) { _result('T6 — warm-start preservation', false, e.message); }
+    _result('T8 — update_graph warmstart: node positions within tol=' + TOL + 'px',
+      allClose, allClose ? 'all nodes placed' : 'some nodes drifted');
+  } catch (e) { _result('T8 — warm-start preservation', false, e.message); }
 
-  // ── T7: hyperedge clique expansion (5 nodes, 1 hyperedge) ─────────────
+  // ── T9: init with hyperedge (clique mode, default) ────────────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES5, edges: EDGES5,
                     hyperedges: HYPEREDGES5 });
     const msg = await nextMsg(w);
     const N = NODES5.length;
-    _result('T7 — init with hyperedge: tick has correct N=5',
+    _result('T9 — hyperedge (clique mode): tick has N=5 positions/ids',
       msg.type === 'tick' &&
       msg.positions.length === 2 * N &&
       msg.node_ids.length  === N,
       'pos.len=' + msg.positions.length + ' ids.len=' + msg.node_ids.length);
     w.terminate();
-  } catch (e) { _result('T7 — hyperedge expansion', false, e.message); }
+  } catch (e) { _result('T9 — hyperedge clique', false, e.message); }
 
-  // ── T8: protocol_version_mismatch → error + worker terminates ────────
+  // ── T10: init with hyperedge (chain mode) ────────────────────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
+    await nextMsg(w);
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES5, edges: EDGES5,
+                    hyperedges: HYPEREDGES5,
+                    options: { hyperedgeMode: 'chain' } });
+    const msg = await nextMsg(w);
+    const N = NODES5.length;
+    _result('T10 — hyperedge (chain mode): tick has N=5 positions/ids',
+      msg.type === 'tick' &&
+      msg.positions.length === 2 * N &&
+      msg.node_ids.length  === N,
+      'pos.len=' + msg.positions.length + ' ids.len=' + msg.node_ids.length);
+    w.terminate();
+  } catch (e) { _result('T10 — hyperedge chain', false, e.message); }
+
+  // ── T11: extended force options accepted without error ────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: {
+                      centerX: 100, centerY: -50,
+                      linkDistance: 60, linkStrength: 0.8,
+                      chargeStrength: -120, chargeDistanceMax: 300,
+                      collisionRadius: 8,
+                    } });
+    const msg = await nextMsg(w);
+    _result('T11 — extended force options: tick arrives without error',
+      msg.type === 'tick',
+      'type=' + msg.type + ' alpha=' + (msg.alpha != null ? msg.alpha.toFixed(4) : 'n/a'));
+    w.terminate();
+  } catch (e) { _result('T11 — extended force options', false, e.message); }
+
+  // ── T12: protocol_version mismatch → error ────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: 999,
                     nodes: NODES3, edges: [], hyperedges: [] });
     const msg = await nextMsg(w, 3000);
-    _result('T8 — bad protocol_version → error reason=protocol_version_mismatch',
+    _result('T12 — bad protocol_version → error reason=protocol_version_mismatch',
       msg.type === 'error' && msg.reason === 'protocol_version_mismatch',
       JSON.stringify(msg));
     w.terminate();
-  } catch (e) { _result('T8 — protocol_version_mismatch', false, e.message); }
+  } catch (e) { _result('T12 — protocol_version_mismatch', false, e.message); }
 
-  // ── T9: double_init → error + worker terminates ───────────────────────
+  // ── T13: double init → error ──────────────────────────────────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: [], hyperedges: [] });
     await nextMsg(w);  // first tick
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: [], hyperedges: [] });
-    // Drain until we get the error (or timeout)
     const msgs = await collectUntil(w,
       function (m) { return m.type === 'error'; }, 3000);
     const errMsg = msgs[msgs.length - 1];
-    _result('T9 — double init → error reason=double_init',
+    _result('T13 — double init → error reason=double_init',
       errMsg.type === 'error' && errMsg.reason === 'double_init',
       JSON.stringify(errMsg));
     w.terminate();
-  } catch (e) { _result('T9 — double_init error', false, e.message); }
+  } catch (e) { _result('T13 — double_init error', false, e.message); }
 
-  // ── T10: freeze stops ticks ───────────────────────────────────────────
+  // ── T14: update_graph before init → not_initialized error ────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
+    await nextMsg(w);  // ready — do NOT send init
+    w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    nodes: NODES3, edges: [], hyperedges: [] });
+    const msg = await nextMsg(w, 3000);
+    _result('T14 — update_graph before init → error reason=not_initialized',
+      msg.type === 'error' && msg.reason === 'not_initialized',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T14 — not_initialized error', false, e.message); }
+
+  // ── T15: freeze stops ticks ───────────────────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: EDGES3, hyperedges: [] });
     await nextMsg(w);  // at least one tick
     w.postMessage({ type: 'freeze', protocol_version: PROTO });
-    // After freeze, no more ticks should arrive within 400 ms
     const silence = await new Promise(function (resolve) {
       let received = false;
       w.onmessage = function () { received = true; };
-      setTimeout(function () {
-        w.onmessage = null;
-        resolve(!received);
-      }, 400);
+      setTimeout(function () { w.onmessage = null; resolve(!received); }, 400);
     });
-    _result('T10 — freeze stops tick messages for ≥400 ms', silence,
+    _result('T15 — freeze stops tick messages for ≥400 ms', silence,
       silence ? 'no messages after freeze' : 'message received after freeze');
     w.terminate();
-  } catch (e) { _result('T10 — freeze stops ticks', false, e.message); }
+  } catch (e) { _result('T15 — freeze stops ticks', false, e.message); }
 
-  // ── T11: reheat after freeze restarts ticks ───────────────────────────
+  // ── T16: reheat after settled restarts ticks ──────────────────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: EDGES3, hyperedges: [],
                     options: { alphaDecay: 0.1 } });
-    // Wait for settled
     await collectUntil(w, function (m) { return m.type === 'settled'; }, 8000);
-    // Now reheat
     w.postMessage({ type: 'reheat', protocol_version: PROTO, alpha: 0.3 });
     const msg = await nextMsg(w, 3000);
-    _result('T11 — reheat after settled restarts ticks',
+    _result('T16 — reheat after settled restarts ticks',
       msg.type === 'tick',
       'type=' + msg.type + ' alpha=' + (msg.alpha != null ? msg.alpha.toFixed(4) : 'n/a'));
     w.terminate();
-  } catch (e) { _result('T11 — reheat restarts', false, e.message); }
+  } catch (e) { _result('T16 — reheat restarts', false, e.message); }
 
-  // ── T12: terminate silences the worker ───────────────────────────────
+  // ── T17: terminate silences the worker ───────────────────────────────
   try {
     const w = new Worker(WORKER_URL);
-    await nextMsg(w);  // ready
+    await nextMsg(w);
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     nodes: NODES3, edges: EDGES3, hyperedges: [] });
-    await nextMsg(w);  // at least one tick
+    await nextMsg(w);
     w.postMessage({ type: 'terminate', protocol_version: PROTO });
-    // No messages after terminate within 400 ms
     const silence = await new Promise(function (resolve) {
       let received = false;
       w.onmessage = function () { received = true; };
-      setTimeout(function () {
-        w.onmessage = null;
-        resolve(!received);
-      }, 400);
+      setTimeout(function () { w.onmessage = null; resolve(!received); }, 400);
     });
-    _result('T12 — terminate silences the worker', silence,
+    _result('T17 — terminate silences the worker', silence,
       silence ? 'no messages after terminate' : 'message received after terminate');
-    w.terminate();  // belt-and-suspenders cleanup
-  } catch (e) { _result('T12 — terminate', false, e.message); }
+    w.terminate();
+  } catch (e) { _result('T17 — terminate', false, e.message); }
 
   // ── summary ───────────────────────────────────────────────────────────
   const total = passed + failed;
