@@ -1,13 +1,17 @@
 /* client/layout-worker.js
  * Web-Worker force-layout engine for the Dynamic Hypergraph Explorer.
  *
- * Protocol version 1 — contract: knowledge/perf/canvas-worker-contract.md §3
- * Contract revision 2 amendments (Phase 1.5):
+ * Protocol version 2 — contract: knowledge/perf/canvas-worker-contract.md §3
+ * r2 amendments:
+ *   - PROTOCOL_VERSION bumped to 2
  *   - graph_id echoed on every outbound message (stale-tick guard)
- *   - Extended force options: centerX/Y, linkDistance/Strength,
- *     chargeStrength/DistanceMax, collisionRadius, hyperedgeMode
- *   - update_graph before init → structured error (not_initialized)
- *   - importScripts wrapped in try/catch for CDN failure detection
+ *   - Hyperedge expansion: sequential CHAIN only (clique removed per contract)
+ *   - update_options message: live-update force params without sim restart
+ *   - Node-count-scaled defaults for linkDistance, chargeStrength, collisionRadius
+ *   - selectedEdge option for lineage-mode emphasis
+ *   - chargeDistanceMax default = 300
+ *   - importScripts try/catch for CDN-failure detection
+ *   - update_graph before init → error{reason:"not_initialized"}
  *
  * Classic-script worker (no ESM).  Instantiate from main thread with:
  *   new Worker('client/layout-worker.js')   // no { type:'module' } needed
@@ -19,12 +23,11 @@
 
 // ── constants ──────────────────────────────────────────────────────────────
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 
 // ── bootstrap: load D3, then announce readiness ────────────────────────────
-// Wrapped in try/catch so a CDN failure produces a structured error rather
-// than a silent worker crash or missing 'ready' that would hang the main
-// thread's ready-timeout handler.
+// Wrapped in try/catch so a CDN / CSP failure produces a structured error
+// message instead of a silent worker crash.
 
 try {
   importScripts('https://d3js.org/d3.v7.min.js');
@@ -37,8 +40,7 @@ try {
     detail:           loadErr ? (loadErr.message || String(loadErr)) : 'importScripts failed',
   });
   self.close();
-  // Stop executing — throw so nothing below runs
-  throw loadErr;
+  throw loadErr;   // stop executing rest of the module body
 }
 
 postMessage({ type: 'ready', protocol_version: PROTOCOL_VERSION });
@@ -49,14 +51,14 @@ let _sim         = null;   // d3.forceSimulation
 let _nodes       = null;   // [{id, x, y, vx, vy}, …] — d3 mutates these in place
 let _initialized = false;
 let _frozen      = false;
-let _graphId     = null;   // echoed on every outbound message for stale-tick detection
+let _graphId     = null;   // echoed on every outbound message (stale-tick detection)
 
 // ── message router ─────────────────────────────────────────────────────────
 
 self.onmessage = function (evt) {
   const msg = evt.data;
 
-  // Protocol-version guard — every message must carry protocol_version
+  // Protocol-version guard on every inbound message
   if (!msg || msg.protocol_version !== PROTOCOL_VERSION) {
     _postError(
       'protocol_version_mismatch',
@@ -68,11 +70,12 @@ self.onmessage = function (evt) {
 
   try {
     switch (msg.type) {
-      case 'init':         _handleInit(msg);        break;
-      case 'update_graph': _handleUpdateGraph(msg); break;
-      case 'reheat':       _handleReheat(msg);       break;
-      case 'freeze':       _handleFreeze();          break;
-      case 'terminate':    _handleTerminate();       break;
+      case 'init':           _handleInit(msg);          break;
+      case 'update_graph':   _handleUpdateGraph(msg);   break;
+      case 'update_options': _handleUpdateOptions(msg); break;
+      case 'reheat':         _handleReheat(msg);         break;
+      case 'freeze':         _handleFreeze();            break;
+      case 'terminate':      _handleTerminate();         break;
       default:
         _postError('unknown_message_type', 'Unknown type: ' + msg.type);
     }
@@ -102,8 +105,6 @@ function _handleInit(msg) {
 
 function _handleUpdateGraph(msg) {
   // Strict lifecycle: update_graph requires a prior init.
-  // A main-thread bug that skips init gets an explicit error rather than
-  // silently working, which makes lifecycle issues easier to diagnose.
   if (!_initialized) {
     _postError('not_initialized',
       'update_graph received before init — send init first');
@@ -112,13 +113,12 @@ function _handleUpdateGraph(msg) {
   _frozen  = false;
   _graphId = msg.graph_id != null ? msg.graph_id : null;
 
-  // Capture live positions so they serve as an implicit warm-start for
-  // nodes that survive the step change.
+  // Snapshot live positions as implicit warm-start for surviving node ids
   const prevPos = {};
   if (_nodes) {
     for (const n of _nodes) prevPos[n.id] = [n.x, n.y];
   }
-  // Caller's explicit warmstart takes precedence over live positions
+  // Caller's explicit warmstart takes precedence
   const warmstart = Object.assign({}, prevPos, msg.warmstart || {});
 
   _destroySim();
@@ -129,6 +129,20 @@ function _handleUpdateGraph(msg) {
     warmstart,
     msg.options    || {}
   );
+}
+
+/**
+ * Live-update force parameters without restarting the simulation.
+ * e.g. user moved a force slider, viewport resized (center changed),
+ * or an edge became selected/deselected.
+ * No alpha change; no position reset; simulation continues from current state.
+ */
+function _handleUpdateOptions(msg) {
+  if (!_initialized || !_sim) {
+    // Silently ignore if not running — no error (caller may race on startup)
+    return;
+  }
+  _applyForceOptions(msg.options || {});
 }
 
 function _handleReheat(msg) {
@@ -147,7 +161,7 @@ function _handleTerminate() {
   _nodes       = null;
   _initialized = false;
   _graphId     = null;
-  self.close();   // release the worker thread
+  self.close();
 }
 
 // ── simulation lifecycle ───────────────────────────────────────────────────
@@ -164,29 +178,17 @@ function _destroySim() {
 /**
  * Build (or rebuild) the d3-force simulation from raw graph data.
  *
- * @param {Array}       rawNodes       [{id:int}, …]
- * @param {Array}       rawEdges       [{source:int, target:int}, …]
- * @param {Array}       rawHyperedges  [{id:int, nodes:[int]}, …]
- * @param {Object|null} warmstart      {[id]: [x, y]} — pre-placed positions
- * @param {Object}      options        simulation tuning (see below)
+ * Hyperedge expansion: SEQUENTIAL CHAIN only — (n0,n1), (n1,n2), …
+ * Per contract r2, clique expansion is out of scope.
  *
- * options fields (all optional):
- *   alpha           {number}  Initial sim alpha (default 0.3)
- *   alphaDecay      {number}  Decay per tick (default 0.0228)
- *   velocityDecay   {number}  Friction (default 0.4)
- *   centerX         {number}  forceCenter X (default 0)
- *   centerY         {number}  forceCenter Y (default 0)
- *   linkDistance    {number}  forceLink target distance px (default 40)
- *   linkStrength    {number}  forceLink strength 0–1 (default 0.5)
- *   chargeStrength  {number}  forceManyBody strength, negative = repel (default -80)
- *   chargeDistanceMax {number} forceManyBody max influence radius (default Infinity)
- *   collisionRadius {number}  forceCollide radius; 0 = disabled (default 0)
- *   hyperedgeMode   {string}  'clique' (default) or 'chain'
- *     'clique' — all pairs of hyperedge members linked (strong cohesion)
- *     'chain'  — sequential pairs only (matches current SVG chain behavior)
+ * @param {Array}       rawNodes       [{id:int}, …]
+ * @param {Array}       rawEdges       [{source:int, target:int, id?:int}, …]
+ * @param {Array}       rawHyperedges  [{id:int, nodes:[int]}, …]
+ * @param {Object|null} warmstart      {[id]: [x, y]}
+ * @param {Object}      options        see _resolveOpts() for fields
  */
 function _buildSim(rawNodes, rawEdges, rawHyperedges, warmstart, options) {
-  // ── node objects ───────────────────────────────────────────────────────
+  // ── node objects ──────────────────────────────────────────────────────
   _nodes = rawNodes.map(function (n) {
     const pos = warmstart && warmstart[n.id];
     return {
@@ -199,81 +201,146 @@ function _buildSim(rawNodes, rawEdges, rawHyperedges, warmstart, options) {
   });
 
   const nodeIndex = new Map(_nodes.map(function (n) { return [n.id, n]; }));
+  const N = _nodes.length;
 
-  // ── links ──────────────────────────────────────────────────────────────
-  // Binary edges are passed through as direct d3 links.
+  // ── links ─────────────────────────────────────────────────────────────
+  // Binary edges: direct d3 links.  Carry _link_id for selectedEdge matching.
   const links = [];
   for (const e of rawEdges) {
     const src = nodeIndex.get(e.source);
     const tgt = nodeIndex.get(e.target);
-    if (src && tgt) links.push({ source: src, target: tgt });
+    if (!src || !tgt) continue;
+    links.push({ source: src, target: tgt, _link_id: e.id != null ? e.id : null });
   }
 
-  // Hyperedges are expanded per hyperedgeMode:
-  //   'clique' — O(n²) pairs; strong spatial cohesion for all members
-  //   'chain'  — sequential pairs (edge[i]→edge[i+1]); matches current
-  //              SVG renderer's forceLink construction for arity > 2
-  const hyperedgeMode = options.hyperedgeMode === 'chain' ? 'chain' : 'clique';
+  // Hyperedges → sequential-chain pairs (n0,n1), (n1,n2), …
+  // Each pair carries the hyperedge's id for selectedEdge matching.
   for (const he of rawHyperedges) {
     const members = (he.nodes || [])
       .map(function (id) { return nodeIndex.get(id); })
       .filter(Boolean);
-    if (hyperedgeMode === 'chain') {
-      for (let i = 0; i < members.length - 1; i++) {
-        links.push({ source: members[i], target: members[i + 1] });
-      }
-    } else {
-      for (let i = 0; i < members.length - 1; i++) {
-        for (let j = i + 1; j < members.length; j++) {
-          links.push({ source: members[i], target: members[j] });
-        }
-      }
+    for (let i = 0; i < members.length - 1; i++) {
+      links.push({ source: members[i], target: members[i + 1], _link_id: he.id });
     }
   }
 
-  // ── simulation parameters ──────────────────────────────────────────────
-  const alpha           = options.alpha           != null ? +options.alpha           : 0.3;
-  const alphaDecay      = options.alphaDecay      != null ? +options.alphaDecay      : 0.0228;
-  const velocityDecay   = options.velocityDecay   != null ? +options.velocityDecay   : 0.4;
-  const centerX         = options.centerX         != null ? +options.centerX         : 0;
-  const centerY         = options.centerY         != null ? +options.centerY         : 0;
-  const linkDistance    = options.linkDistance    != null ? +options.linkDistance    : 40;
-  const linkStrength    = options.linkStrength    != null ? +options.linkStrength    : 0.5;
-  const chargeStrength  = options.chargeStrength  != null ? +options.chargeStrength  : -80;
-  const chargeDistMax   = options.chargeDistanceMax != null ? +options.chargeDistanceMax : Infinity;
-  const collisionRadius = options.collisionRadius != null ? +options.collisionRadius : 0;
-
-  // ── build sim ──────────────────────────────────────────────────────────
-  const chargeForce = d3.forceManyBody()
-    .strength(chargeStrength)
-    .distanceMax(chargeDistMax);
+  // ── forces ────────────────────────────────────────────────────────────
+  const opts = _resolveOpts(options, N);
 
   const linkForce = d3.forceLink(links)
-    .distance(linkDistance)
-    .strength(linkStrength);
+    .distance(_linkDistanceFn(opts))
+    .strength(_linkStrengthFn(opts));
+
+  const chargeForce = d3.forceManyBody()
+    .strength(opts.chargeStrength)
+    .distanceMax(opts.chargeDistMax);
 
   _sim = d3.forceSimulation(_nodes)
-    .alpha(alpha)
-    .alphaDecay(alphaDecay)
-    .velocityDecay(velocityDecay)
+    .alpha(opts.alpha)
+    .alphaDecay(opts.alphaDecay)
+    .velocityDecay(opts.velocityDecay)
     .alphaMin(0.001)
     .force('link',   linkForce)
     .force('charge', chargeForce)
-    .force('center', d3.forceCenter(centerX, centerY))
+    .force('center', d3.forceCenter(opts.centerX, opts.centerY))
     .on('tick', _onTick)
     .on('end',  _onSettled);
 
-  // Collision force is optional — only wire it up if a non-zero radius was given
-  if (collisionRadius > 0) {
-    _sim.force('collision', d3.forceCollide(collisionRadius));
+  if (opts.collisionRadius > 0) {
+    _sim.force('collision', d3.forceCollide(opts.collisionRadius));
   }
+}
+
+/**
+ * Live-apply option changes to the running simulation.
+ * Called by update_options; also used internally by _buildSim via
+ * the forces already set.
+ */
+function _applyForceOptions(options) {
+  const N    = _nodes ? _nodes.length : 0;
+  const opts = _resolveOpts(options, N);
+
+  const lf = _sim.force('link');
+  if (lf) {
+    lf.distance(_linkDistanceFn(opts));
+    lf.strength(_linkStrengthFn(opts));
+  }
+
+  const cf = _sim.force('charge');
+  if (cf) cf.strength(opts.chargeStrength).distanceMax(opts.chargeDistMax);
+
+  const cenf = _sim.force('center');
+  if (cenf) cenf.x(opts.centerX).y(opts.centerY);
+
+  if (opts.collisionRadius > 0) {
+    const colf = _sim.force('collision');
+    if (colf) colf.radius(opts.collisionRadius);
+    else _sim.force('collision', d3.forceCollide(opts.collisionRadius));
+  } else {
+    _sim.force('collision', null);
+  }
+
+  // Sim-level knobs
+  if (options.alphaDecay    != null) _sim.alphaDecay(+options.alphaDecay);
+  if (options.velocityDecay != null) _sim.velocityDecay(+options.velocityDecay);
+}
+
+// ── option helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Resolve raw options into concrete numbers, applying node-count scaling
+ * where a field is absent (§3.1 default scaling formulas).
+ */
+function _resolveOpts(options, N) {
+  const safeN = Math.max(N, 1);
+  return {
+    alpha:           options.alpha           != null ? +options.alpha           : 1,
+    alphaDecay:      options.alphaDecay      != null ? +options.alphaDecay      : 0.0228,
+    velocityDecay:   options.velocityDecay   != null ? +options.velocityDecay   : 0.4,
+    centerX:         options.centerX         != null ? +options.centerX         : 0,
+    centerY:         options.centerY         != null ? +options.centerY         : 0,
+    // §3.1 default scaling — matches client/app.js:821-835
+    linkDistance:    options.linkDistance    != null ? +options.linkDistance
+                       : 40 * Math.sqrt(Math.min(1, 100 / safeN)),
+    linkStrength:    options.linkStrength    != null ? +options.linkStrength    : 0.5,
+    chargeStrength:  options.chargeStrength  != null ? +options.chargeStrength
+                       : -80 * (N <= 100 ? 1 : 100 / safeN),
+    chargeDistMax:   options.chargeDistanceMax != null ? +options.chargeDistanceMax : 300,
+    collisionRadius: options.collisionRadius != null ? +options.collisionRadius
+                       : (N >= 50 ? 5 : 0),
+    selectedEdge:    options.selectedEdge    || null,
+  };
+}
+
+/** Return a d3-forceLink distance accessor that handles selectedEdge. */
+function _linkDistanceFn(opts) {
+  const base    = opts.linkDistance;
+  const sel     = opts.selectedEdge;
+  if (!sel) return base;
+  return function (link) {
+    return (link._link_id != null && link._link_id === sel.edge_id)
+      ? +sel.distance
+      : base;
+  };
+}
+
+/** Return a d3-forceLink strength accessor that handles selectedEdge. */
+function _linkStrengthFn(opts) {
+  const base = opts.linkStrength;
+  const sel  = opts.selectedEdge;
+  if (!sel) return base;
+  return function (link) {
+    return (link._link_id != null && link._link_id === sel.edge_id)
+      ? +sel.strength
+      : base;
+  };
 }
 
 // ── outbound message helpers ───────────────────────────────────────────────
 
 /**
  * Pack current node positions into new transferable typed arrays.
- * Returns { positions: Float32Array(2*N), node_ids: Int32Array(N) }.
+ * Allocates fresh arrays each call — callers transfer the buffers.
  */
 function _packPositions() {
   const N         = _nodes.length;
@@ -287,11 +354,7 @@ function _packPositions() {
   return { positions, node_ids };
 }
 
-/**
- * Called by d3 on each simulation tick (~60 Hz).
- * graph_id is echoed so the main thread can discard ticks from a prior
- * step that arrive after update_graph has advanced the active graph.
- */
+/** Called by d3 on each simulation tick (~60 Hz). */
 function _onTick() {
   if (_frozen || !_nodes || _nodes.length === 0) return;
   const { positions, node_ids } = _packPositions();
@@ -304,13 +367,11 @@ function _onTick() {
       node_ids:         node_ids,
       alpha:            _sim.alpha(),
     },
-    [positions.buffer, node_ids.buffer]   // transfer ownership — zero-copy
+    [positions.buffer, node_ids.buffer]
   );
 }
 
-/**
- * Called by d3 once alpha drops below alphaMin.
- */
+/** Called by d3 once alpha drops below alphaMin. */
 function _onSettled() {
   if (!_nodes) return;
   const { positions, node_ids } = _packPositions();
@@ -327,7 +388,7 @@ function _onSettled() {
 }
 
 /**
- * Post a structured error message and self-terminate.
+ * Post a structured error and self-terminate.
  * Per contract §3: worker self-terminates on any internal failure.
  */
 function _postError(reason, detail) {
