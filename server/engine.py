@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import math
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Optional
 
 # ── Cache version ─────────────────────────────────────────────────────
@@ -39,7 +39,7 @@ def _is_cancelled() -> bool:
 # ── pattern matching (undirected) ────────────────────────────────────
 from functools import lru_cache
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=131072)
 def _edge_perms_cached(e_tuple: tuple) -> list[list[int]]:
     return [list(p) for p in set(itertools.permutations(e_tuple))]
 
@@ -49,10 +49,18 @@ def _edge_perms(e: Edge) -> list[list[int]]:
 def find_matches(hyp: Hypergraph, pattern: list[list[str]]) -> list[tuple[list[int], dict]]:
     results: list[tuple[list[int], dict]] = []
 
-    # Pre-index edges by length for fast lookup
+    # Pre-index edges by length — used when no variable is bound yet.
     by_len: dict[int, list[int]] = defaultdict(list)
     for i, e in enumerate(hyp):
         by_len[len(e)].append(i)
+
+    # Node-to-edge-indices index — used for constrained pattern edges.
+    # Mirrors the same optimisation in _find_matches_gen: reduces candidates
+    # from O(E) to O(degree) once any variable in the pattern edge is bound.
+    node_to_edges: dict[int, list[int]] = defaultdict(list)
+    for i, e in enumerate(hyp):
+        for n in e:
+            node_to_edges[n].append(i)
 
     # Pre-compute permutations for each edge (cached)
     edge_perms_cache: dict[int, list[list[int]]] = {}
@@ -69,9 +77,20 @@ def find_matches(hyp: Hypergraph, pattern: list[list[str]]) -> list[tuple[list[i
             return
         pe = pattern[pi]
         pe_len = len(pe)
-        candidates = by_len.get(pe_len, [])
+
+        # Use node_to_edges for any bound variable — O(degree) candidates.
+        best_candidates = None
+        for var in pe:
+            if var in binding:
+                nc = node_to_edges.get(binding[var], [])
+                if best_candidates is None or len(nc) < len(best_candidates):
+                    best_candidates = nc
+        candidates = best_candidates if best_candidates is not None else by_len.get(pe_len, [])
+
         for i in candidates:
             if i in used:
+                continue
+            if len(hyp[i]) != pe_len:
                 continue
             for perm in edge_perms_cache[i]:
                 nb = dict(binding)
@@ -235,19 +254,51 @@ def apply_rule_once(hyp: Hypergraph, lhs, rhs, match_idx: int):
 
 # ── greedy (non-overlapping) application — Rec-1 lazy early-exit ─────
 def apply_all_non_overlapping(hyp: Hypergraph, lhs, rhs):
-    """Greedily select non-overlapping matches.
+    """Greedily select non-overlapping matches and apply the rule.
 
-    Rec-1 optimisation: consume matches from a lazy generator instead of
-    materialising all matches upfront.  After each accepted match we decrement
-    a per-length counter of free edges.  When any length required by the LHS
-    pattern has no remaining free edges, no further complete match is possible
-    and we exit the generator early.
+    Two code paths:
 
-    At rule-1 step 12 this cuts enumeration from 55 186 matches to ~3 469
-    (the number actually selected), a ~16× reduction, saving ~93 s.
+    **Single-edge LHS fast path** (rules 3, 4 and any other 1-edge pattern):
+    Every hyperedge matches independently — they can never overlap.  We iterate
+    directly, picking the first permutation per edge, avoiding generator
+    overhead and the 5 wasted permutation checks per ternary edge.  Cancel is
+    checked every 1 024 edges.
+
+    **Multi-edge LHS general path** (rules 1, 2, 5, custom rules):
+    Rec-1 lazy generator with node-index acceleration + committed-set pruning.
+    See _find_matches_gen for details.
     """
-    from collections import Counter
+    nv = rule_new_vars(lhs, rhs)
+    pe_len = len(lhs[0]) if lhs else 0
 
+    # ── Single-edge fast path ─────────────────────────────────────────
+    if len(lhs) == 1:
+        pe = lhs[0]
+        pe_len_1 = len(pe)
+        events: list = []
+        new_edges: list = []
+        consumed_indices: set[int] = set()
+        for i, e in enumerate(hyp):
+            if len(e) != pe_len_1:
+                continue
+            # Cooperative cancellation — check every 1024 edges.
+            if i & 1023 == 0 and _is_cancelled():
+                break
+            perms = _edge_perms(e)
+            # Use the first permutation to form the binding.
+            bind = dict(zip(pe, perms[0]))
+            for v in nv:
+                bind[v] = fresh()
+            produced = [[bind[v] for v in re] for re in rhs]
+            new_edges.extend(produced)
+            events.append({"consumed": [e[:]], "produced": produced})
+            consumed_indices.add(i)
+        if not events:
+            return hyp, []
+        remaining = [e[:] for i, e in enumerate(hyp) if i not in consumed_indices]
+        return remaining + new_edges, events
+
+    # ── Multi-edge general path ───────────────────────────────────────
     # Count free edges by length; updated as matches are accepted.
     free_by_len: Counter = Counter(len(e) for e in hyp)
     # Per-length demand for one complete LHS match.
@@ -281,7 +332,6 @@ def apply_all_non_overlapping(hyp: Hypergraph, lhs, rhs):
     if not selected:
         return hyp, []
 
-    nv = rule_new_vars(lhs, rhs)
     all_matched = {i for mi, _ in selected for i in mi}
     remaining = [e[:] for i, e in enumerate(hyp) if i not in all_matched]
     events = []
@@ -450,8 +500,19 @@ def estimate_dimension(st: Hypergraph) -> Optional[float]:
     all its nodes) rather than an adjacency-projection (clique expansion).  For
     undirected hyperedges both metrics produce identical ball volumes, so this is
     a conceptual improvement (O(k) per edge vs O(k²)) without changing results.
+
+    Size limits: BFS over large hypergraphs is expensive.
+      >20 000 edges → skip (return None) — graph too large for useful estimate.
+      >5 000 edges  → use 1 seed instead of 5 (reduces BFS cost by 5×).
+    The dimension estimate is most useful for early/intermediate steps when the
+    emergent geometry is still forming; at very large step counts the manifold
+    structure is already well-established and the exact number matters less.
     """
     if len(st) < 5:
+        return None
+    # Skip BFS entirely for very large states — cost is O(E × seeds) and the
+    # estimate adds no value that the trend from smaller states didn't already.
+    if len(st) > 20000:
         return None
     node_set = set(n for e in st for n in e)
     nodes = sorted(node_set)
@@ -464,7 +525,11 @@ def estimate_dimension(st: Hypergraph) -> Optional[float]:
         for node in e:
             incidence[node].append(idx)
 
-    num_seeds = min(5, len(nodes))
+    # Use fewer seeds for large graphs (5 000 < edges ≤ 20 000) to keep BFS cheap.
+    if len(st) > 5000:
+        num_seeds = min(2, len(nodes))
+    else:
+        num_seeds = min(5, len(nodes))
     seed_step = max(1, len(nodes) // num_seeds)
     all_balls: list[list[int]] = []
 

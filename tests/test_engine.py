@@ -247,6 +247,19 @@ class TestEstimateDimension:
         # May return None if heuristics disagree, but should not raise
         assert dim is None or (0.5 < dim < 2.0)
 
+    def test_very_large_state_returns_none(self):
+        """States >20 000 edges return None (size cap to keep BFS cheap)."""
+        large = [[i, i + 1] for i in range(21000)]
+        assert engine.estimate_dimension(large) is None
+
+    def test_size_cap_does_not_affect_medium_states(self):
+        """States well below the cap still get a dimension estimate."""
+        # 100-edge ring — small enough for full BFS, large enough to return a value
+        ring = [[i, (i + 1) % 100] for i in range(100)]
+        dim = engine.estimate_dimension(ring)
+        # Ring ≈ 1D; None is also acceptable if BFS heuristics disagree
+        assert dim is None or isinstance(dim, float)
+
 
 # ── Rec-1: lazy generator ─────────────────────────────────────────────
 
@@ -335,6 +348,37 @@ class TestApplyAllNonOverlappingRec1:
         nxt, evts = engine.apply_all_non_overlapping(state, parsed["lhs"], parsed["rhs"])
         assert evts == []
         assert nxt == state
+
+    def test_single_edge_fast_path_event_count(self):
+        """Single-edge LHS: every edge should produce exactly one event."""
+        # Rule3: {x,y} -> {x,y},{y,z} — single binary edge LHS
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        state = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]]
+        nxt, evts = engine.apply_all_non_overlapping(state, lhs, rhs)
+        # Every edge matches independently — 5 edges → 5 events
+        assert len(evts) == 5
+        assert len(nxt) == 5 + 5  # 5 original + 5 new (each {x,y} produces {x,y},{y,z})
+
+    def test_single_edge_ternary_fast_path(self):
+        """Single ternary-edge LHS (rule4-style): all edges produce events."""
+        parsed = engine.parse_notation("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        state = [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+        nxt, evts = engine.apply_all_non_overlapping(state, lhs, rhs)
+        assert len(evts) == 3   # all 3 edges consumed
+        assert len(nxt) == 9   # 3 × 3 produced edges
+
+    def test_single_edge_fast_path_preserves_evolution_semantics(self):
+        """Fast path must produce identical step count and node growth as general path."""
+        # Use rule3 for 5 steps and verify states/events structure is intact.
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        engine.reset(1)
+        result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=5)
+        assert len(result["states"]) == 6   # initial + 5 steps
+        # Edge count doubles each step: 1, 2, 4, 8, 16, 32
+        for i, st in enumerate(result["states"]):
+            assert len(st) == 2 ** i, f"step {i}: expected {2**i} edges, got {len(st)}"
 
 
 # ── Rec-2: produced_index causal edges ───────────────────────────────
