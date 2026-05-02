@@ -1623,7 +1623,7 @@ function renderCausal() {
   }
   const totalVisible = visibleEvents.length;
   const truncated = totalVisible > CAUSAL_NODE_CAP;
-  const renderEvents = truncated ? visibleEvents.slice(0, CAUSAL_NODE_CAP) : visibleEvents;
+  const renderEvents = truncated ? visibleEvents.slice(-CAUSAL_NODE_CAP) : visibleEvents;
   const renderIds    = new Set(renderEvents.map(e => e.id));
   const renderEdges  = truncated
     ? filteredEdges.filter(e => renderIds.has(e.source) && renderIds.has(e.target))
@@ -1711,7 +1711,7 @@ function renderCausal() {
       .attr('fill', isDark ? '#f0a040' : '#b06000')
       .attr('font-size', 11)
       .attr('font-family', "'JetBrains Mono', monospace")
-      .text(`Showing first ${CAUSAL_NODE_CAP.toLocaleString()} of ${totalVisible.toLocaleString()} events`);
+      .text(`Showing most recent ${CAUSAL_NODE_CAP.toLocaleString()} of ${totalVisible.toLocaleString()} events`);
   }
 }
 
