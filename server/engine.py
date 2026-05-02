@@ -1081,6 +1081,17 @@ def compute_multiway_occurrences(
             break
         frontier = new_frontier
 
+    # Rin audit: determine whether the frontier at max_steps has further matches.
+    # multiway_causal_graph() uses this to distinguish "BFS stopped at the
+    # requested depth with work remaining" (→ max_depth truncation) from
+    # "system naturally ran out of matches" (→ NOT truncated).
+    # We check now while _state is still present; it will be stripped below.
+    frontier_can_extend: bool = False
+    if not truncated and max_steps > 0 and frontier:
+        frontier_can_extend = any(
+            bool(find_matches(occ["_state"], lhs)) for occ in frontier
+        )
+
     # Strip internal _state field before returning (keep payload compact).
     public_occs = [{k: v for k, v in occ.items() if k != "_state"} for occ in occurrences]
 
@@ -1089,6 +1100,7 @@ def compute_multiway_occurrences(
         "root_hash": root_hash,
         "truncated": truncated,
         "truncation_reason": truncation_reason,
+        "frontier_can_extend": frontier_can_extend,
     }
 
 
@@ -1277,9 +1289,10 @@ def multiway_causal_graph(
     truncated: bool = bfs["truncated"]
     truncation_reason: Optional[str] = bfs["truncation_reason"]
 
-    # Rin audit: max_steps stop is also a truncation (there may be more
-    # events at depth max_steps+1 that we never computed).
-    if not truncated and max_steps > 0 and any(o["step"] == max_steps for o in occs):
+    # Rin audit (B2.1 fix): only report max_depth when the frontier actually has
+    # more matches available — not when the system terminated naturally at depth.
+    # compute_multiway_occurrences() checks this while _state is still live.
+    if not truncated and max_steps > 0 and bfs.get("frontier_can_extend", False):
         truncated = True
         truncation_reason = "max_depth"
 
@@ -1301,36 +1314,57 @@ def multiway_causal_graph(
         if occ["occ_id"] != 0  # root has no rewrite event
     ]
 
-    # ── 3. Cross-branch causal edges (co-historical only) ────────────
+    # ── 3. Cross-branch causal edges via per-occurrence replay ────────
+    #
+    # Sofia audit (B2.1 blocker): the previous ancestry-produced-index approach
+    # indexed every ancestor's produced edges but never drained edges consumed
+    # by intermediate ancestors.  When identical edge content is produced and
+    # re-consumed along one branch (e.g. rule3: [0,1] is consumed and re-produced
+    # at every step), FIFO-pop incorrectly attributed the later consumer to the
+    # oldest stale producer instead of the live, immediately-preceding one.
+    #
+    # Fix: for each occurrence B, replay its branch_path using
+    # causal_graph_for_path(), which maintains a live produced_index (popping
+    # consumed instances before adding new produced instances — exactly like
+    # evolve()).  The causal edges targeting B's own event (local index d-1)
+    # give the correct co-historical causal parents.  Mapping local event index
+    # i → chain[i].occ_id converts replay-local IDs to occurrence IDs.
+    #
+    # Cost: O(total_occurrences × depth × apply_rule_once).  Bounded by caps
+    # (default 5 000 occurrences × 4 depth = 20 000 apply_rule_once calls).
     causal_edges: list[list[int]] = []
+    seen_pairs: set[tuple[int, int]] = set()
 
     for occ in occs:
-        if occ["occ_id"] == 0 or not occ["consumed"]:
+        if occ["occ_id"] == 0:
             continue
 
-        # Build ancestry produced_index: edge_tuple -> [event_id, ...] oldest-first
-        # Walk from parent up to root, then process root-first so that
-        # FIFO pop correctly assigns oldest producer to first consumer.
-        ancestry_produced: dict[tuple, list[int]] = defaultdict(list)
+        d = len(occ["branch_path"])
+        if d == 0:
+            continue  # root (defensive; already handled above)
+
+        # Build ancestry chain ordered oldest→newest:
+        # chain[0] = step-1 ancestor, ..., chain[d-1] = occ itself.
         chain_rev: list[dict] = []
-        cur: Optional[dict] = by_id.get(occ["parent_occ_id"])
+        cur: Optional[dict] = occ
         while cur is not None and cur["occ_id"] != 0:
             chain_rev.append(cur)
             cur = by_id.get(cur["parent_occ_id"])
-        # Reverse so we iterate oldest (root-side) ancestor first
-        for ancestor in reversed(chain_rev):
-            for pe in ancestor["produced"]:
-                ancestry_produced[tuple(pe)].append(ancestor["occ_id"])
+        chain: list[dict] = list(reversed(chain_rev))
 
-        # Match each consumed edge to its oldest available ancestor producer
-        seen_cause_ids: set[int] = set()
-        for consumed_edge in occ["consumed"]:
-            q = ancestry_produced[tuple(consumed_edge)]
-            if q:
-                cause_id = q.pop(0)  # FIFO: oldest producer first
-                if cause_id not in seen_cause_ids:
-                    seen_cause_ids.add(cause_id)
-                    causal_edges.append([cause_id, occ["occ_id"]])
+        # Replay the full path to get correct live-provenance causal edges.
+        replay = causal_graph_for_path(init_state, lhs, rhs, occ["branch_path"])
+
+        # Add only causal edges whose target is B's event (local index d-1).
+        # Edges targeting earlier ancestors are emitted when those ancestor
+        # occurrences are processed — no duplication, full coverage.
+        for src_local, dst_local in replay["causal_edges"]:
+            if dst_local == d - 1:
+                src_occ_id = chain[src_local]["occ_id"]
+                pair = (src_occ_id, occ["occ_id"])
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    causal_edges.append(list(pair))
 
     # ── 4. Default (greedy) path: always match_idx=0 ─────────────────
     children_by_parent: dict[int, list[dict]] = defaultdict(list)
