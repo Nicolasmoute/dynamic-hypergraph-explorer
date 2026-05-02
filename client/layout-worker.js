@@ -40,7 +40,14 @@ try {
     detail:           loadErr ? (loadErr.message || String(loadErr)) : 'importScripts failed',
   });
   self.close();
-  throw loadErr;   // stop executing rest of the module body
+  // self.close() schedules termination but does NOT immediately halt
+  // execution of the current task. Re-throw so the rest of the module
+  // body (postMessage('ready'), state declarations, message router
+  // attachment) does not run before termination takes effect. Phase 3
+  // observes both the structured `error` message and the implicit
+  // worker.onerror that this re-throw triggers — either signal is
+  // sufficient to fall back to the SVG renderer.
+  throw loadErr;
 }
 
 postMessage({ type: 'ready', protocol_version: PROTOCOL_VERSION });
@@ -70,12 +77,12 @@ self.onmessage = function (evt) {
 
   try {
     switch (msg.type) {
-      case 'init':           _handleInit(msg);          break;
-      case 'update_graph':   _handleUpdateGraph(msg);   break;
-      case 'update_options': _handleUpdateOptions(msg); break;
-      case 'reheat':         _handleReheat(msg);         break;
-      case 'freeze':         _handleFreeze();            break;
-      case 'terminate':      _handleTerminate();         break;
+      case 'init':           _handleInit(msg);           break;
+      case 'update_graph':   _handleUpdateGraph(msg);    break;
+      case 'update_options': _handleUpdateOptions(msg);  break;
+      case 'reheat':         _handleReheat(msg);          break;
+      case 'freeze':         _handleFreeze(msg);          break;
+      case 'terminate':      _handleTerminate();          break;
       default:
         _postError('unknown_message_type', 'Unknown type: ' + msg.type);
     }
@@ -84,16 +91,44 @@ self.onmessage = function (evt) {
   }
 };
 
+// ── graph_id validation helpers ────────────────────────────────────────────
+
+/**
+ * Per contract r2 §3, all messages except `terminate` (and the outbound
+ * `ready`) carry a required, non-empty `graph_id`. Returns true if valid;
+ * otherwise posts a structured `missing_graph_id` error and self-terminates,
+ * and returns false.
+ */
+function _requireGraphId(msg, msgType) {
+  if (msg.graph_id == null || msg.graph_id === '') {
+    _postError('missing_graph_id',
+      msgType + ' requires a non-empty graph_id (contract r2 §3)');
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Returns true if the message's graph_id matches the worker's currently
+ * active graph. Used by update_options / reheat / freeze to silently
+ * drop stale operations from a previous step / rule (no error — main
+ * thread races are common and benign).
+ */
+function _isCurrentGraph(msg) {
+  return msg.graph_id === _graphId;
+}
+
 // ── message handlers ───────────────────────────────────────────────────────
 
 function _handleInit(msg) {
+  if (!_requireGraphId(msg, 'init')) return;
   if (_initialized) {
     _postError('double_init', 'init received on already-initialized worker');
     return;
   }
   _initialized = true;
   _frozen      = false;
-  _graphId     = msg.graph_id != null ? msg.graph_id : null;
+  _graphId     = msg.graph_id;
   _buildSim(
     msg.nodes      || [],
     msg.edges      || [],
@@ -104,6 +139,7 @@ function _handleInit(msg) {
 }
 
 function _handleUpdateGraph(msg) {
+  if (!_requireGraphId(msg, 'update_graph')) return;
   // Strict lifecycle: update_graph requires a prior init.
   if (!_initialized) {
     _postError('not_initialized',
@@ -111,7 +147,7 @@ function _handleUpdateGraph(msg) {
     return;
   }
   _frozen  = false;
-  _graphId = msg.graph_id != null ? msg.graph_id : null;
+  _graphId = msg.graph_id;
 
   // Snapshot live positions as implicit warm-start for surviving node ids
   const prevPos = {};
@@ -136,22 +172,29 @@ function _handleUpdateGraph(msg) {
  * e.g. user moved a force slider, viewport resized (center changed),
  * or an edge became selected/deselected.
  * No alpha change; no position reset; simulation continues from current state.
+ *
+ * Stale-graph operations (msg.graph_id !== _graphId) are silently ignored
+ * — main thread races on step transitions are common; an error would be
+ * disruptive. Missing graph_id IS an error (programming bug, not a race).
  */
 function _handleUpdateOptions(msg) {
-  if (!_initialized || !_sim) {
-    // Silently ignore if not running — no error (caller may race on startup)
-    return;
-  }
+  if (!_requireGraphId(msg, 'update_options')) return;
+  if (!_initialized || !_sim) return;       // not running — caller may race on startup
+  if (!_isCurrentGraph(msg))    return;     // stale graph — silently drop
   _applyForceOptions(msg.options || {});
 }
 
 function _handleReheat(msg) {
-  if (!_sim) return;
+  if (!_requireGraphId(msg, 'reheat')) return;
+  if (!_sim)                 return;
+  if (!_isCurrentGraph(msg)) return;        // stale graph — silently drop
   _frozen = false;
   _sim.alpha(msg.alpha != null ? +msg.alpha : 0.3).restart();
 }
 
-function _handleFreeze() {
+function _handleFreeze(msg) {
+  if (!_requireGraphId(msg, 'freeze')) return;
+  if (!_isCurrentGraph(msg))           return;  // stale graph — silently drop
   _frozen = true;
   if (_sim) _sim.stop();
 }

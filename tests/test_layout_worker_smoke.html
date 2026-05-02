@@ -431,7 +431,7 @@ async function runAll() {
     w.postMessage({ type: 'init', protocol_version: PROTO,
                     graph_id: 't15', nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
     await nextMsg(w);
-    w.postMessage({ type: 'freeze', protocol_version: PROTO });
+    w.postMessage({ type: 'freeze', protocol_version: PROTO, graph_id: 't15' });
     _result('T15 — freeze stops ticks for ≥400 ms', await silence(w, 400),
       'n/a');
     w.terminate();
@@ -464,6 +464,76 @@ async function runAll() {
       'n/a');
     w.terminate();
   } catch (e) { _result('T17 — terminate', false, e.message); }
+
+  // ── T18: missing graph_id on init → missing_graph_id error ────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    /* graph_id intentionally omitted */
+                    nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    const msg = await nextMsg(w, 3000);
+    _result('T18 — init without graph_id → error reason=missing_graph_id',
+      msg.type === 'error' && msg.reason === 'missing_graph_id',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T18 — missing_graph_id on init', false, e.message); }
+
+  // ── T19: protocol_version=1 explicitly rejected (post r2 bump) ───────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: 1,
+                    graph_id: 't19',
+                    nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    const msg = await nextMsg(w, 3000);
+    _result('T19 — protocol_version=1 (legacy) → protocol_version_mismatch',
+      msg.type === 'error' && msg.reason === 'protocol_version_mismatch',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T19 — legacy protocol rejected', false, e.message); }
+
+  // ── T20: freeze with stale graph_id is silently ignored ──────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't20-active',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
+    await nextMsg(w);  // first tick under active graph
+    // Send freeze for a DIFFERENT (stale) graph — should be ignored, sim continues
+    w.postMessage({ type: 'freeze', protocol_version: PROTO,
+                    graph_id: 't20-stale' });
+    // Within 400 ms we should still see at least one tick (sim not frozen)
+    const heard = await new Promise(function (resolve) {
+      let got = false;
+      w.onmessage = function (evt) {
+        if (evt.data.type === 'tick' || evt.data.type === 'settled') got = true;
+      };
+      setTimeout(function () { w.onmessage = null; resolve(got); }, 400);
+    });
+    _result('T20 — freeze with stale graph_id is silently ignored (sim continues)',
+      heard, heard ? 'tick observed after stale freeze' : 'no ticks after stale freeze');
+    w.terminate();
+  } catch (e) { _result('T20 — stale freeze ignored', false, e.message); }
+
+  // ── T21: update_options with stale graph_id is silently ignored ──────
+  // We can't directly observe "ignored" vs "applied" easily, so we verify
+  // (a) no error message, and (b) ticks continue normally.
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't21-active',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
+    await nextMsg(w);  // first tick
+    // Send update_options for stale graph — should be silently dropped (no error)
+    w.postMessage({ type: 'update_options', protocol_version: PROTO,
+                    graph_id: 't21-stale',
+                    options: { linkDistance: 1000 } });
+    // Next message should be a normal tick, not an error
+    const msg = await nextMsg(w, 3000);
+    _result('T21 — update_options with stale graph_id silently dropped',
+      msg.type === 'tick' && msg.graph_id === 't21-active',
+      'next msg type=' + msg.type + ' gid=' + msg.graph_id);
+    w.terminate();
+  } catch (e) { _result('T21 — stale update_options ignored', false, e.message); }
 
   // ── summary ───────────────────────────────────────────────────────────
   const total = passed + failed;
