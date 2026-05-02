@@ -16,6 +16,7 @@
 !client/
 !client/index.html
 !client/app.js
+!client/layout-worker.js
 
 # Docs
 !README.md
@@ -32,6 +33,7 @@
 !tests/conftest.py
 !tests/test_browser_smoke.py
 !tests/test_dimension.py
+!tests/test_layout_worker_smoke.html
 
 # Git hooks (tracked so all agents get the same rules)
 !.githooks/

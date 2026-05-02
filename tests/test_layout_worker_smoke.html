@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<!--
+  tests/test_layout_worker_smoke.html
+  Smoke-test harness for client/layout-worker.js (protocol v1).
+
+  Open this file in a browser served from the project root (so the worker URL
+  '../client/layout-worker.js' resolves correctly), or run via the Playwright
+  helper in tests/test_browser_smoke.py.
+
+  Usage (from repo root):
+    python -m http.server 8080
+    open http://localhost:8080/tests/test_layout_worker_smoke.html
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>layout-worker smoke tests</title>
+  <style>
+    body  { font-family: 'Courier New', monospace; padding: 24px; background:#fafafa; }
+    h2    { margin-bottom: 16px; }
+    .pass { color: #196; }
+    .fail { color: #c22; font-weight: bold; }
+    .info { color: #555; font-style: italic; }
+    ol    { padding-left: 1.4em; line-height: 2; }
+    #summary { margin-top: 20px; font-size: 1.1em; font-weight: bold; }
+    .ok   { color: #196; }
+    .bad  { color: #c22; }
+  </style>
+</head>
+<body>
+<h2>layout-worker smoke tests</h2>
+<ol id="results"></ol>
+<div id="summary">Running…</div>
+
+<script>
+'use strict';
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+const WORKER_URL   = '../client/layout-worker.js';
+const PROTO        = 1;
+const TIMEOUT_MS   = 10000;
+
+const log = document.getElementById('results');
+const summary = document.getElementById('summary');
+
+let passed = 0, failed = 0;
+
+function _result(label, ok, detail) {
+  const li = document.createElement('li');
+  li.className = ok ? 'pass' : 'fail';
+  li.textContent = (ok ? '✓ ' : '✗ ') + label + (detail ? '  — ' + detail : '');
+  log.appendChild(li);
+  ok ? passed++ : failed++;
+}
+
+function _info(text) {
+  const li = document.createElement('li');
+  li.className = 'info';
+  li.textContent = '  ' + text;
+  log.appendChild(li);
+}
+
+/** Return a Promise that resolves with the next message from worker, or
+ *  rejects after timeoutMs. */
+function nextMsg(worker, timeoutMs) {
+  timeoutMs = timeoutMs || TIMEOUT_MS;
+  return new Promise(function (resolve, reject) {
+    const timer = setTimeout(function () {
+      worker.onmessage = null;
+      reject(new Error('timeout waiting for message'));
+    }, timeoutMs);
+    worker.onmessage = function (evt) {
+      clearTimeout(timer);
+      worker.onmessage = null;
+      resolve(evt.data);
+    };
+  });
+}
+
+/** Collect N messages from worker (or until timeout). */
+function collectN(worker, n, timeoutMs) {
+  timeoutMs = timeoutMs || TIMEOUT_MS;
+  return new Promise(function (resolve, reject) {
+    const msgs = [];
+    const timer = setTimeout(function () {
+      worker.onmessage = null;
+      if (msgs.length > 0) resolve(msgs);  // partial is OK for some tests
+      else reject(new Error('timeout: got 0 messages'));
+    }, timeoutMs);
+    worker.onmessage = function (evt) {
+      msgs.push(evt.data);
+      if (msgs.length >= n) {
+        clearTimeout(timer);
+        worker.onmessage = null;
+        resolve(msgs);
+      }
+    };
+  });
+}
+
+/** Collect messages until a predicate is satisfied, with timeout. */
+function collectUntil(worker, pred, timeoutMs) {
+  timeoutMs = timeoutMs || TIMEOUT_MS;
+  return new Promise(function (resolve, reject) {
+    const msgs = [];
+    const timer = setTimeout(function () {
+      worker.onmessage = null;
+      reject(new Error('timeout: collected ' + msgs.length + ' messages without satisfying predicate'));
+    }, timeoutMs);
+    worker.onmessage = function (evt) {
+      msgs.push(evt.data);
+      if (pred(evt.data, msgs)) {
+        clearTimeout(timer);
+        worker.onmessage = null;
+        resolve(msgs);
+      }
+    };
+  });
+}
+
+// Minimal graph fixture (triangle: nodes 0,1,2; edges 0→1, 1→2, 0→2)
+const NODES3 = [{ id: 0 }, { id: 1 }, { id: 2 }];
+const EDGES3 = [
+  { source: 0, target: 1 },
+  { source: 1, target: 2 },
+  { source: 0, target: 2 },
+];
+
+// Larger fixture with a hyperedge (nodes 0..4, hyperedge spanning 2,3,4)
+const NODES5     = [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+const EDGES5     = [{ source: 0, target: 1 }, { source: 1, target: 2 }];
+const HYPEREDGES5 = [{ id: 10, nodes: [2, 3, 4] }];
+
+// ── test suite ─────────────────────────────────────────────────────────────
+
+async function runAll() {
+  // ── T1: ready message ─────────────────────────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    const msg = await nextMsg(w);
+    _result('T1 — ready message has type="ready" and protocol_version=1',
+      msg.type === 'ready' && msg.protocol_version === PROTO,
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T1 — ready message', false, e.message); }
+
+  // ── T2: init → receive tick ───────────────────────────────────────────
+  let tickMsg = null;
+  let tickWorker = null;
+  try {
+    const w = tickWorker = new Worker(WORKER_URL);
+    await nextMsg(w);  // drain ready
+
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [] });
+    const msg = await nextMsg(w);
+    tickMsg = msg;
+    _result('T2 — init triggers a tick message',
+      msg.type === 'tick',
+      'type=' + msg.type);
+    // keep w alive for T3
+  } catch (e) { _result('T2 — init triggers tick', false, e.message); if (tickWorker) tickWorker.terminate(); }
+
+  // ── T3: tick payload types and sizes ─────────────────────────────────
+  try {
+    if (!tickMsg) throw new Error('no tick from T2');
+    const N = NODES3.length;
+    const posOk  = tickMsg.positions instanceof Float32Array &&
+                   tickMsg.positions.length === 2 * N;
+    const idsOk  = tickMsg.node_ids  instanceof Int32Array  &&
+                   tickMsg.node_ids.length  === N;
+    const alphaOk = typeof tickMsg.alpha === 'number' &&
+                    tickMsg.alpha >= 0 && tickMsg.alpha <= 1;
+    _result('T3 — positions is Float32Array(2*N), node_ids is Int32Array(N), alpha in [0,1]',
+      posOk && idsOk && alphaOk,
+      'pos.len=' + (tickMsg.positions ? tickMsg.positions.length : 'n/a') +
+      ' ids.len=' + (tickMsg.node_ids  ? tickMsg.node_ids.length  : 'n/a') +
+      ' alpha='  + (tickMsg.alpha));
+    if (tickWorker) { tickWorker.terminate(); tickWorker = null; }
+  } catch (e) { _result('T3 — payload types/sizes', false, e.message); if (tickWorker) { tickWorker.terminate(); tickWorker = null; } }
+
+  // ── T4: alpha decreases across ticks ─────────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alpha: 0.5, alphaDecay: 0.05 } });
+    const msgs = await collectN(w, 5, TIMEOUT_MS);
+    const ticks = msgs.filter(function (m) { return m.type === 'tick'; });
+    let decreasing = ticks.length >= 2;
+    for (let i = 1; i < ticks.length; i++) {
+      if (ticks[i].alpha > ticks[i - 1].alpha + 0.01) { decreasing = false; break; }
+    }
+    _result('T4 — alpha is non-increasing across ticks',
+      decreasing,
+      'alphas=' + ticks.map(function (m) { return m.alpha.toFixed(4); }).join(', '));
+    w.terminate();
+  } catch (e) { _result('T4 — alpha decreasing', false, e.message); }
+
+  // ── T5: settled message received ─────────────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    // Use fast decay so it settles quickly
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alpha: 0.3, alphaDecay: 0.1 } });
+    const msgs = await collectUntil(w,
+      function (m) { return m.type === 'settled'; },
+      8000);
+    const settledMsg = msgs[msgs.length - 1];
+    const ok = settledMsg.type === 'settled' &&
+               settledMsg.positions instanceof Float32Array &&
+               settledMsg.node_ids instanceof Int32Array;
+    _result('T5 — settled message received with typed-array payloads', ok,
+      'ticks before settle=' + (msgs.length - 1));
+    w.terminate();
+  } catch (e) { _result('T5 — settled message', false, e.message); }
+
+  // ── T6: warm-start preserves positions across update_graph ───────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+
+    // Init with 3 nodes, collect first tick to get initial positions
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alpha: 0.3 } });
+    const firstTick = await nextMsg(w);  // first tick
+
+    // Extract positions from first tick as our warmstart
+    const warmstart = {};
+    const N = NODES3.length;
+    for (let i = 0; i < N; i++) {
+      warmstart[firstTick.node_ids[i]] = [
+        firstTick.positions[2 * i],
+        firstTick.positions[2 * i + 1],
+      ];
+    }
+
+    // Freeze to capture stable positions, then update_graph with warmstart
+    w.postMessage({ type: 'freeze', protocol_version: PROTO });
+    await new Promise(function (r) { setTimeout(r, 50); });
+
+    w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    warmstart: warmstart });
+
+    const afterUpdate = await nextMsg(w);  // first tick after update
+    w.terminate();
+
+    // Positions for nodes that were in warmstart should be very close
+    let allClose = true;
+    const TOL = 1.0;  // positions may shift slightly due to force application
+    for (let i = 0; i < afterUpdate.node_ids.length; i++) {
+      const id = afterUpdate.node_ids[i];
+      if (warmstart[id] == null) continue;
+      const dx = afterUpdate.positions[2 * i]     - warmstart[id][0];
+      const dy = afterUpdate.positions[2 * i + 1] - warmstart[id][1];
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > TOL) {
+        allClose = false;
+        _info('  node ' + id + ': warmstart=[' +
+          warmstart[id].map(function (v) { return v.toFixed(2); }) + ']' +
+          ' after_update=[' + [afterUpdate.positions[2*i], afterUpdate.positions[2*i+1]]
+            .map(function (v) { return v.toFixed(2); }) + ']' +
+          ' dist=' + dist.toFixed(3));
+      }
+    }
+    _result('T6 — update_graph with warmstart: positions within tolerance=' + TOL + 'px',
+      allClose, allClose ? 'all nodes placed correctly' : 'some nodes drifted');
+  } catch (e) { _result('T6 — warm-start preservation', false, e.message); }
+
+  // ── T7: hyperedge clique expansion (5 nodes, 1 hyperedge) ─────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES5, edges: EDGES5,
+                    hyperedges: HYPEREDGES5 });
+    const msg = await nextMsg(w);
+    const N = NODES5.length;
+    _result('T7 — init with hyperedge: tick has correct N=5',
+      msg.type === 'tick' &&
+      msg.positions.length === 2 * N &&
+      msg.node_ids.length  === N,
+      'pos.len=' + msg.positions.length + ' ids.len=' + msg.node_ids.length);
+    w.terminate();
+  } catch (e) { _result('T7 — hyperedge expansion', false, e.message); }
+
+  // ── T8: protocol_version_mismatch → error + worker terminates ────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: 999,
+                    nodes: NODES3, edges: [], hyperedges: [] });
+    const msg = await nextMsg(w, 3000);
+    _result('T8 — bad protocol_version → error reason=protocol_version_mismatch',
+      msg.type === 'error' && msg.reason === 'protocol_version_mismatch',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T8 — protocol_version_mismatch', false, e.message); }
+
+  // ── T9: double_init → error + worker terminates ───────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: [], hyperedges: [] });
+    await nextMsg(w);  // first tick
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: [], hyperedges: [] });
+    // Drain until we get the error (or timeout)
+    const msgs = await collectUntil(w,
+      function (m) { return m.type === 'error'; }, 3000);
+    const errMsg = msgs[msgs.length - 1];
+    _result('T9 — double init → error reason=double_init',
+      errMsg.type === 'error' && errMsg.reason === 'double_init',
+      JSON.stringify(errMsg));
+    w.terminate();
+  } catch (e) { _result('T9 — double_init error', false, e.message); }
+
+  // ── T10: freeze stops ticks ───────────────────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [] });
+    await nextMsg(w);  // at least one tick
+    w.postMessage({ type: 'freeze', protocol_version: PROTO });
+    // After freeze, no more ticks should arrive within 400 ms
+    const silence = await new Promise(function (resolve) {
+      let received = false;
+      w.onmessage = function () { received = true; };
+      setTimeout(function () {
+        w.onmessage = null;
+        resolve(!received);
+      }, 400);
+    });
+    _result('T10 — freeze stops tick messages for ≥400 ms', silence,
+      silence ? 'no messages after freeze' : 'message received after freeze');
+    w.terminate();
+  } catch (e) { _result('T10 — freeze stops ticks', false, e.message); }
+
+  // ── T11: reheat after freeze restarts ticks ───────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alphaDecay: 0.1 } });
+    // Wait for settled
+    await collectUntil(w, function (m) { return m.type === 'settled'; }, 8000);
+    // Now reheat
+    w.postMessage({ type: 'reheat', protocol_version: PROTO, alpha: 0.3 });
+    const msg = await nextMsg(w, 3000);
+    _result('T11 — reheat after settled restarts ticks',
+      msg.type === 'tick',
+      'type=' + msg.type + ' alpha=' + (msg.alpha != null ? msg.alpha.toFixed(4) : 'n/a'));
+    w.terminate();
+  } catch (e) { _result('T11 — reheat restarts', false, e.message); }
+
+  // ── T12: terminate silences the worker ───────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    await nextMsg(w);  // ready
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [] });
+    await nextMsg(w);  // at least one tick
+    w.postMessage({ type: 'terminate', protocol_version: PROTO });
+    // No messages after terminate within 400 ms
+    const silence = await new Promise(function (resolve) {
+      let received = false;
+      w.onmessage = function () { received = true; };
+      setTimeout(function () {
+        w.onmessage = null;
+        resolve(!received);
+      }, 400);
+    });
+    _result('T12 — terminate silences the worker', silence,
+      silence ? 'no messages after terminate' : 'message received after terminate');
+    w.terminate();  // belt-and-suspenders cleanup
+  } catch (e) { _result('T12 — terminate', false, e.message); }
+
+  // ── summary ───────────────────────────────────────────────────────────
+  const total = passed + failed;
+  summary.className = failed === 0 ? 'ok' : 'bad';
+  summary.textContent = passed + '/' + total + ' passed' +
+    (failed > 0 ? ' — ' + failed + ' FAILED' : ' — all OK');
+}
+
+runAll().catch(function (e) {
+  summary.className = 'bad';
+  summary.textContent = 'Test suite error: ' + e.message;
+  console.error(e);
+});
+</script>
+</body>
+</html>
