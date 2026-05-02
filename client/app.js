@@ -241,6 +241,7 @@ let _jobAborted   = false; // set by abortCurrentJob(); callers skip their error
 
 // Force-layout user controls (live-adjustable via sidebar sliders)
 let forceParams = { linkDistMult: 1.0, chargeMult: 1.0, linkStrength: 0.3 };
+let _prevNodePositions = new Map(); // warmstart: reuse positions across step changes
 
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
@@ -673,7 +674,11 @@ function renderSpatial() {
       l._curve = sign * Math.ceil((i + 1) / 2) * 18;
     }
   });
-  const nodes = Array.from(nodeSet).map(id => ({ id }));
+  const nodes = Array.from(nodeSet).map(id => {
+    const prev = _prevNodePositions.get(id);
+    return prev ? { id, x: prev.x, y: prev.y } : { id };
+  });
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
 
   const nodeR = Math.max(0.5, Math.min(2, 60 / Math.sqrt(nodes.length)));
   const baseEdgeWidth = Math.max(0.8, 2.5 - nodes.length / 400);
@@ -742,6 +747,24 @@ function renderSpatial() {
 
   const loopG = g.append('g');
 
+  // Precompute self-loop stacking indices; create path elements once (updated by tick handler)
+  const loopIdxByNode = {};
+  selfLoops.forEach(sl => {
+    sl._loopIdx = loopIdxByNode[sl.node] || 0;
+    loopIdxByNode[sl.node] = sl._loopIdx + 1;
+  });
+  const loopPaths = loopG.selectAll('path').data(selfLoops).join('path')
+    .attr('fill', 'none')
+    .attr('stroke', sl => {
+      if (selectedEdges.length > 0) {
+        const c = getEdgeSelColor(sl.edgeIdx);
+        if (c) return c;
+      }
+      return opts.colors ? edgeBirthColor(sl.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
+    })
+    .attr('stroke-width', sl => selectedEdges.length > 0 && getEdgeSelColor(sl.edgeIdx) ? baseEdgeWidth * 2 : baseEdgeWidth)
+    .attr('stroke-opacity', sl => selectedEdges.length > 0 ? (getEdgeSelColor(sl.edgeIdx) ? 1 : 0.25) : 0.65);
+
   // Nodes
   const node = g.append('g').selectAll('circle').data(nodes).join('circle')
     .attr('r', nodeR)
@@ -783,10 +806,11 @@ function renderSpatial() {
       .on('end', (e,d) => { if (!e.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; })
     );
 
-  // Labels
+  // Labels — cache the D3 selection so the tick handler can call .attr() directly
   const labelG = g.append('g');
+  let labelSel = null;
   if (opts.labels) {
-    labelG.selectAll('text').data(nodes).join('text')
+    labelSel = labelG.selectAll('text').data(nodes).join('text')
       .attr('font-size', Math.max(6, 8 - nodes.length/100))
       .attr('font-family', 'JetBrains Mono, monospace')
       .attr('fill', isDark ? '#888' : '#666')
@@ -794,7 +818,13 @@ function renderSpatial() {
       .text(d => d.id);
   }
 
-  if (simulation) simulation.stop();
+  if (simulation) {
+    // Save current positions for warmstart on the next renderSpatial call
+    simulation.nodes().forEach(n => {
+      if (n.x != null) _prevNodePositions.set(n.id, { x: n.x, y: n.y });
+    });
+    simulation.stop();
+  }
   const baseDist = 20 + 200/Math.sqrt(nodes.length);
   simulation = d3.forceSimulation(nodes)
     .force('link', d3.forceLink(links).id(d => d.id)
@@ -815,31 +845,14 @@ function renderSpatial() {
         return 'M' + sx + ',' + sy + 'Q' + cx + ',' + cy + ' ' + tx + ',' + ty;
       });
       node.attr('cx',d=>d.x).attr('cy',d=>d.y);
-      if (opts.labels) labelG.selectAll('text').attr('x',d=>d.x).attr('y',d=>d.y);
-      if (opts.hulls) drawHulls(hullG, hyperedges, nodes, edgeBirthColor);
-      // Self-loops
-      loopG.selectAll('path').remove();
-      const loopCount = {};
-      selfLoops.forEach(sl => { loopCount[sl.node] = (loopCount[sl.node] || 0) + 1; });
-      const loopIdx = {};
-      selfLoops.forEach(sl => {
-        const n = nodes.find(x => x.id === sl.node);
-        if (!n || n.x == null) return;
-        const idx = loopIdx[sl.node] || 0;
-        loopIdx[sl.node] = idx + 1;
-        const r = nodeR * 3 + idx * nodeR * 2.5;
-        loopG.append('path')
-          .attr('d', `M${n.x},${n.y - nodeR} A${r},${r} 0 1,1 ${n.x + 0.01},${n.y - nodeR}`)
-          .attr('fill', 'none')
-          .attr('stroke', () => {
-            if (selectedEdges.length > 0) {
-              const c = getEdgeSelColor(sl.edgeIdx);
-              if (c) return c;
-            }
-            return opts.colors ? edgeBirthColor(sl.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
-          })
-          .attr('stroke-width', selectedEdges.length > 0 && getEdgeSelColor(sl.edgeIdx) ? baseEdgeWidth * 2 : baseEdgeWidth)
-          .attr('stroke-opacity', selectedEdges.length > 0 ? (getEdgeSelColor(sl.edgeIdx) ? 1 : 0.25) : 0.65);
+      if (labelSel) labelSel.attr('x',d=>d.x).attr('y',d=>d.y);
+      if (opts.hulls) drawHulls(hullG, hyperedges, nodeById, edgeBirthColor);
+      // Self-loops — path elements already exist; just update `d` in place
+      loopPaths.attr('d', sl => {
+        const n = nodeById.get(sl.node);
+        if (!n || n.x == null) return '';
+        const r = nodeR * 3 + sl._loopIdx * nodeR * 2.5;
+        return `M${n.x},${n.y - nodeR} A${r},${r} 0 1,1 ${n.x + 0.01},${n.y - nodeR}`;
       });
     });
 
@@ -872,26 +885,28 @@ function renderSpatial() {
   }
 }
 
-function drawHulls(hullG, hyperedges, nodes, birthColorFn) {
-  hullG.selectAll('path').remove();
-  hyperedges.filter(h => h.nodes.length > 2).forEach((h, i) => {
-    const pts = h.nodes.map(nid => {
-      const n = nodes.find(x => x.id === nid);
-      return n && n.x != null ? [n.x, n.y] : null;
-    }).filter(Boolean);
-    if (pts.length >= 3) {
+function drawHulls(hullG, hyperedges, nodeById, birthColorFn) {
+  // Data-join preserves path elements across ticks; only the `d` attribute is recomputed
+  const hEdges = hyperedges.filter(h => h.nodes.length > 2);
+  hullG.selectAll('path')
+    .data(hEdges, h => h.id)
+    .join(
+      enter => enter.append('path')
+        .attr('fill-opacity', 0.06)
+        .attr('stroke-opacity', 0.15)
+        .attr('stroke-width', 1)
+        .attr('fill', h => birthColorFn ? birthColorFn(h.id) : getPalette()[0])
+        .attr('stroke', h => birthColorFn ? birthColorFn(h.id) : getPalette()[0])
+    )
+    .attr('d', h => {
+      const pts = h.nodes.map(nid => {
+        const n = nodeById.get(nid);
+        return n && n.x != null ? [n.x, n.y] : null;
+      }).filter(Boolean);
+      if (pts.length < 3) return '';
       const hull = d3.polygonHull(pts);
-      if (hull) {
-        hullG.append('path')
-          .attr('d', 'M' + hull.join('L') + 'Z')
-          .attr('fill', birthColorFn ? birthColorFn(h.id) : getPalette()[i % getPalette().length])
-          .attr('fill-opacity', 0.06)
-          .attr('stroke', birthColorFn ? birthColorFn(h.id) : getPalette()[i % getPalette().length])
-          .attr('stroke-opacity', 0.15)
-          .attr('stroke-width', 1);
-      }
-    }
-  });
+      return hull ? 'M' + hull.join('L') + 'Z' : '';
+    });
 }
 
 // =========================================================================
