@@ -1304,8 +1304,8 @@ function renderSpatialCanvas() {
     // LEVER-1: throttle overlay setAttribute storm to ≤10fps (100ms interval).
     // The overlay is used for click/drag hit-testing; positions only need to be
     // fresh when the user is about to interact, not at full simulation frame rate.
-    // _overlayNeedsImmediateUpdate is set on pointerdown so click targets are
-    // always accurate at the moment the user clicks.
+    // _overlayNeedsImmediateUpdate is set on pointermove (see LEVER-1 above) so
+    // the overlay is fresh by the time the user lifts to click.
     const overlayActive = !_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH;
     if (overlayActive) {
       const now = performance.now();
@@ -2382,56 +2382,6 @@ function tracePathTo(mw, targetHash) {
   }
   return path;
 }
-
-// =========================================================================
-// MINIMAL CLIENT-SIDE ENGINE (for causal view alt-match detection only)
-// =========================================================================
-const HGEngine = (() => {
-  function findMatches(hyp, pattern) {
-    const results = [];
-    _matchRec(hyp, pattern, 0, [], {}, new Set(), results);
-    const seen = new Set();
-    return results.filter(([mi, bind]) => {
-      const key = mi.join(',') + ':' + JSON.stringify(bind);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }
-
-  function _edgePerms(e) {
-    if (e.length <= 1) return [e];
-    if (e.length === 2) return [e, [e[1], e[0]]];
-    const res = [];
-    for (let i = 0; i < e.length; i++) {
-      const rest = e.slice(0, i).concat(e.slice(i + 1));
-      for (const p of _edgePerms(rest)) res.push([e[i], ...p]);
-    }
-    return res;
-  }
-
-  function _matchRec(hyp, pat, pi, matched, binding, used, results) {
-    if (pi === pat.length) { results.push([matched.slice(), {...binding}]); return; }
-    const pe = pat[pi];
-    for (let i = 0; i < hyp.length; i++) {
-      if (used.has(i) || hyp[i].length !== pe.length) continue;
-      for (const perm of _edgePerms(hyp[i])) {
-        const nb = {...binding};
-        let ok = true;
-        for (let j = 0; j < pe.length; j++) {
-          if (nb[pe[j]] !== undefined) { if (nb[pe[j]] !== perm[j]) { ok = false; break; } }
-          else nb[pe[j]] = perm[j];
-        }
-        if (!ok) continue;
-        matched.push(i); used.add(i);
-        _matchRec(hyp, pat, pi + 1, matched, nb, used, results);
-        used.delete(i); matched.pop();
-      }
-    }
-  }
-
-  return { findMatches };
-})();
 
 function parseNotation(notation) {
   const arrow = notation.includes('\u2192') ? '\u2192' : '->';
