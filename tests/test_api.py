@@ -198,6 +198,36 @@ class TestGetMultiwayCausal:
         # Small cap should be truncated; large cap may not be
         assert r_small.json()["truncated"] is True
 
+    # ── GET cap validation ────────────────────────────────────────────────
+
+    def test_max_steps_zero_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_steps=0")
+        assert r.status_code == 400
+
+    def test_max_steps_too_large_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_steps=9")
+        assert r.status_code == 400
+
+    def test_max_steps_negative_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_steps=-1")
+        assert r.status_code == 400
+
+    def test_max_occurrences_zero_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_occurrences=0")
+        assert r.status_code == 400
+
+    def test_max_occurrences_too_large_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_occurrences=20001")
+        assert r.status_code == 400
+
+    def test_max_time_ms_zero_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_time_ms=0")
+        assert r.status_code == 400
+
+    def test_max_time_ms_too_large_returns_400(self, client):
+        r = client.get("/api/rules/rule3/multiway-causal?max_time_ms=30001")
+        assert r.status_code == 400
+
 
 # ── POST /api/custom/multiway-causal ─────────────────────────────────
 
@@ -271,6 +301,14 @@ class TestCustomMultiwayCausal:
 
     def test_max_occurrences_too_large_returns_400(self):
         r = self._post(max_occurrences=20_001)
+        assert r.status_code == 400
+
+    def test_max_time_ms_zero_returns_400(self):
+        r = self._post(max_time_ms=0)
+        assert r.status_code == 400
+
+    def test_max_time_ms_too_large_returns_400(self):
+        r = self._post(max_time_ms=30_001)
         assert r.status_code == 400
 
     def test_unicode_arrow_notation(self):

@@ -369,6 +369,11 @@ def get_multiway_causal(
     independent cache entries.  Read order: in-memory CACHE → disk JSON →
     recompute (then persist).
     """
+    # Hard caps — callers should validate first, but clamp defensively here too
+    max_steps = max(1, min(max_steps, 8))
+    max_occurrences = max(1, min(max_occurrences, 20_000))
+    max_time_ms = max(1, min(max_time_ms, 30_000))
+
     cache_key = f"{rule_id}_mwcausal_{max_steps}_{max_occurrences}_{max_time_ms}"
     if cache_key in CACHE:
         logger.debug("cache hit (memory) key=%s", cache_key)
@@ -545,13 +550,19 @@ def get_rule_multiway_causal(
     (Phase B).
 
     Query params:
-    - max_steps        : BFS depth cap (default 4).
-    - max_occurrences  : total occurrence cap (default 5000).
-    - max_time_ms      : wall-clock cap in ms (default 5000).
+    - max_steps        : BFS depth cap (default 4, must be 1–8).
+    - max_occurrences  : total occurrence cap (default 5000, must be 1–20000).
+    - max_time_ms      : wall-clock cap in ms (default 5000, must be 1–30000).
 
     Response shape: see engine.multiway_causal_graph() docstring, plus:
     - meta.rule_id, meta.rule_notation, meta.init_state
     """
+    if max_steps < 1 or max_steps > 8:
+        raise HTTPException(400, "max_steps must be 1-8")
+    if max_occurrences < 1 or max_occurrences > 20_000:
+        raise HTTPException(400, "max_occurrences must be 1-20000")
+    if max_time_ms < 1 or max_time_ms > 30_000:
+        raise HTTPException(400, "max_time_ms must be 1-30000")
     return get_multiway_causal(rule_id, max_steps, max_occurrences, max_time_ms)
 
 
@@ -740,9 +751,9 @@ def run_custom_multiway_causal(req: MultiwayCausalRequest):
     Request body:
     - notation       : rule in {{...}} → {{...}} notation (required).
     - init           : initial hypergraph state (required).
-    - max_steps      : BFS depth cap (default 4, max 8).
-    - max_occurrences: total occurrence cap (default 5000, max 20000).
-    - max_time_ms    : wall-clock cap in ms (default 5000, hard cap applies).
+    - max_steps      : BFS depth cap (default 4, must be 1–8).
+    - max_occurrences: total occurrence cap (default 5000, must be 1–20000).
+    - max_time_ms    : wall-clock cap in ms (default 5000, must be 1–30000).
 
     Response shape: same as GET /api/rules/{id}/multiway-causal, plus
     meta.rule_notation and meta.init_state.  Computation is never
@@ -752,6 +763,8 @@ def run_custom_multiway_causal(req: MultiwayCausalRequest):
         raise HTTPException(400, "max_steps must be 1-8")
     if req.max_occurrences < 1 or req.max_occurrences > 20_000:
         raise HTTPException(400, "max_occurrences must be 1-20000")
+    if req.max_time_ms < 1 or req.max_time_ms > 30_000:
+        raise HTTPException(400, "max_time_ms must be 1-30000")
 
     parsed = engine.parse_notation(req.notation)
     if not parsed:
