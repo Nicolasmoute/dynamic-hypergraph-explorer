@@ -12,7 +12,10 @@ from typing import Optional
 # value so old files remain on disk but are no longer read.
 # v1 → v2: §5.4 dimension fix — incidence-based BFS replaces clique projection.
 #   Ternary hyperedges (Rules 4, 5) produce different (more correct) estimates.
-CACHE_VERSION = "v2"
+# v2 → v3: Phase B1/B2 — occurrence-based multiway BFS adds match_idx /
+#   branch_path fields; multiway_causal_graph() payload uses occ_id as event id.
+#   Old multiway cache entries lack these fields; must be invalidated.
+CACHE_VERSION = "v3"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1180,6 +1183,179 @@ def causal_graph_for_path(
         states.append([e[:] for e in state])
 
     return {"events": events, "causal_edges": causal_edges, "states": states}
+
+
+# ── multiway causal graph (Phase B2) ─────────────────────────────────
+
+def multiway_causal_graph(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    max_steps: int = 4,
+    max_occurrences: int = 5000,
+    max_time_ms: int = 5000,
+) -> dict:
+    """Compute the multiway causal graph: events DAG across all branches.
+
+    Builds the cross-branch causal DAG by running the occurrence BFS
+    (``compute_multiway_occurrences``) and then — for each non-root
+    occurrence — constructing its ancestry-produced index to find which
+    earlier event produced each consumed edge.
+
+    **Co-historical guarantee (Sofia's requirement)**
+
+    Causal edge ``A → B`` exists iff:
+
+    - B's ``consumed`` set contains edge ``h``, AND
+    - the ancestry chain from root to B's *parent* contains an occurrence
+      whose ``produced`` list includes ``h`` and whose ``occ_id == A``.
+
+    Causal edges from events outside B's ancestry are never added.
+    Cross-branch causal edges arise naturally when a shared canonical state
+    is reached from two different rule applications; descendant occurrences
+    from one branch will have ancestors produced by the other branch only if
+    those ancestors appear literally in their ancestry chain.
+
+    **Greedy default path**
+
+    ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
+    reached by always selecting ``match_idx=0`` at each step (the first
+    available match — the same deterministic choice ``evolve()`` makes).
+    These events are colored red client-side; off-path events are green.
+
+    **Truncation**
+
+    Three stop conditions, all surfaced as ``truncated=True``:
+
+    - ``"max_occurrences"`` — BFS reached ``max_occurrences`` total.
+    - ``"max_time_ms"``     — wall-clock cap exceeded.
+    - ``"max_depth"``       — BFS stopped at ``max_steps`` depth (Rin
+      audit: honest about depth-cap even when other caps don't fire).
+
+    **CACHE_VERSION** is bumped to ``v3`` alongside this function to
+    invalidate cached multiway payloads (new ``match_idx`` / ``branch_path``
+    fields make old payloads incompatible).
+
+    Args:
+        init_state:      Initial hypergraph.
+        lhs:             Parsed LHS pattern (from ``parse_notation``).
+        rhs:             Parsed RHS pattern.
+        max_steps:       Maximum BFS depth (rewrite steps from root).
+        max_occurrences: Total occurrence cap (default 5 000).
+        max_time_ms:     Wall-clock cap in milliseconds (default 5 000).
+
+    Returns::
+
+        {
+          "events": [
+            {
+              "id":             int,           # == occ_id (>0)
+              "step":           int,           # depth from root
+              "occ_id":         int,           # same as id
+              "parent_occ_id":  int | None,
+              "match_idx":      int,
+              "consumed":       list[list[int]],
+              "produced":       list[list[int]],
+              "branch_path":    list[int],     # replay-stable path token
+            }, ...
+          ],
+          "causal_edges":            [[from_id, to_id], ...],
+          "default_path_event_ids":  [int, ...],
+          "truncated":               bool,
+          "truncation_reason":       str | None,
+        }
+    """
+    # ── 1. Occurrence BFS ─────────────────────────────────────────────
+    bfs = compute_multiway_occurrences(
+        init_state, lhs, rhs,
+        max_steps=max_steps,
+        max_occurrences=max_occurrences,
+        max_time_ms=max_time_ms,
+    )
+
+    occs: list[dict] = bfs["occurrences"]
+    truncated: bool = bfs["truncated"]
+    truncation_reason: Optional[str] = bfs["truncation_reason"]
+
+    # Rin audit: max_steps stop is also a truncation (there may be more
+    # events at depth max_steps+1 that we never computed).
+    if not truncated and max_steps > 0 and any(o["step"] == max_steps for o in occs):
+        truncated = True
+        truncation_reason = "max_depth"
+
+    # ── 2. Index occurrences and build events list ────────────────────
+    by_id: dict[int, dict] = {o["occ_id"]: o for o in occs}
+
+    events: list[dict] = [
+        {
+            "id": occ["occ_id"],
+            "step": occ["step"],
+            "occ_id": occ["occ_id"],
+            "parent_occ_id": occ["parent_occ_id"],
+            "match_idx": occ["match_idx"],
+            "consumed": occ["consumed"],
+            "produced": occ["produced"],
+            "branch_path": occ["branch_path"],
+        }
+        for occ in occs
+        if occ["occ_id"] != 0  # root has no rewrite event
+    ]
+
+    # ── 3. Cross-branch causal edges (co-historical only) ────────────
+    causal_edges: list[list[int]] = []
+
+    for occ in occs:
+        if occ["occ_id"] == 0 or not occ["consumed"]:
+            continue
+
+        # Build ancestry produced_index: edge_tuple -> [event_id, ...] oldest-first
+        # Walk from parent up to root, then process root-first so that
+        # FIFO pop correctly assigns oldest producer to first consumer.
+        ancestry_produced: dict[tuple, list[int]] = defaultdict(list)
+        chain_rev: list[dict] = []
+        cur: Optional[dict] = by_id.get(occ["parent_occ_id"])
+        while cur is not None and cur["occ_id"] != 0:
+            chain_rev.append(cur)
+            cur = by_id.get(cur["parent_occ_id"])
+        # Reverse so we iterate oldest (root-side) ancestor first
+        for ancestor in reversed(chain_rev):
+            for pe in ancestor["produced"]:
+                ancestry_produced[tuple(pe)].append(ancestor["occ_id"])
+
+        # Match each consumed edge to its oldest available ancestor producer
+        seen_cause_ids: set[int] = set()
+        for consumed_edge in occ["consumed"]:
+            q = ancestry_produced[tuple(consumed_edge)]
+            if q:
+                cause_id = q.pop(0)  # FIFO: oldest producer first
+                if cause_id not in seen_cause_ids:
+                    seen_cause_ids.add(cause_id)
+                    causal_edges.append([cause_id, occ["occ_id"]])
+
+    # ── 4. Default (greedy) path: always match_idx=0 ─────────────────
+    children_by_parent: dict[int, list[dict]] = defaultdict(list)
+    for occ in occs:
+        if occ["parent_occ_id"] is not None:
+            children_by_parent[occ["parent_occ_id"]].append(occ)
+
+    default_path_event_ids: list[int] = []
+    cur_occ: dict = by_id[0]  # start at root
+    while True:
+        kids = children_by_parent.get(cur_occ["occ_id"], [])
+        if not kids:
+            break
+        # Pick the child with the smallest match_idx (0 when BFS not truncated)
+        greedy_child = min(kids, key=lambda o: o["match_idx"])
+        default_path_event_ids.append(greedy_child["occ_id"])
+        cur_occ = greedy_child
+
+    return {
+        "events": events,
+        "causal_edges": causal_edges,
+        "default_path_event_ids": default_path_event_ids,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+    }
 
 
 # ── notation parser ───────────────────────────────────────────────────
