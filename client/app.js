@@ -645,7 +645,8 @@ function setView(view, el) {
   if (el) el.classList.add('active');
 
   document.getElementById('main-svg').style.display = view === 'spatial' ? '' : 'none';
-  if (USE_CANVAS) document.getElementById('main-canvas').style.display = view === 'spatial' ? '' : 'none';
+  // HIGH-1 completion: if worker fell back to SVG, don't try to show the canvas.
+  if (USE_CANVAS && !_canvasWorkerDisabled) document.getElementById('main-canvas').style.display = view === 'spatial' ? '' : 'none';
   document.getElementById('causal-view').className = 'causal-overlay' + (view === 'causal' ? ' active' : '');
   document.getElementById('multiway-view').className = 'causal-overlay' + (view === 'multiway' ? ' active' : '');
   document.getElementById('growth-view').style.display = view === 'growth' ? '' : 'none';
@@ -1920,7 +1921,18 @@ function stepPlus1() {
 function toggleOption(opt) {
   opts[opt] = !opts[opt];
   document.getElementById('toggle-' + opt).classList.toggle('on', opts[opt]);
-  if (opt === 'nudge') document.getElementById('nudge-hint').hidden = !opts.nudge;
+  if (opt === 'nudge') {
+    const hint = document.getElementById('nudge-hint');
+    hint.hidden = !opts.nudge;
+    // MEDIUM-3 waiver: in canvas mode the worker owns the simulation; directional
+    // per-node repulsion is not implemented (would need a 'nudge' worker message).
+    // Show a short explanation so users aren't confused when drag does nothing visual.
+    if (opts.nudge && USE_CANVAS && !_canvasWorkerDisabled) {
+      hint.textContent = 'Canvas mode: nudge reheats the layout — drag individual nodes for precise positioning';
+    } else {
+      hint.textContent = 'Click & drag on empty space to push nearby nodes around';
+    }
+  }
   renderCurrentView();
 }
 
