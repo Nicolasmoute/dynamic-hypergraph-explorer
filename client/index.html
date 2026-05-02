@@ -454,6 +454,8 @@
   </div>
 
   <div class="canvas-area" id="canvas-area">
+    <!-- canvas-renderer: sits below the SVG overlay; only shown in ?renderer=canvas mode -->
+    <canvas id="main-canvas" style="display:none;position:absolute;inset:0;pointer-events:none;"></canvas>
     <svg id="main-svg"></svg>
     <div class="causal-overlay" id="causal-view"><svg id="causal-svg"></svg></div>
     <div class="causal-overlay" id="multiway-view"><svg id="multiway-svg"></svg></div>
@@ -477,6 +479,7 @@
 </div>
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="static/canvas-renderer.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

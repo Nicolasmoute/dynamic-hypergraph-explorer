@@ -15,6 +15,10 @@ function escHtml(str) {
 
 // \u00a76.8 [L5] BLURBS removed \u2014 rule descriptions now come from server /api/rules blurb field
 
+// Feature flag: ?renderer=canvas enables the Canvas 2D path (Phase 2/3).
+// Default (no param or ?renderer=svg) keeps the existing SVG path unchanged.
+const USE_CANVAS = new URLSearchParams(location.search).get('renderer') === 'canvas';
+
 let RULES = [];        // [{id, name, notation, desc, tag, tagClass}]
 let DATA = {};         // ruleId -> {states, events, causal_edges, stats, lineage, birthSteps}
 let MULTIWAY = {};     // ruleId -> server multiway data
@@ -77,7 +81,54 @@ function retryActiveRule() {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Force-layout live controls ─────────────────────────────────────────────
+
+/**
+ * Build the worker `options` object from current forceParams and viewport.
+ * N is the current node count (needed for the same scaling formulas the SVG
+ * path uses inline).  Called on every init/update_graph and on slider change.
+ */
+function _buildWorkerOptions(N, centerX, centerY) {
+  const n       = Math.max(N, 1);
+  const baseDist = 40 * Math.sqrt(Math.min(1, 100 / n));
+  return {
+    centerX:           centerX  || 0,
+    centerY:           centerY  || 0,
+    linkDistance:      baseDist * forceParams.linkDistMult,
+    linkStrength:      forceParams.linkStrength,
+    chargeStrength:    -80 * (n <= 100 ? 1 : 100 / n) * forceParams.chargeMult,
+    chargeDistanceMax: 300,
+    collisionRadius:   n >= 50 ? 5 : 0,
+    // selectedEdge forwarded separately via _workerOptions when set
+    selectedEdge:      (_workerOptions && _workerOptions.selectedEdge) || null,
+  };
+}
+
 function applyForceParams() {
+  if (USE_CANVAS) {
+    // Canvas path: send update_options to worker (partial merge is fine here).
+    if (_layoutWorker && _activeGraphId && _workerInitialized) {
+      const opts_ = _buildWorkerOptions(
+        (_workerOptions && _workerOptions._N) || 1,
+        (_workerOptions && _workerOptions.centerX) || 0,
+        (_workerOptions && _workerOptions.centerY) || 0
+      );
+      Object.assign(_workerOptions, opts_);
+      _layoutWorker.postMessage({
+        type:             'update_options',
+        protocol_version: 2,
+        graph_id:         _activeGraphId,
+        options:          opts_,
+      });
+      // MEDIUM-4: reheat settled simulations so the new force params take effect.
+      // Mirrors SVG path's simulation.alpha(0.3).restart() after slider changes.
+      _layoutWorker.postMessage({
+        type: 'reheat', protocol_version: 2,
+        graph_id: _activeGraphId, alpha: 0.3,
+      });
+    }
+    return;
+  }
+  // SVG path: apply directly to main-thread simulation.
   if (!simulation) return;
   const n = Math.max(simulation.nodes().length, 1);
   const baseDist = 20 + 200 / Math.sqrt(n);
@@ -242,6 +293,32 @@ let _jobAborted   = false; // set by abortCurrentJob(); callers skip their error
 // Force-layout user controls (live-adjustable via sidebar sliders)
 let forceParams = { linkDistMult: 1.0, chargeMult: 1.0, linkStrength: 0.3 };
 let _prevNodePositions = new Map(); // warmstart: reuse positions across step changes
+
+// ── Phase 3: layout-worker state ──────────────────────────────────────────
+// All canvas-path simulation lives in the worker; these vars manage its
+// lifecycle from the main thread.
+let _layoutWorker      = null;   // current Worker instance (canvas path only)
+let _activeGraphId     = null;   // graph_id echoed by in-flight worker messages
+let _workerRafId       = null;   // pending rAF handle (coalescing)
+let _workerReadyTimer  = null;   // 5-second ready-timeout handle
+let _workerActiveRule  = null;   // rule for which the current worker was spawned
+// The canonical option set the main thread forwards to the worker on every
+// init / update_graph.  Slider changes update this and post update_options.
+let _workerOptions     = {};     // {centerX, centerY, linkDistance, chargeStrength, ...}
+// HIGH-1: set true on first fallback; prevents renderCurrentView() re-routing to canvas.
+let _canvasWorkerDisabled   = false;
+// MEDIUM-2: true only after 'init' has been posted (post-ready); guards update_graph.
+let _workerInitialized      = false;
+// MEDIUM-1: module-level slots for the LATEST pending tick (always updated, never dropped).
+let _pendingWorkerPositions = null;
+let _pendingWorkerNodeIds   = null;
+// PERF-SCRUB: during rapid slider scrub on large graphs, skip expensive D3 SVG overlay
+// DOM creation (join/remove ~4096 elements) and only do canvas rendering.  The overlay
+// is rebuilt 250 ms after the slider stops, restoring full click/drag interactivity.
+let _isScrubbing      = false;
+let _scrubEndTimer    = null;
+const _SCRUB_END_MS        = 250;  // ms after last slider move before overlay rebuild
+const _OVERLAY_NODE_THRESH = 200;  // node count above which scrub skip applies
 
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
@@ -457,7 +534,15 @@ function clearLineage() {
   selectedEdges = [];
   lineageSets = [];
   document.getElementById('lineage-bar').classList.remove('active');
-  renderSpatial();
+  // HIGH-2: clear selectedEdge in worker so force params reset to un-emphasised defaults.
+  if (USE_CANVAS && _layoutWorker && _activeGraphId && _workerInitialized) {
+    _workerOptions.selectedEdge = null;
+    _layoutWorker.postMessage({
+      type: 'update_options', protocol_version: 2,
+      graph_id: _activeGraphId, options: { selectedEdge: null },
+    });
+  }
+  renderCurrentView();   // renderer-aware: routes to canvas or SVG path
 }
 
 // =========================================================================
@@ -560,6 +645,8 @@ function setView(view, el) {
   if (el) el.classList.add('active');
 
   document.getElementById('main-svg').style.display = view === 'spatial' ? '' : 'none';
+  // HIGH-1 completion: if worker fell back to SVG, don't try to show the canvas.
+  if (USE_CANVAS && !_canvasWorkerDisabled) document.getElementById('main-canvas').style.display = view === 'spatial' ? '' : 'none';
   document.getElementById('causal-view').className = 'causal-overlay' + (view === 'causal' ? ' active' : '');
   document.getElementById('multiway-view').className = 'causal-overlay' + (view === 'multiway' ? ' active' : '');
   document.getElementById('growth-view').style.display = view === 'growth' ? '' : 'none';
@@ -568,7 +655,8 @@ function setView(view, el) {
 }
 
 function renderCurrentView() {
-  if (currentView === 'spatial') renderSpatial();
+  // HIGH-1: once _canvasWorkerDisabled is set, never re-route to canvas for this session.
+  if (currentView === 'spatial') { if (USE_CANVAS && !_canvasWorkerDisabled) renderSpatialCanvas(); else renderSpatial(); }
   else if (currentView === 'causal') renderCausal();
   else if (currentView === 'multiway') renderMultiway();
   else if (currentView === 'growth') renderGrowthAnalysis();
@@ -596,6 +684,17 @@ function setStepFromSlider(step) {
   selectedPath = null;
   document.getElementById('step-display').textContent = step;
   if (selectedEdges.length > 0) recomputeLineage();
+  // PERF-SCRUB: mark as scrubbing so renderSpatialCanvas skips expensive SVG overlay
+  // rebuild on large graphs.  250 ms after the last slider move, rebuild the full overlay.
+  if (USE_CANVAS && !_canvasWorkerDisabled) {
+    _isScrubbing = true;
+    if (_scrubEndTimer) clearTimeout(_scrubEndTimer);
+    _scrubEndTimer = setTimeout(() => {
+      _isScrubbing = false;
+      _scrubEndTimer = null;
+      renderCurrentView();  // full rebuild including overlay now that scrub has stopped
+    }, _SCRUB_END_MS);
+  }
   if (_stepRafId !== null) cancelAnimationFrame(_stepRafId);
   _stepRafId = requestAnimationFrame(() => { _stepRafId = null; renderCurrentView(); });
 }
@@ -907,6 +1006,504 @@ function drawHulls(hullG, hyperedges, nodeById, birthColorFn) {
       const hull = d3.polygonHull(pts);
       return hull ? 'M' + hull.join('L') + 'Z' : '';
     });
+}
+
+// =========================================================================
+// CANVAS RENDERER PATH  (?renderer=canvas)
+// Phase 2: main-thread d3 simulation, canvas drawing, SVG hit-test overlay.
+// Phase 3 will replace the simulation with layout-worker.js postMessage ticks.
+// =========================================================================
+function renderSpatialCanvas() {
+  const data = DATA[activeRule];
+  if (!data || !data.states || currentStep >= data.states.length) {
+    // Clear canvas + overlay on empty/error state
+    const canvasEl = document.getElementById('main-canvas');
+    if (canvasEl) {
+      const ctx = canvasEl.getContext('2d');
+      ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    }
+    d3.select('#main-svg').selectAll('*').remove();
+    return;
+  }
+
+  const mw = MULTIWAY[activeRule];
+  const state = (selectedMultiwayNode && mw && mw.states && mw.states[selectedMultiwayNode])
+    ? mw.states[selectedMultiwayNode].state
+    : data.states[currentStep];
+
+  // ── Build graph topology (same as renderSpatial) ─────────────────────────
+  const nodeSet  = new Set();
+  const links    = [];
+  const selfLoops = [];
+  const hyperedges = [];
+  state.forEach((edge, idx) => {
+    edge.forEach(n => nodeSet.add(n));
+    hyperedges.push({ id: idx, nodes: edge });
+    if (edge.length === 2 && edge[0] === edge[1]) {
+      selfLoops.push({ node: edge[0], edgeIdx: idx });
+    } else if (edge.length === 2) {
+      links.push({ source: edge[0], target: edge[1], edgeIdx: idx });
+    } else {
+      for (let i = 0; i < edge.length - 1; i++) {
+        links.push({ source: edge[i], target: edge[i + 1], edgeIdx: idx });
+      }
+    }
+  });
+
+  // Curve offsets for parallel edges
+  const pairCount = {};
+  links.forEach(l => {
+    const key = l.source + '-' + l.target;
+    pairCount[key] = (pairCount[key] || 0) + 1;
+    l._pairKey = key; l._pairIdx = pairCount[key] - 1;
+  });
+  links.forEach(l => {
+    const total = pairCount[l._pairKey];
+    if (total <= 1) { l._curve = 0; }
+    else {
+      const i = l._pairIdx;
+      const sign = (i % 2 === 0) ? 1 : -1;
+      l._curve = sign * Math.ceil((i + 1) / 2) * 18;
+    }
+  });
+
+  // Warmstart node positions
+  const nodes = Array.from(nodeSet).map(id => {
+    const prev = _prevNodePositions.get(id);
+    return prev ? { id, x: prev.x, y: prev.y } : { id };
+  });
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+
+  // Resolve link source/target to node objects so _overlayEdgePath can read .x/.y.
+  // (d3-force did this internally in Phase 2; we do it explicitly for Phase 3.)
+  links.forEach(l => {
+    l.source = nodeById.get(l.source) || { id: l.source, x: null, y: null };
+    l.target = nodeById.get(l.target) || { id: l.target, x: null, y: null };
+  });
+
+  const nodeR = Math.max(0.5, Math.min(2, 60 / Math.sqrt(nodes.length)));
+  const baseEdgeWidth = Math.max(0.8, 2.5 - nodes.length / 400);
+
+  // ── Birth-step colour helpers ─────────────────────────────────────────────
+  const birthSteps = (data.birthSteps && data.birthSteps[currentStep]) || [];
+  function edgeBirthColor(edgeIdx) {
+    const birth = birthSteps[edgeIdx] !== undefined ? birthSteps[edgeIdx] : 0;
+    return getPalette()[birth % getPalette().length];
+  }
+  const nodeBirthMap = {};
+  state.forEach((edge, idx) => {
+    const birth = birthSteps[idx] !== undefined ? birthSteps[idx] : 0;
+    edge.forEach(n => {
+      if (nodeBirthMap[n] === undefined || birth < nodeBirthMap[n]) nodeBirthMap[n] = birth;
+    });
+  });
+  function nodeBirthColor(nodeId) {
+    const birth = nodeBirthMap[nodeId] !== undefined ? nodeBirthMap[nodeId] : 0;
+    return getPalette()[birth % getPalette().length];
+  }
+
+  // Precompute base colours onto data objects (canvas renderer reads these)
+  const palette = getPalette();
+  nodes.forEach((n, i) => {
+    n._fill = opts.colors ? nodeBirthColor(n.id) : palette[i % palette.length];
+  });
+  links.forEach(l => {
+    l._stroke = opts.colors ? edgeBirthColor(l.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
+  });
+  selfLoops.forEach(sl => {
+    sl._stroke = opts.colors ? edgeBirthColor(sl.edgeIdx) : (isDark ? '#3a3a5e' : '#8888aa');
+  });
+  hyperedges.forEach(h => { h._color = edgeBirthColor(h.id); });
+
+  // Self-loop stacking indices
+  const loopIdxByNode = {};
+  selfLoops.forEach(sl => {
+    sl._loopIdx = loopIdxByNode[sl.node] || 0;
+    loopIdxByNode[sl.node] = sl._loopIdx + 1;
+  });
+
+  // ── Canvas setup ──────────────────────────────────────────────────────────
+  const canvasEl = document.getElementById('main-canvas');
+  const rect = document.getElementById('canvas-area').getBoundingClientRect();
+  const width = rect.width, height = rect.height;
+  canvasEl.style.display = '';
+  CanvasRenderer.init(canvasEl);
+  CanvasRenderer.resize(width, height);
+
+  // ── SVG as hit-test overlay (no visual paint, transparent shapes only) ────
+  const svg = d3.select('#main-svg');
+  svg.selectAll('*').remove();
+
+  // Nudge mode: wire the same repulsion interaction onto the overlay SVG.
+  // 'line' tags don't appear in the overlay (edge paths are <path>), so
+  // skip interaction on <circle> and <path> elements only.
+  svg.on('mousedown.nudge', null).on('mousemove.nudge', null).on('mouseup.nudge', null);
+  svg.on('click', function(e) { if (e.target === this) clearLineage(); });
+
+  const overlayG     = svg.append('g');
+  const overlayEdgeG = overlayG.append('g');  // edges below nodes (z-order)
+  const overlayNodeG = overlayG.append('g');
+
+  // Helper: compute edge path string for overlay (same formula as renderSpatial tick)
+  function _overlayEdgePath(d) {
+    const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
+    if (sx == null || sy == null || tx == null || ty == null) return '';
+    if (d._curve === 0) return `M${sx},${sy}L${tx},${ty}`;
+    const mx = (sx + tx) / 2, my = (sy + ty) / 2;
+    const dx = tx - sx, dy = ty - sy;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    const cx = mx + nx * d._curve, cy = my + ny * d._curve;
+    return `M${sx},${sy}Q${cx},${cy} ${tx},${ty}`;
+  }
+
+  // ── Zoom behaviour ────────────────────────────────────────────────────────
+  const zoomBehavior = d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => {
+    overlayG.attr('transform', e.transform);
+    CanvasRenderer.setTransform(e.transform);
+    CanvasRenderer.drawFrame({
+      nodes, nodeById, links, selfLoops, hyperedges,
+      nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
+    });
+  });
+  svg.call(zoomBehavior);
+
+  // ── Nudge mode (canvas path) ──────────────────────────────────────────────
+  // Near-copy of the SVG nudge block; overlay elements are <circle>/<path>
+  // (not <line>), so we skip those and activate only on bare SVG background.
+  if (opts.nudge) {
+    svg.style('cursor', 'crosshair');
+    svg.on('mousedown.zoom', null);  // disable zoom while nudging
+    const nudgeRadius = 140, nudgeStrength = 2.0;
+    let nudging = false;
+    svg.on('mousedown.nudge', function(e) {
+      const tag = e.target.tagName;
+      if (tag === 'circle' || tag === 'path') return;
+      nudging = true;
+    });
+    svg.on('mousemove.nudge', function(e) {
+      if (!nudging) return;
+      const transform = d3.zoomTransform(svg.node());
+      const mx = (e.offsetX - transform.x) / transform.k;
+      const my = (e.offsetY - transform.y) / transform.k;
+      // MEDIUM-3 (accepted gap): canvas nudge only reheats the simulation; the
+      // directional repulsion (nudgeRadius/nudgeStrength) is intentionally not
+      // applied because the worker owns the simulation — per-node custom forces
+      // would require a new worker message type (e.g. 'nudge':{x,y,r,strength}).
+      // Tracked for a future worker protocol extension; reheat is a useful fallback.
+      if (_layoutWorker && _activeGraphId && _workerInitialized) {
+        _layoutWorker.postMessage({
+          type: 'reheat', protocol_version: 2,
+          graph_id: _activeGraphId, alpha: 0.3,
+        });
+      }
+    });
+    svg.on('mouseup.nudge', () => { nudging = false; });
+  }
+
+  // ── Phase 3: layout-worker integration ───────────────────────────────────
+  // The worker owns the d3-force simulation.  Main thread posts graph data,
+  // receives position tick messages, draws via CanvasRenderer, updates overlay.
+
+  // Build the full option set to send to the worker (r3: forward all slider
+  // values + viewport center on every init AND update_graph, not just init).
+  const workerOpts = _buildWorkerOptions(nodes.length, width / 2, height / 2);
+  workerOpts._N = nodes.length;   // stash for applyForceParams slider calls
+  _workerOptions = workerOpts;
+
+  // Warmstart map: surviving node positions from the previous step.
+  const warmstart = {};
+  nodes.forEach(n => { if (n.x != null) warmstart[n.id] = [n.x, n.y]; });
+
+  // Build worker edge/hyperedge lists directly from state with NO overlap.
+  // Sofia HIGH: `links` contains both genuine binary edges AND chain pairs
+  // extracted from arity>2 hyperedges.  `workerHyperedges` sends those same
+  // hyperedges, and the worker expands them to chain links again — doubling
+  // every hyperedge's force contribution.  Fix: partition by arity.
+  //
+  //   workerEdges:      arity-2 non-self-loop only  → worker adds one link each
+  //   workerHyperedges: arity>2 only                → worker expands to chain
+  //   (self-loops and arity-1: no force links needed)
+  const workerEdges      = [];
+  const workerHyperedges = [];
+  state.forEach((edge, idx) => {
+    if (edge.length === 2 && edge[0] !== edge[1]) {
+      workerEdges.push({ source: edge[0], target: edge[1], id: idx });
+    } else if (edge.length > 2) {
+      workerHyperedges.push({ id: idx, nodes: edge.slice() });
+    }
+  });
+  const workerNodes = nodes.map(n => ({ id: n.id }));
+
+  // ── Inner helpers (closed over current step's nodes/links/etc.) ──────────
+
+  function _drawTick() {
+    CanvasRenderer.drawFrame({
+      nodes, nodeById, links, selfLoops, hyperedges,
+      nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
+    });
+    // PERF-SCRUB: skip SVG overlay attr updates while scrubbing large graphs.
+    // Overlay elements don't exist during scrub (see join section below), so
+    // these selections are empty and updating them wastes O(n) time for nothing.
+    if (!_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH) {
+      overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
+      overlayNodeG.selectAll('circle')
+        .attr('cx', d => d.x != null ? d.x : 0)
+        .attr('cy', d => d.y != null ? d.y : 0);
+    }
+  }
+
+  function _applyPositions(positions, node_ids) {
+    for (let i = 0; i < node_ids.length; i++) {
+      const n = nodeById.get(node_ids[i]);
+      if (!n) continue;
+      // Respect drag fix: main thread overrides worker position for dragged nodes.
+      if (n.fx != null) { n.x = n.fx; n.y = n.fy; }
+      else              { n.x = positions[2 * i]; n.y = positions[2 * i + 1]; }
+    }
+  }
+
+  function _fallbackToSvg(reason) {
+    console.warn('[canvas-worker] falling back to SVG renderer:', reason);
+    // HIGH-1: disable canvas for this session so future renderCurrentView() calls
+    // go to the SVG path instead of re-entering renderSpatialCanvas().
+    _canvasWorkerDisabled = true;
+    _workerInitialized    = false;
+    const _canvasEl = document.getElementById('main-canvas');
+    if (_canvasEl) _canvasEl.style.display = 'none';
+    if (_workerReadyTimer) { clearTimeout(_workerReadyTimer); _workerReadyTimer = null; }
+    if (_workerRafId)      { cancelAnimationFrame(_workerRafId); _workerRafId = null; }
+    if (_layoutWorker) {
+      try { _layoutWorker.postMessage({ type: 'terminate', protocol_version: 2 }); } catch (_) {}
+      _layoutWorker.onmessage = null;
+      _layoutWorker.onerror = null;
+      _layoutWorker.onmessageerror = null;
+      _layoutWorker = null;
+    }
+    _activeGraphId    = null;
+    _workerActiveRule = null;
+    renderSpatial();
+  }
+
+  // The main onmessage handler — installed after 'ready' is received.
+  // Closed over current step's nodes/links/etc.
+  function _onWorkerMessage(evt) {
+    const msg = evt.data;
+    if (!msg || msg.protocol_version !== 2) return;
+    if (msg.graph_id !== _activeGraphId) return;  // stale tick from old step/rule
+
+    if (msg.type === 'tick' || msg.type === 'settled') {
+      // MEDIUM-1: always copy to module-level slots so the rAF draws the LATEST tick,
+      // not the first one to arrive (old code dropped ticks while rAF was pending).
+      // Transferable buffers are neutered after postMessage — slice before rAF.
+      _pendingWorkerPositions = msg.positions.slice();
+      _pendingWorkerNodeIds   = msg.node_ids.slice();
+      // rAF coalescing: if one is already queued it will pick up the updated slots.
+      if (_workerRafId) return;
+      _workerRafId = requestAnimationFrame(() => {
+        _workerRafId = null;
+        _applyPositions(_pendingWorkerPositions, _pendingWorkerNodeIds);
+        _drawTick();
+        // Save positions for warmstart on next step change.
+        nodes.forEach(n => {
+          if (n.x != null) _prevNodePositions.set(n.id, { x: n.x, y: n.y });
+        });
+      });
+    } else if (msg.type === 'error') {
+      console.error('[canvas-worker] error:', msg.reason, msg.detail);
+      _fallbackToSvg('worker posted error: ' + msg.reason);
+    }
+  }
+
+  // ── Worker lifecycle ──────────────────────────────────────────────────────
+  const isNewRule = (_layoutWorker === null || _workerActiveRule !== activeRule);
+
+  if (isNewRule) {
+    // Tear down any existing worker cleanly.
+    if (_layoutWorker) {
+      try { _layoutWorker.postMessage({ type: 'terminate', protocol_version: 2 }); } catch (_) {}
+      _layoutWorker.onmessage = null;
+      _layoutWorker.onerror = null;
+      _layoutWorker.onmessageerror = null;
+      _layoutWorker = null;
+    }
+    if (_workerRafId) { cancelAnimationFrame(_workerRafId); _workerRafId = null; }
+    _workerActiveRule  = activeRule;
+    // MEDIUM-2: mark uninitialized until 'ready' arrives and 'init' is posted.
+    _workerInitialized = false;
+
+    // Mint a new graph_id before spawning so the 'ready' callback can use it.
+    _activeGraphId = 'g-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    const initGraphId = _activeGraphId;
+
+    // Spawn the worker.
+    const worker = new Worker('/static/layout-worker.js');
+    _layoutWorker = worker;
+
+    // Robustness: onerror + onmessageerror both fall back to SVG (§3 requirements).
+    worker.onerror = function(e) {
+      console.warn('[canvas-worker] worker.onerror:', e && e.message);
+      _fallbackToSvg('worker.onerror');
+    };
+    worker.onmessageerror = function(e) {
+      console.warn('[canvas-worker] worker.onmessageerror');
+      _fallbackToSvg('worker.onmessageerror');
+    };
+
+    // 5-second ready timeout: if 'ready' never arrives (CDN failure, CSP, etc.),
+    // fall back to the SVG renderer for this session.
+    if (_workerReadyTimer) clearTimeout(_workerReadyTimer);
+    _workerReadyTimer = setTimeout(() => {
+      _workerReadyTimer = null;
+      if (_layoutWorker === worker) _fallbackToSvg('ready timeout (5 s)');
+    }, 5000);
+
+    // Bootstrap: wait for 'ready', then send 'init'.
+    worker.onmessage = function(evt) {
+      const msg = evt.data;
+      if (!msg || msg.protocol_version !== 2) return;
+      if (msg.type === 'ready') {
+        clearTimeout(_workerReadyTimer);
+        _workerReadyTimer = null;
+        // Switch to the normal tick handler for this step.
+        worker.onmessage = _onWorkerMessage;
+        worker.postMessage({
+          type:             'init',
+          protocol_version: 2,
+          graph_id:         initGraphId,
+          nodes:            workerNodes,
+          edges:            workerEdges,
+          hyperedges:       workerHyperedges,
+          options:          workerOpts,
+          warmstart:        warmstart,
+        });
+        // MEDIUM-2: mark initialized so update_graph / update_options can now be sent.
+        _workerInitialized = true;
+      } else if (msg.type === 'error') {
+        console.error('[canvas-worker] pre-ready error:', msg.reason, msg.detail);
+        _fallbackToSvg('worker error before ready: ' + msg.reason);
+      }
+    };
+
+  } else {
+    // Same rule, new step: mint a fresh graph_id and send update_graph.
+    // MEDIUM-2: guard against the race where the worker is spawned but has not yet
+    // received 'init' (e.g. slider moved during the 5 s ready window).
+    // Posting update_graph before init triggers a worker error → fallback to SVG.
+    if (!_workerInitialized) return;
+    // r3: always include current slider state (workerOpts) so the worker
+    // doesn't snap back to defaults after a step change.
+    if (_workerRafId) { cancelAnimationFrame(_workerRafId); _workerRafId = null; }
+    _activeGraphId = 'g-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    // Swap in the new step's tick handler (captures new nodes/links/etc.).
+    _layoutWorker.onmessage = _onWorkerMessage;
+    _layoutWorker.postMessage({
+      type:             'update_graph',
+      protocol_version: 2,
+      graph_id:         _activeGraphId,
+      nodes:            workerNodes,
+      edges:            workerEdges,
+      hyperedges:       workerHyperedges,
+      options:          workerOpts,   // r3: forward current slider state
+      warmstart:        warmstart,
+    });
+  }
+
+  // ── SVG overlay — enter selections (event handlers wired once per step) ──
+  // PERF-SCRUB: skip the D3 DOM join (create/remove up to n nodes + n edge paths)
+  // while the slider is being dragged on large graphs.  At 4096 elements the join
+  // takes 60–150 ms, making every step-change rAF miss the 33 ms frame budget.
+  // The overlay is rebuilt 250 ms after scrubbing stops (see setStepFromSlider).
+  // Small graphs (≤ _OVERLAY_NODE_THRESH) always get the full overlay immediately.
+  if (!_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH) {
+    overlayEdgeG.selectAll('path')
+      .data(links, d => d.edgeIdx)
+      .join(
+        enter => enter.append('path')
+          .attr('stroke', 'transparent')
+          .attr('stroke-width', Math.max(6, baseEdgeWidth + 4))
+          .attr('fill', 'none')
+          .style('cursor', 'pointer')
+          .on('click', function(e, d) {
+            e.stopPropagation();
+            const existIdx = selectedEdges.findIndex(
+              s => s.step === currentStep && s.edgeIdx === d.edgeIdx);
+            if (existIdx >= 0) {
+              selectedEdges.splice(existIdx, 1);
+              lineageSets.splice(existIdx, 1);
+            } else {
+              if (selectedEdges.length >= 3) { selectedEdges.shift(); lineageSets.shift(); }
+              selectedEdges.push({ edgeIdx: d.edgeIdx, step: currentStep });
+            }
+            if (selectedEdges.length === 0) { clearLineage(); return; }
+            recomputeLineage();
+            // HIGH-2: forward selectedEdge to worker so it adjusts link forces for the
+            // selected edge (same effect as SVG path's inline applyForceParams logic).
+            if (_layoutWorker && _activeGraphId && _workerInitialized) {
+              const sel = selectedEdges[selectedEdges.length - 1];
+              const workerSel = sel ? {
+                edge_id:  sel.edgeIdx,
+                distance: (_workerOptions.linkDistance || 40) * 0.2,
+                strength: 1.0,
+              } : null;
+              _workerOptions.selectedEdge = workerSel;
+              _layoutWorker.postMessage({
+                type: 'update_options', protocol_version: 2,
+                graph_id: _activeGraphId, options: { selectedEdge: workerSel },
+              });
+            }
+            renderSpatialCanvas();
+          })
+      )
+      .attr('d', _overlayEdgePath);
+
+    overlayNodeG.selectAll('circle')
+      .data(nodes, d => d.id)
+      .join(
+        enter => enter.append('circle')
+          .attr('r', nodeR + 2)
+          .attr('fill', 'transparent')
+          .style('cursor', 'pointer')
+          .on('mouseenter', (ev, d) => showTooltip(ev, `Node ${d.id}`))
+          .on('mouseleave', hideTooltip)
+          .call(d3.drag()
+            .on('start', (e, d) => {
+              d.fx = d.x; d.fy = d.y;
+              // Reheat the worker so it keeps ticking during the drag.
+              if (_layoutWorker && _activeGraphId) {
+                _layoutWorker.postMessage({
+                  type: 'reheat', protocol_version: 2,
+                  graph_id: _activeGraphId, alpha: 0.3,
+                });
+              }
+            })
+            .on('drag', (e, d) => {
+              // Update local position immediately so canvas reflects the drag.
+              d.fx = e.x; d.fy = e.y;
+              d.x  = e.x; d.y  = e.y;
+              // Schedule a canvas redraw for this drag frame (coalesced).
+              if (!_workerRafId) {
+                _workerRafId = requestAnimationFrame(() => {
+                  _workerRafId = null;
+                  _drawTick();
+                });
+              }
+            })
+            .on('end', (e, d) => {
+              d.fx = null; d.fy = null;
+              // Let the worker re-settle from the released position.
+              if (_layoutWorker && _activeGraphId) {
+                _layoutWorker.postMessage({
+                  type: 'reheat', protocol_version: 2,
+                  graph_id: _activeGraphId, alpha: 0.15,
+                });
+              }
+            })
+          )
+      )
+      .attr('cx', d => d.x != null ? d.x : 0)
+      .attr('cy', d => d.y != null ? d.y : 0);
+  }
 }
 
 // =========================================================================
@@ -1324,7 +1921,18 @@ function stepPlus1() {
 function toggleOption(opt) {
   opts[opt] = !opts[opt];
   document.getElementById('toggle-' + opt).classList.toggle('on', opts[opt]);
-  if (opt === 'nudge') document.getElementById('nudge-hint').hidden = !opts.nudge;
+  if (opt === 'nudge') {
+    const hint = document.getElementById('nudge-hint');
+    hint.hidden = !opts.nudge;
+    // MEDIUM-3 waiver: in canvas mode the worker owns the simulation; directional
+    // per-node repulsion is not implemented (would need a 'nudge' worker message).
+    // Show a short explanation so users aren't confused when drag does nothing visual.
+    if (opts.nudge && USE_CANVAS && !_canvasWorkerDisabled) {
+      hint.textContent = 'Canvas mode: nudge reheats the layout — drag individual nodes for precise positioning';
+    } else {
+      hint.textContent = 'Click & drag on empty space to push nearby nodes around';
+    }
+  }
   renderCurrentView();
 }
 
