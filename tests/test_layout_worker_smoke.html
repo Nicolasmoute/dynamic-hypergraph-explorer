@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<!--
+  tests/test_layout_worker_smoke.html
+  Smoke-test harness for client/layout-worker.js (protocol v2, contract r2).
+
+  Usage (from repo root):
+    python -m http.server 8080
+    open http://localhost:8080/tests/test_layout_worker_smoke.html
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>layout-worker smoke tests (protocol v2)</title>
+  <style>
+    body  { font-family: 'Courier New', monospace; padding: 24px; background: #fafafa; }
+    h2    { margin-bottom: 16px; }
+    .pass { color: #196; }
+    .fail { color: #c22; font-weight: bold; }
+    .info { color: #555; font-style: italic; }
+    ol    { padding-left: 1.4em; line-height: 2; }
+    #summary { margin-top: 20px; font-size: 1.1em; font-weight: bold; }
+    .ok   { color: #196; }
+    .bad  { color: #c22; }
+  </style>
+</head>
+<body>
+<h2>layout-worker smoke tests (protocol v2)</h2>
+<ol id="results"></ol>
+<div id="summary">Running…</div>
+
+<script>
+'use strict';
+
+// ── constants ──────────────────────────────────────────────────────────────
+
+const WORKER_URL = '../client/layout-worker.js';
+const PROTO      = 2;            // must match PROTOCOL_VERSION in the worker
+const TIMEOUT_MS = 10000;
+
+// ── test output helpers ────────────────────────────────────────────────────
+
+const log     = document.getElementById('results');
+const summary = document.getElementById('summary');
+let passed = 0, failed = 0;
+
+function _result(label, ok, detail) {
+  const li = document.createElement('li');
+  li.className = ok ? 'pass' : 'fail';
+  li.textContent = (ok ? '✓ ' : '✗ ') + label +
+                   (detail ? '  — ' + detail : '');
+  log.appendChild(li);
+  ok ? passed++ : failed++;
+}
+
+function _info(text) {
+  const li = document.createElement('li');
+  li.className = 'info';
+  li.textContent = '  ' + text;
+  log.appendChild(li);
+}
+
+// ── message collection helpers ─────────────────────────────────────────────
+
+/** Resolve with the next worker message, or reject on timeout. */
+function nextMsg(worker, timeoutMs) {
+  timeoutMs = timeoutMs || TIMEOUT_MS;
+  return new Promise(function (resolve, reject) {
+    const timer = setTimeout(function () {
+      worker.onmessage = null;
+      reject(new Error('timeout waiting for message'));
+    }, timeoutMs);
+    worker.onmessage = function (evt) {
+      clearTimeout(timer);
+      worker.onmessage = null;
+      resolve(evt.data);
+    };
+  });
+}
+
+/** Collect messages until pred(msg, allSoFar) is satisfied, or timeout. */
+function collectUntil(worker, pred, timeoutMs) {
+  timeoutMs = timeoutMs || TIMEOUT_MS;
+  return new Promise(function (resolve, reject) {
+    const msgs = [];
+    const timer = setTimeout(function () {
+      worker.onmessage = null;
+      reject(new Error('timeout: ' + msgs.length + ' msgs, predicate not satisfied'));
+    }, timeoutMs);
+    worker.onmessage = function (evt) {
+      msgs.push(evt.data);
+      if (pred(evt.data, msgs)) {
+        clearTimeout(timer);
+        worker.onmessage = null;
+        resolve(msgs);
+      }
+    };
+  });
+}
+
+/** Collect exactly n messages (or reject on timeout). */
+function collectN(worker, n, timeoutMs) {
+  timeoutMs = timeoutMs || TIMEOUT_MS;
+  return new Promise(function (resolve, reject) {
+    const msgs = [];
+    const timer = setTimeout(function () {
+      worker.onmessage = null;
+      if (msgs.length > 0) resolve(msgs);
+      else reject(new Error('timeout: 0 messages received'));
+    }, timeoutMs);
+    worker.onmessage = function (evt) {
+      msgs.push(evt.data);
+      if (msgs.length >= n) {
+        clearTimeout(timer);
+        worker.onmessage = null;
+        resolve(msgs);
+      }
+    };
+  });
+}
+
+// ── silence helper — returns true if no message arrives within ms ──────────
+function silence(worker, ms) {
+  return new Promise(function (resolve) {
+    let heard = false;
+    worker.onmessage = function () { heard = true; };
+    setTimeout(function () {
+      worker.onmessage = null;
+      resolve(!heard);
+    }, ms);
+  });
+}
+
+// ── graph fixtures ─────────────────────────────────────────────────────────
+
+const NODES3 = [{ id: 0 }, { id: 1 }, { id: 2 }];
+const EDGES3 = [
+  { source: 0, target: 1 },
+  { source: 1, target: 2 },
+  { source: 0, target: 2 },
+];
+
+const NODES5      = [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+const EDGES5      = [{ source: 0, target: 1 }, { source: 1, target: 2 }];
+const HYPEREDGES5 = [{ id: 10, nodes: [2, 3, 4] }];
+
+// Shared init helper: creates a fresh worker, drains ready, returns {w}
+async function freshWorker() {
+  const w = new Worker(WORKER_URL);
+  await nextMsg(w);   // drain 'ready'
+  return w;
+}
+
+// ── test suite ─────────────────────────────────────────────────────────────
+
+async function runAll() {
+
+  // ── T1: ready has protocol_version=2 ─────────────────────────────────
+  try {
+    const w = new Worker(WORKER_URL);
+    const msg = await nextMsg(w);
+    _result('T1 — ready: type="ready", protocol_version=2',
+      msg.type === 'ready' && msg.protocol_version === PROTO,
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T1 — ready message', false, e.message); }
+
+  // ── T2: init → tick arrives ──────────────────────────────────────────
+  let firstTick = null;
+  let tw = null;
+  try {
+    tw = await freshWorker();
+    tw.postMessage({ type: 'init', protocol_version: PROTO,
+                     graph_id: 't2',
+                     nodes: NODES3, edges: EDGES3, hyperedges: [],
+                     options: {} });
+    firstTick = await nextMsg(tw);
+    _result('T2 — init triggers a tick', firstTick.type === 'tick',
+      'type=' + firstTick.type);
+  } catch (e) {
+    _result('T2 — init triggers tick', false, e.message);
+    if (tw) { tw.terminate(); tw = null; }
+  }
+
+  // ── T3: tick payload — correct types and sizes ────────────────────────
+  try {
+    if (!firstTick) throw new Error('no tick from T2');
+    const N = NODES3.length;
+    _result('T3 — tick: Float32Array(2N) + Int32Array(N) + alpha∈[0,1]',
+      firstTick.positions instanceof Float32Array &&
+      firstTick.positions.length === 2 * N &&
+      firstTick.node_ids  instanceof Int32Array  &&
+      firstTick.node_ids.length  === N &&
+      typeof firstTick.alpha === 'number' &&
+      firstTick.alpha >= 0 && firstTick.alpha <= 1,
+      'pos.len=' + (firstTick.positions && firstTick.positions.length) +
+      ' ids.len=' + (firstTick.node_ids && firstTick.node_ids.length) +
+      ' alpha=' + firstTick.alpha);
+    if (tw) { tw.terminate(); tw = null; }
+  } catch (e) {
+    _result('T3 — tick payload types', false, e.message);
+    if (tw) { tw.terminate(); tw = null; }
+  }
+
+  // ── T4: graph_id echoed on tick ───────────────────────────────────────
+  try {
+    const w = await freshWorker();
+    const GID = 'step-42';
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: GID,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alphaDecay: 0.1 } });
+    const msgs = await collectUntil(w, function (m) { return m.type === 'settled'; }, 8000);
+    const ticks   = msgs.filter(function (m) { return m.type === 'tick'; });
+    const settled = msgs.find(function (m)   { return m.type === 'settled'; });
+    _result('T4 — graph_id echoed on tick and settled',
+      ticks.every(function (m) { return m.graph_id === GID; }) &&
+      settled && settled.graph_id === GID,
+      'ticks=' + ticks.length + ' settled_gid=' + (settled ? settled.graph_id : 'n/a'));
+    w.terminate();
+  } catch (e) { _result('T4 — graph_id echoed', false, e.message); }
+
+  // ── T5: graph_id updates after update_graph ───────────────────────────
+  try {
+    const w = await freshWorker();
+    const GID1 = 'step-1', GID2 = 'step-2';
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: GID1,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: {} });
+    const t1 = await nextMsg(w);
+
+    w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    graph_id: GID2,
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: {} });
+    const msgs = await collectUntil(w,
+      function (m) { return m.type === 'tick' && m.graph_id === GID2; }, 5000);
+    const t2 = msgs[msgs.length - 1];
+    _result('T5 — graph_id updates after update_graph',
+      t1.graph_id === GID1 && t2.graph_id === GID2,
+      'init_gid=' + t1.graph_id + ' update_gid=' + t2.graph_id);
+    w.terminate();
+  } catch (e) { _result('T5 — graph_id updates', false, e.message); }
+
+  // ── T6: settled fires with correct types ─────────────────────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't6',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alphaDecay: 0.12 } });
+    const msgs = await collectUntil(w, function (m) { return m.type === 'settled'; }, 8000);
+    const s = msgs[msgs.length - 1];
+    _result('T6 — settled: Float32Array positions + Int32Array node_ids',
+      s.type === 'settled' &&
+      s.positions instanceof Float32Array &&
+      s.node_ids  instanceof Int32Array,
+      'ticks_before=' + (msgs.length - 1));
+    w.terminate();
+  } catch (e) { _result('T6 — settled payload', false, e.message); }
+
+  // ── T7: warm-start preserves positions across update_graph ────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 'ws-init',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: {} });
+    const t0 = await nextMsg(w);
+
+    // Build warmstart from first tick
+    const warmstart = {};
+    const N = NODES3.length;
+    for (let i = 0; i < N; i++) {
+      warmstart[t0.node_ids[i]] = [t0.positions[2 * i], t0.positions[2 * i + 1]];
+    }
+
+    w.postMessage({ type: 'freeze', protocol_version: PROTO });
+    await new Promise(function (r) { setTimeout(r, 50); });
+
+    w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    graph_id: 'ws-update',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    warmstart: warmstart, options: {} });
+    const t1 = await nextMsg(w);
+    w.terminate();
+
+    const TOL = 1.0;
+    let allClose = true;
+    for (let i = 0; i < t1.node_ids.length; i++) {
+      const id = t1.node_ids[i];
+      if (!warmstart[id]) continue;
+      const dx = t1.positions[2 * i]     - warmstart[id][0];
+      const dy = t1.positions[2 * i + 1] - warmstart[id][1];
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > TOL) {
+        allClose = false;
+        _info('  node ' + id + ' drift=' + dist.toFixed(3) + 'px');
+      }
+    }
+    _result('T7 — warm-start: node positions within ' + TOL + 'px', allClose,
+      allClose ? 'all nodes placed correctly' : 'drift detected');
+  } catch (e) { _result('T7 — warm-start', false, e.message); }
+
+  // ── T8: hyperedge with N=5 nodes (sequential-chain physics) ──────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't8',
+                    nodes: NODES5, edges: EDGES5,
+                    hyperedges: HYPEREDGES5,
+                    options: {} });
+    const msg = await nextMsg(w);
+    const N = NODES5.length;
+    _result('T8 — hyperedge sequential-chain: tick N=5',
+      msg.type === 'tick' &&
+      msg.positions.length === 2 * N &&
+      msg.node_ids.length  === N,
+      'pos.len=' + msg.positions.length + ' ids.len=' + msg.node_ids.length);
+    w.terminate();
+  } catch (e) { _result('T8 — hyperedge chain', false, e.message); }
+
+  // ── T9: update_options — accepted without error, tick continues ───────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't9',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: {} });
+    await nextMsg(w);  // first tick
+
+    w.postMessage({ type: 'update_options', protocol_version: PROTO,
+                    graph_id: 't9',
+                    options: {
+                      centerX: 50, centerY: -25,
+                      linkDistance: 80, linkStrength: 0.9,
+                      chargeStrength: -120, chargeDistanceMax: 200,
+                      collisionRadius: 6,
+                    } });
+
+    // Next tick after update_options should arrive normally
+    const msg = await nextMsg(w, 3000);
+    _result('T9 — update_options: tick continues after live option update',
+      msg.type === 'tick',
+      'type=' + msg.type + ' alpha=' + (msg.alpha ? msg.alpha.toFixed(4) : 'n/a'));
+    w.terminate();
+  } catch (e) { _result('T9 — update_options', false, e.message); }
+
+  // ── T10: selectedEdge option — accepted without error ────────────────
+  try {
+    const w = await freshWorker();
+    // Edges with explicit ids for selectedEdge matching
+    const edgesWithId = [
+      { source: 0, target: 1, id: 100 },
+      { source: 1, target: 2, id: 101 },
+    ];
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't10',
+                    nodes: NODES3, edges: edgesWithId, hyperedges: [],
+                    options: { selectedEdge: { edge_id: 100, distance: 120, strength: 0.9 } } });
+    const msg = await nextMsg(w);
+    _result('T10 — selectedEdge option: tick arrives without error',
+      msg.type === 'tick',
+      'type=' + msg.type);
+    w.terminate();
+  } catch (e) { _result('T10 — selectedEdge', false, e.message); }
+
+  // ── T11: node-count-scaled defaults (N=100 boundary) ─────────────────
+  // Verify that a 100-node graph starts without errors under default opts.
+  try {
+    const bigNodes = [];
+    for (let i = 0; i < 100; i++) bigNodes.push({ id: i });
+    const bigEdges = [];
+    for (let i = 0; i < 99; i++) bigEdges.push({ source: i, target: i + 1 });
+
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't11-100',
+                    nodes: bigNodes, edges: bigEdges, hyperedges: [],
+                    options: {} });   // all defaults — scaled automatically
+    const msg = await nextMsg(w, 5000);
+    _result('T11 — N=100 default-scaled options: tick arrives',
+      msg.type === 'tick' && msg.positions.length === 200 && msg.node_ids.length === 100,
+      'pos.len=' + msg.positions.length);
+    w.terminate();
+  } catch (e) { _result('T11 — N=100 defaults', false, e.message); }
+
+  // ── T12: protocol_version mismatch → error ────────────────────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: 999,
+                    nodes: NODES3, edges: [], hyperedges: [] });
+    const msg = await nextMsg(w, 3000);
+    _result('T12 — bad protocol_version → error reason=protocol_version_mismatch',
+      msg.type === 'error' && msg.reason === 'protocol_version_mismatch',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T12 — protocol_version_mismatch', false, e.message); }
+
+  // ── T13: double init → error ──────────────────────────────────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't13', nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    await nextMsg(w);  // first tick
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't13b', nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    const msgs = await collectUntil(w, function (m) { return m.type === 'error'; }, 3000);
+    const errMsg = msgs[msgs.length - 1];
+    _result('T13 — double init → error reason=double_init',
+      errMsg.type === 'error' && errMsg.reason === 'double_init',
+      JSON.stringify(errMsg));
+    w.terminate();
+  } catch (e) { _result('T13 — double_init', false, e.message); }
+
+  // ── T14: update_graph before init → not_initialized error ────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'update_graph', protocol_version: PROTO,
+                    graph_id: 't14', nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    const msg = await nextMsg(w, 3000);
+    _result('T14 — update_graph before init → error reason=not_initialized',
+      msg.type === 'error' && msg.reason === 'not_initialized',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T14 — not_initialized', false, e.message); }
+
+  // ── T15: freeze stops ticks ───────────────────────────────────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't15', nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
+    await nextMsg(w);
+    w.postMessage({ type: 'freeze', protocol_version: PROTO, graph_id: 't15' });
+    _result('T15 — freeze stops ticks for ≥400 ms', await silence(w, 400),
+      'n/a');
+    w.terminate();
+  } catch (e) { _result('T15 — freeze', false, e.message); }
+
+  // ── T16: reheat after settled ─────────────────────────────────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't16', nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { alphaDecay: 0.12 } });
+    await collectUntil(w, function (m) { return m.type === 'settled'; }, 8000);
+    w.postMessage({ type: 'reheat', protocol_version: PROTO,
+                    graph_id: 't16', alpha: 0.3 });
+    const msg = await nextMsg(w, 3000);
+    _result('T16 — reheat after settled restarts ticks',
+      msg.type === 'tick',
+      'alpha=' + (msg.alpha ? msg.alpha.toFixed(4) : 'n/a'));
+    w.terminate();
+  } catch (e) { _result('T16 — reheat', false, e.message); }
+
+  // ── T17: terminate silences the worker ───────────────────────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't17', nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
+    await nextMsg(w);
+    w.postMessage({ type: 'terminate', protocol_version: PROTO });
+    _result('T17 — terminate silences the worker', await silence(w, 400),
+      'n/a');
+    w.terminate();
+  } catch (e) { _result('T17 — terminate', false, e.message); }
+
+  // ── T18: missing graph_id on init → missing_graph_id error ────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    /* graph_id intentionally omitted */
+                    nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    const msg = await nextMsg(w, 3000);
+    _result('T18 — init without graph_id → error reason=missing_graph_id',
+      msg.type === 'error' && msg.reason === 'missing_graph_id',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T18 — missing_graph_id on init', false, e.message); }
+
+  // ── T19: protocol_version=1 explicitly rejected (post r2 bump) ───────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: 1,
+                    graph_id: 't19',
+                    nodes: NODES3, edges: [], hyperedges: [], options: {} });
+    const msg = await nextMsg(w, 3000);
+    _result('T19 — protocol_version=1 (legacy) → protocol_version_mismatch',
+      msg.type === 'error' && msg.reason === 'protocol_version_mismatch',
+      JSON.stringify(msg));
+    w.terminate();
+  } catch (e) { _result('T19 — legacy protocol rejected', false, e.message); }
+
+  // ── T20: freeze with stale graph_id is silently ignored ──────────────
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't20-active',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
+    await nextMsg(w);  // first tick under active graph
+    // Send freeze for a DIFFERENT (stale) graph — should be ignored, sim continues
+    w.postMessage({ type: 'freeze', protocol_version: PROTO,
+                    graph_id: 't20-stale' });
+    // Within 400 ms we should still see at least one tick (sim not frozen)
+    const heard = await new Promise(function (resolve) {
+      let got = false;
+      w.onmessage = function (evt) {
+        if (evt.data.type === 'tick' || evt.data.type === 'settled') got = true;
+      };
+      setTimeout(function () { w.onmessage = null; resolve(got); }, 400);
+    });
+    _result('T20 — freeze with stale graph_id is silently ignored (sim continues)',
+      heard, heard ? 'tick observed after stale freeze' : 'no ticks after stale freeze');
+    w.terminate();
+  } catch (e) { _result('T20 — stale freeze ignored', false, e.message); }
+
+  // ── T21: update_options with stale graph_id is silently ignored ──────
+  // We can't directly observe "ignored" vs "applied" easily, so we verify
+  // (a) no error message, and (b) ticks continue normally.
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't21-active',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [], options: {} });
+    await nextMsg(w);  // first tick
+    // Send update_options for stale graph — should be silently dropped (no error)
+    w.postMessage({ type: 'update_options', protocol_version: PROTO,
+                    graph_id: 't21-stale',
+                    options: { linkDistance: 1000 } });
+    // Next message should be a normal tick, not an error
+    const msg = await nextMsg(w, 3000);
+    _result('T21 — update_options with stale graph_id silently dropped',
+      msg.type === 'tick' && msg.graph_id === 't21-active',
+      'next msg type=' + msg.type + ' gid=' + msg.graph_id);
+    w.terminate();
+  } catch (e) { _result('T21 — stale update_options ignored', false, e.message); }
+
+  // ── T22: update_options partial-update preserves unspecified fields ────
+  // Before the _currentRawOptions merge fix, update_options({selectedEdge:null})
+  // after init({linkDistance:99,chargeStrength:-5,centerX:50}) would silently
+  // reset those fields to defaults. We can't inspect internal force params, but
+  // we verify (a) no error and (b) ticks continue normally — sufficient to rule
+  // out a crash or broken simulation state from the merge operation.
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't22',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { linkDistance: 99, chargeStrength: -5,
+                               centerX: 50, centerY: 50 } });
+    const t1 = await nextMsg(w);  // first tick
+    if (t1.type !== 'tick') throw new Error('expected tick, got ' + t1.type);
+    // Partial update — only selectedEdge; all other options must be preserved.
+    w.postMessage({ type: 'update_options', protocol_version: PROTO,
+                    graph_id: 't22', options: { selectedEdge: null } });
+    // Should still get a tick, not an error.
+    const t2 = await nextMsg(w, 3000);
+    _result('T22 — partial update_options preserves prior options (no error/crash)',
+      t2.type === 'tick' && t2.graph_id === 't22',
+      'after partial update type=' + t2.type + ' gid=' + t2.graph_id);
+    w.terminate();
+  } catch (e) { _result('T22 — partial update_options merge', false, e.message); }
+
+  // ── summary ───────────────────────────────────────────────────────────
+  const total = passed + failed;
+  summary.className = failed === 0 ? 'ok' : 'bad';
+  summary.textContent = passed + '/' + total + ' passed' +
+    (failed > 0 ? ' — ' + failed + ' FAILED' : ' — all OK');
+}
+
+runAll().catch(function (e) {
+  summary.className = 'bad';
+  summary.textContent = 'Test suite error: ' + e.message;
+  console.error(e);
+});
+</script>
+</body>
+</html>
