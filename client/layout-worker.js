@@ -54,11 +54,13 @@ postMessage({ type: 'ready', protocol_version: PROTOCOL_VERSION });
 
 // ── worker state ───────────────────────────────────────────────────────────
 
-let _sim         = null;   // d3.forceSimulation
-let _nodes       = null;   // [{id, x, y, vx, vy}, …] — d3 mutates these in place
-let _initialized = false;
-let _frozen      = false;
-let _graphId     = null;   // echoed on every outbound message (stale-tick detection)
+let _sim                = null;   // d3.forceSimulation
+let _nodes              = null;   // [{id, x, y, vx, vy}, …] — d3 mutates these in place
+let _initialized        = false;
+let _frozen             = false;
+let _graphId            = null;   // echoed on every outbound message (stale-tick detection)
+let _currentRawOptions  = {};     // raw options from last init/update_graph; used for
+                                  // partial update_options merging (contract r2 §3.2)
 
 // ── message router ─────────────────────────────────────────────────────────
 
@@ -176,12 +178,19 @@ function _handleUpdateGraph(msg) {
  * Stale-graph operations (msg.graph_id !== _graphId) are silently ignored
  * — main thread races on step transitions are common; an error would be
  * disruptive. Missing graph_id IS an error (programming bug, not a race).
+ *
+ * Merge semantics (contract r2 §3.2): only the fields present in msg.options
+ * are updated; all other force params retain their last resolved values.
+ * Example: update_options({selectedEdge:null}) leaves centerX/chargeStrength
+ * untouched even if they were set to non-default values on init.
  */
 function _handleUpdateOptions(msg) {
   if (!_requireGraphId(msg, 'update_options')) return;
   if (!_initialized || !_sim) return;       // not running — caller may race on startup
   if (!_isCurrentGraph(msg))    return;     // stale graph — silently drop
-  _applyForceOptions(msg.options || {});
+  // Merge partial update onto current raw options so unspecified fields are preserved.
+  _currentRawOptions = Object.assign({}, _currentRawOptions, msg.options || {});
+  _applyForceOptions(_currentRawOptions);
 }
 
 function _handleReheat(msg) {
@@ -201,9 +210,10 @@ function _handleFreeze(msg) {
 
 function _handleTerminate() {
   _destroySim();
-  _nodes       = null;
-  _initialized = false;
-  _graphId     = null;
+  _nodes              = null;
+  _initialized        = false;
+  _graphId            = null;
+  _currentRawOptions  = {};
   self.close();
 }
 
@@ -224,6 +234,9 @@ function _destroySim() {
  * Hyperedge expansion: SEQUENTIAL CHAIN only — (n0,n1), (n1,n2), …
  * Per contract r2, clique expansion is out of scope.
  *
+ * Stores `options` as `_currentRawOptions` so subsequent update_options calls
+ * can merge partial payloads onto it (contract r2 §3.2 merge semantics).
+ *
  * @param {Array}       rawNodes       [{id:int}, …]
  * @param {Array}       rawEdges       [{source:int, target:int, id?:int}, …]
  * @param {Array}       rawHyperedges  [{id:int, nodes:[int]}, …]
@@ -231,6 +244,9 @@ function _destroySim() {
  * @param {Object}      options        see _resolveOpts() for fields
  */
 function _buildSim(rawNodes, rawEdges, rawHyperedges, warmstart, options) {
+  // Snapshot raw options for partial update_options merging (§3.2).
+  _currentRawOptions = options;
+
   // ── node objects ──────────────────────────────────────────────────────
   _nodes = rawNodes.map(function (n) {
     const pos = warmstart && warmstart[n.id];
@@ -443,8 +459,9 @@ function _postError(reason, detail) {
     detail:           detail || null,
   });
   _destroySim();
-  _nodes       = null;
-  _initialized = false;
-  _graphId     = null;
+  _nodes              = null;
+  _initialized        = false;
+  _graphId            = null;
+  _currentRawOptions  = {};
   self.close();
 }

@@ -535,6 +535,32 @@ async function runAll() {
     w.terminate();
   } catch (e) { _result('T21 — stale update_options ignored', false, e.message); }
 
+  // ── T22: update_options partial-update preserves unspecified fields ────
+  // Before the _currentRawOptions merge fix, update_options({selectedEdge:null})
+  // after init({linkDistance:99,chargeStrength:-5,centerX:50}) would silently
+  // reset those fields to defaults. We can't inspect internal force params, but
+  // we verify (a) no error and (b) ticks continue normally — sufficient to rule
+  // out a crash or broken simulation state from the merge operation.
+  try {
+    const w = await freshWorker();
+    w.postMessage({ type: 'init', protocol_version: PROTO,
+                    graph_id: 't22',
+                    nodes: NODES3, edges: EDGES3, hyperedges: [],
+                    options: { linkDistance: 99, chargeStrength: -5,
+                               centerX: 50, centerY: 50 } });
+    const t1 = await nextMsg(w);  // first tick
+    if (t1.type !== 'tick') throw new Error('expected tick, got ' + t1.type);
+    // Partial update — only selectedEdge; all other options must be preserved.
+    w.postMessage({ type: 'update_options', protocol_version: PROTO,
+                    graph_id: 't22', options: { selectedEdge: null } });
+    // Should still get a tick, not an error.
+    const t2 = await nextMsg(w, 3000);
+    _result('T22 — partial update_options preserves prior options (no error/crash)',
+      t2.type === 'tick' && t2.graph_id === 't22',
+      'after partial update type=' + t2.type + ' gid=' + t2.graph_id);
+    w.terminate();
+  } catch (e) { _result('T22 — partial update_options merge', false, e.message); }
+
   // ── summary ───────────────────────────────────────────────────────────
   const total = passed + failed;
   summary.className = failed === 0 ? 'ok' : 'bad';
