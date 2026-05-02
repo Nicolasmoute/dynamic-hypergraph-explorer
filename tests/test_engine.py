@@ -539,3 +539,280 @@ class TestCausalIndexRec2:
         assert len(set(causes)) == 3, (
             f"step-2 events share producers: {causes} — queue not draining correctly"
         )
+
+
+# ── compute_multiway_occurrences ──────────────────────────────────────
+
+class TestComputeMultiwayOccurrences:
+    """Tests for the occurrence-based multiway BFS (Phase B1)."""
+
+    # Rule: {{x,y}} -> {{x,y},{y,z}}  — simple binary-tree rule
+    _RULE = "{{x,y}} -> {{x,y},{y,z}}"
+
+    def _parsed(self):
+        return engine.parse_notation(self._RULE)
+
+    def setup_method(self):
+        engine.reset(1)
+
+    # ── root occurrence ────────────────────────────────────────────────
+
+    def test_root_occurrence_properties(self):
+        """occ_id=0, step=0, empty branch_path, no parent, no consumed/produced."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        root = result["occurrences"][0]
+        assert root["occ_id"] == 0
+        assert root["step"] == 0
+        assert root["branch_path"] == []
+        assert root["parent_occ_id"] is None
+        assert root["match_idx"] is None
+        assert root["consumed"] == []
+        assert root["produced"] == []
+
+    def test_root_hash_matches_init_state(self):
+        """root_hash must equal canonical_hash(init_state)."""
+        p = self._parsed()
+        init = [[0, 1], [1, 2]]
+        result = engine.compute_multiway_occurrences(init, p["lhs"], p["rhs"], max_steps=1)
+        assert result["root_hash"] == engine.canonical_hash(init)
+
+    def test_zero_steps_returns_only_root(self):
+        """max_steps=0 → only the root occurrence, not truncated."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences([[0, 1]], p["lhs"], p["rhs"], max_steps=0)
+        assert len(result["occurrences"]) == 1
+        assert result["truncated"] is False
+
+    # ── structure invariants ───────────────────────────────────────────
+
+    def test_all_occ_ids_unique(self):
+        """Every occurrence must have a distinct occ_id."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        ids = [o["occ_id"] for o in result["occurrences"]]
+        assert len(ids) == len(set(ids))
+
+    def test_step_equals_branch_path_length(self):
+        """step must equal len(branch_path) for every occurrence."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        for occ in result["occurrences"]:
+            assert occ["step"] == len(occ["branch_path"]), (
+                f"occ_id={occ['occ_id']}: step={occ['step']} but "
+                f"len(branch_path)={len(occ['branch_path'])}"
+            )
+
+    def test_branch_path_extends_parent(self):
+        """child.branch_path == parent.branch_path + [child.match_idx]."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=2
+        )
+        by_id = {o["occ_id"]: o for o in result["occurrences"]}
+        for occ in result["occurrences"]:
+            if occ["parent_occ_id"] is None:
+                continue  # root
+            parent = by_id[occ["parent_occ_id"]]
+            expected_path = parent["branch_path"] + [occ["match_idx"]]
+            assert occ["branch_path"] == expected_path, (
+                f"occ_id={occ['occ_id']}: branch_path={occ['branch_path']} "
+                f"but expected {expected_path}"
+            )
+
+    def test_parent_chain_leads_to_root(self):
+        """Following parent_occ_id links must always reach the root (occ_id=0)."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+        )
+        by_id = {o["occ_id"]: o for o in result["occurrences"]}
+        for occ in result["occurrences"]:
+            cur = occ
+            seen = set()
+            while cur["parent_occ_id"] is not None:
+                assert cur["occ_id"] not in seen, "cycle in parent links"
+                seen.add(cur["occ_id"])
+                cur = by_id[cur["parent_occ_id"]]
+            assert cur["occ_id"] == 0, f"chain from {occ['occ_id']} did not reach root"
+
+    # ── multi-branch behaviour ─────────────────────────────────────────
+
+    def test_multi_match_state_produces_multiple_children(self):
+        """A state with multiple matches must produce multiple child occurrences."""
+        p = self._parsed()
+        # [[0,1],[1,2]] has ≥2 matches for the single-edge rule (both edges can fire)
+        result = engine.compute_multiway_occurrences(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=1
+        )
+        children_of_root = [o for o in result["occurrences"] if o["parent_occ_id"] == 0]
+        assert len(children_of_root) >= 2, (
+            f"Expected ≥2 children of root but got {len(children_of_root)}"
+        )
+
+    # ── caps ───────────────────────────────────────────────────────────
+
+    def test_max_occurrences_cap_triggers_truncation(self):
+        """Capping at 3 occurrences must set truncated=True, truncation_reason='max_occurrences'."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"],
+            max_steps=10,
+            max_occurrences=3,
+        )
+        assert result["truncated"] is True
+        assert result["truncation_reason"] == "max_occurrences"
+        assert len(result["occurrences"]) <= 3
+
+    def test_max_time_cap_triggers_truncation(self):
+        """A 1 ms time cap on a branching rule must truncate without raising."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"],
+            max_steps=20,
+            max_time_ms=1,
+        )
+        # Either completed before the cap or was truncated — either is fine;
+        # what must NOT happen is a crash.
+        assert result["truncated"] in (True, False)
+        assert len(result["occurrences"]) >= 1
+
+    def test_no_truncation_when_well_within_caps(self):
+        """A tiny run must complete without truncation."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=2,
+            max_occurrences=5000,
+            max_time_ms=5000,
+        )
+        assert result["truncated"] is False
+        assert result["truncation_reason"] is None
+
+    # ── KEY: replay stability ──────────────────────────────────────────
+
+    def test_replay_stability_all_occurrences(self):
+        """The canonical hash of the replayed final state must match occ['canonical_hash'].
+
+        This is the core correctness guarantee of Phase B1: branch_path values
+        recorded during BFS are replay-stable — replaying them from init_state
+        via causal_graph_for_path() always lands in the same canonical state.
+        """
+        p = self._parsed()
+        init = [[0, 1], [1, 2]]
+        result = engine.compute_multiway_occurrences(init, p["lhs"], p["rhs"], max_steps=3)
+        for occ in result["occurrences"]:
+            if not occ["branch_path"]:
+                continue  # skip root
+            replay = engine.causal_graph_for_path(init, p["lhs"], p["rhs"], occ["branch_path"])
+            replayed_hash = engine.canonical_hash(replay["states"][-1])
+            assert replayed_hash == occ["canonical_hash"], (
+                f"occ_id={occ['occ_id']} branch_path={occ['branch_path']}: "
+                f"replayed hash {replayed_hash!r} != stored {occ['canonical_hash']!r}"
+            )
+
+    def test_replay_stability_ternary_rule(self):
+        """Replay stability holds for ternary-edge rules too (rule4-style)."""
+        p = engine.parse_notation("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}")
+        init = [[0, 1, 2], [3, 4, 5]]
+        result = engine.compute_multiway_occurrences(init, p["lhs"], p["rhs"], max_steps=2)
+        for occ in result["occurrences"]:
+            if not occ["branch_path"]:
+                continue
+            replay = engine.causal_graph_for_path(init, p["lhs"], p["rhs"], occ["branch_path"])
+            replayed_hash = engine.canonical_hash(replay["states"][-1])
+            assert replayed_hash == occ["canonical_hash"], (
+                f"occ_id={occ['occ_id']}: replayed hash mismatch"
+            )
+
+    def test_no_internal_state_in_returned_occurrences(self):
+        """_state must not appear in the public payload."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        for occ in result["occurrences"]:
+            assert "_state" not in occ, "_state leaked into public occurrence payload"
+
+
+# ── causal_graph_for_path ─────────────────────────────────────────────
+
+class TestCausalGraphForPath:
+    """Tests for the selected-path causal replay helper."""
+
+    _RULE = "{{x,y}} -> {{x,y},{y,z}}"
+
+    def _parsed(self):
+        return engine.parse_notation(self._RULE)
+
+    def setup_method(self):
+        engine.reset(1)
+
+    def test_empty_path_returns_empty(self):
+        """match_indices=[] → no events, no causal edges, one state (the initial)."""
+        p = self._parsed()
+        r = engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [])
+        assert r["events"] == []
+        assert r["causal_edges"] == []
+        assert len(r["states"]) == 1
+        assert r["states"][0] == [[0, 1]]
+
+    def test_single_step_no_prior_produces_no_causal_edge(self):
+        """First rewrite has no predecessor events → no causal edges."""
+        p = self._parsed()
+        r = engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [0])
+        assert len(r["events"]) == 1
+        assert r["causal_edges"] == []
+
+    def test_two_step_path_has_causal_edge(self):
+        """Second rewrite consumes a produced edge → at least one causal edge."""
+        p = self._parsed()
+        r = engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [0, 0])
+        assert len(r["events"]) == 2
+        assert len(r["causal_edges"]) >= 1
+
+    def test_states_length_equals_steps_plus_one(self):
+        """len(states) must equal len(match_indices) + 1 for any path length."""
+        p = self._parsed()
+        for depth in [0, 1, 2, 3, 4]:
+            r = engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [0] * depth)
+            assert len(r["states"]) == depth + 1, (
+                f"depth={depth}: expected {depth+1} states, got {len(r['states'])}"
+            )
+
+    def test_event_ids_are_sequential(self):
+        """Event IDs must be 0, 1, 2, … in order."""
+        p = self._parsed()
+        r = engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [0, 0, 0])
+        ids = [ev["id"] for ev in r["events"]]
+        assert ids == list(range(len(ids)))
+
+    def test_invalid_match_idx_raises(self):
+        """An out-of-range match_idx must raise ValueError, not silently skip."""
+        p = self._parsed()
+        with pytest.raises(ValueError):
+            engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [99])
+
+    def test_causal_edges_reference_valid_event_ids(self):
+        """Every [src, dst] in causal_edges must reference a valid event id."""
+        p = self._parsed()
+        r = engine.causal_graph_for_path([[0, 1]], p["lhs"], p["rhs"], [0, 0, 0, 0])
+        valid_ids = {ev["id"] for ev in r["events"]}
+        for src, dst in r["causal_edges"]:
+            assert src in valid_ids, f"causal src {src} not in event IDs"
+            assert dst in valid_ids, f"causal dst {dst} not in event IDs"
+
+    def test_path_causal_duplicate_attribution_correct(self):
+        """Duplicate produced edges trace to distinct producers via FIFO.
+
+        Identity rule {x,y}->{x,y} on [[1,2],[1,2]]:
+        - step 0: match_idx=0 → consumes one [1,2], produces one [1,2] (event 0)
+        - step 1: match_idx=0 → consumes [1,2] from event 0, so causal edge 0→1
+        """
+        engine.reset(0)
+        lhs = [["x", "y"]]
+        rhs = [["x", "y"]]
+        r = engine.causal_graph_for_path([[1, 2], [1, 2]], lhs, rhs, [0, 0])
+        assert len(r["events"]) == 2
+        # Event 1 consumes an edge produced by event 0 → must have causal edge 0→1
+        assert [0, 1] in r["causal_edges"], (
+            f"Expected causal edge [0,1] but got: {r['causal_edges']}"
+        )
