@@ -1610,39 +1610,80 @@ function renderCausal() {
   const visibleIds = new Set(visibleEvents.map(e => e.id));
   const filteredEdges = allCausalEdges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
 
-  const eventStep = {};
-  for (const ev of allEvNodes) eventStep[ev.id] = ev.step;
-  const maxCausalStep = Math.max(1, ...visibleEvents.map(e => e.step));
-
-  const nodes = visibleEvents.map(ev => ({
-    id: ev.id,
-    x: width / 2 + (Math.random() - 0.5) * 40,
-    y: 50 + ev.step * (height - 100) / maxCausalStep
-  }));
-
-  if (nodes.length === 0) {
+  // ── 8 K node cap ─────────────────────────────────────────────────────────
+  const CAUSAL_NODE_CAP = 8000;
+  if (visibleEvents.length === 0) {
     svg.append('text').attr('x', width/2).attr('y', height/2)
       .attr('text-anchor', 'middle').attr('fill', isDark ? '#666' : '#999')
       .attr('font-size', 14).text('No causal data at this step');
     return;
   }
+  if (visibleEvents.length > CAUSAL_NODE_CAP) {
+    svg.append('text').attr('x', width/2).attr('y', height/2 - 12)
+      .attr('text-anchor', 'middle').attr('fill', isDark ? '#888' : '#666')
+      .attr('font-size', 14)
+      .text(`Causal graph too large to display`);
+    svg.append('text').attr('x', width/2).attr('y', height/2 + 12)
+      .attr('text-anchor', 'middle').attr('fill', isDark ? '#666' : '#999')
+      .attr('font-size', 12)
+      .text(`(${visibleEvents.length.toLocaleString()} events — cap is ${CAUSAL_NODE_CAP.toLocaleString()})`);
+    return;
+  }
 
+  // ── Static step-layered layout ────────────────────────────────────────────
+  // Nodes are positioned purely by their causal step (y-axis) and their index
+  // within that step (x-axis).  No force simulation is needed — the causal
+  // graph is a DAG with a natural step ordering from the engine.
+  const maxCausalStep = Math.max(1, ...visibleEvents.map(e => e.step));
+  const PAD_X = 40, PAD_Y = 50;
+  const usableW = width  - 2 * PAD_X;
+  const usableH = height - 2 * PAD_Y;
+
+  // Group nodes by causal step
+  const stepGroups = new Map();
+  for (const ev of visibleEvents) {
+    if (!stepGroups.has(ev.step)) stepGroups.set(ev.step, []);
+    stepGroups.get(ev.step).push(ev);
+  }
+
+  // Assign static (x, y) positions
+  const posById = new Map();
+  for (const [step, group] of stepGroups) {
+    const y = PAD_Y + step * usableH / maxCausalStep;
+    group.forEach((ev, i) => {
+      const x = group.length === 1
+        ? width / 2
+        : PAD_X + usableW * i / (group.length - 1);
+      posById.set(ev.id, { id: ev.id, x, y, step });
+    });
+  }
+
+  const nodes = visibleEvents.map(ev => posById.get(ev.id));
+  const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.2);
+
+  // ── Render ────────────────────────────────────────────────────────────────
   const g = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => g.attr('transform', e.transform)));
-
-  const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.2);
 
   g.append('defs').append('marker')
     .attr('id', 'arrow-causal').attr('viewBox', '0 -3 6 6').attr('refX', 8)
     .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
     .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', '#ff4444');
 
-  const link = g.append('g').selectAll('line').data(filteredEdges).join('line')
+  // Edges — source/target are plain event IDs (no forceLink transform)
+  g.append('g').selectAll('line').data(filteredEdges).join('line')
     .attr('stroke', '#ff444480')
     .attr('stroke-width', 2)
-    .attr('marker-end', 'url(#arrow-causal)');
+    .attr('marker-end', 'url(#arrow-causal)')
+    .attr('x1', d => (posById.get(d.source) || {}).x || 0)
+    .attr('y1', d => (posById.get(d.source) || {}).y || 0)
+    .attr('x2', d => (posById.get(d.target) || {}).x || 0)
+    .attr('y2', d => (posById.get(d.target) || {}).y || 0);
 
-  const node_el = g.append('g').selectAll('circle').data(nodes).join('circle')
+  // Nodes
+  g.append('g').selectAll('circle').data(nodes).join('circle')
+    .attr('cx', d => d.x)
+    .attr('cy', d => d.y)
     .attr('r', nodeR * 1.5)
     .attr('fill', '#ff4444')
     .attr('fill-opacity', 1)
@@ -1651,27 +1692,16 @@ function renderCausal() {
     .style('cursor', 'pointer')
     .on('mouseenter', (ev, d) => {
       const info = eventInfo[d.id];
-      if (!info) { showTooltip(ev, `Event ${d.id} (step ${eventStep[d.id] || '?'})`); return; }
+      if (!info) { showTooltip(ev, `Event ${d.id} (step ${d.step})`); return; }
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
       showTooltip(ev,
-        `Event #${d.id}  (step ${eventStep[d.id] || '?'})\n` +
+        `Event #${d.id}  (step ${d.step})\n` +
         `Consumed: ${consumed || 'none'}\n` +
         `Produced: ${produced || 'none'}`
       );
     })
     .on('mouseleave', hideTooltip);
-
-  d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(filteredEdges).id(d => d.id).distance(40).strength(0.15))
-    .force('charge', d3.forceManyBody().strength(-120).distanceMax(500))
-    .force('y', d3.forceY(d => 50 + (eventStep[d.id] || 0) * (height - 100) / maxCausalStep).strength(0.6))
-    .force('x', d3.forceX(width / 2).strength(0.03))
-    .on('tick', () => {
-      link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
-          .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
-      node_el.attr('cx',d=>d.x).attr('cy',d=>d.y);
-    });
 }
 
 // =========================================================================
