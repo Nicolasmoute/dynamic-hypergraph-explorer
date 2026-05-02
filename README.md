@@ -14,19 +14,29 @@ causal graph, lineage, and estimated dimension.
 
 ```
 server/
-├── engine.py      # Pure-Python hypergraph rewriting engine
-└── main.py        # FastAPI server — exposes /api/* and serves client/
+├── engine.py          # Pure-Python hypergraph rewriting engine
+└── main.py            # FastAPI server — exposes /api/* and serves client/
 client/
-├── index.html     # Shell HTML (loads app.js)
-└── app.js         # All rendering + interaction; calls /api/* only
-Dockerfile         # python:3.11-slim, EXPOSE 8080
-zeabur.json        # Zeabur deployment config (Dockerfile build type)
+├── index.html         # Shell HTML (loads app.js)
+├── app.js             # All rendering + interaction; calls /api/* only
+├── canvas-renderer.js # Canvas rendering path for the spatial view
+└── layout-worker.js   # Web Worker: off-thread D3 force layout (protocol v2)
+Dockerfile             # python:3.11-slim, EXPOSE 8080
+zeabur.json            # Zeabur deployment config (Dockerfile build type)
 ```
 
 The **server** is the only engine: it computes evolutions on demand,
 persists results to `data/cache/`, and serves the client over HTTP.
 The **client** is a pure display layer — no rewriting logic lives in
 the browser.
+
+### Rendering paths
+
+| View | Renderer | Notes |
+|------|----------|-------|
+| Spatial (main graph) | SVG (default) or Canvas (`?renderer=canvas`) | Canvas uses an off-thread Web Worker for D3 force layout |
+| Causal graph | SVG, static step-layered layout | O(N); no force sim; capped at 8,000 visible events |
+| Multiway system | SVG, static step-layered layout | Bounded at 300 states by the engine |
 
 ---
 
@@ -68,11 +78,11 @@ pytest
 
 | File | What it covers | Count |
 |------|---------------|-------|
-| `tests/test_engine.py`       | Engine unit tests (parse, match, evolve, lineage, hash, dimension) | 35 |
-| `tests/test_api.py`          | FastAPI endpoint integration tests (all routes + error paths) | 21 |
+| `tests/test_engine.py`       | Engine unit tests (parse, match, evolve, causal index, lineage, hash, dimension) | 53 |
+| `tests/test_api.py`          | FastAPI endpoint integration tests (all routes, job polling, extend, abort, stale-but-done) | 43 |
 | `tests/test_smoke.py`        | Serving-layer smoke tests (MIME types, /health, rules list) | 12 |
 | `tests/test_dimension.py`    | Dimension estimation correctness (incidence-BFS metric) | 6 |
-| `tests/test_browser_smoke.py`| Playwright E2E browser tests — skipped by default; `--run-slow` to enable | 3 |
+| `tests/test_browser_smoke.py`| Playwright E2E browser tests — skipped by default; `--run-slow` to enable | — |
 
 ---
 
@@ -80,14 +90,20 @@ pytest
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/health` | Liveness probe → `{"status":"ok","uptime_s":N,"version":"sha"}` |
-| `GET`  | `/api/rules` | List all built-in rules |
-| `GET`  | `/api/rules/{id}` | Full evolution data (states, events, causal graph) |
-| `GET`  | `/api/rules/{id}/multiway` | Multiway system for a rule |
-| `GET`  | `/api/rules/{id}/descendants` | Trace edge descendants across steps |
-| `POST` | `/api/custom` | Run a custom rule (`notation`, `init`, `steps`) |
-| `GET`  | `/api/custom/{key}` | Recall a previously computed custom rule |
-| `GET`  | `/api/cache/custom` | List cached custom rules (notation, init, max_steps) |
+| `GET`    | `/health` | Liveness probe → `{"status":"ok","uptime_s":N,"version":"sha"}` |
+| `GET`    | `/api/rules` | List all built-in rules |
+| `GET`    | `/api/rules/{id}` | Full evolution data (states, events, causal graph) |
+| `GET`    | `/api/rules/{id}/multiway` | Multiway system for a rule |
+| `GET`    | `/api/rules/{id}/descendants` | Trace edge descendants across steps |
+| `POST`   | `/api/custom` | Start async evolution (`notation`, `init`, `steps`) → `{job_id, status}` |
+| `GET`    | `/api/jobs/{job_id}` | Poll job status (`running` / `done` / `stale`) |
+| `DELETE` | `/api/jobs/{job_id}` | Abort a running job cooperatively |
+| `POST`   | `/api/extend` | Extend a cached result by more steps (`key`, `extra_steps`) |
+| `GET`    | `/api/custom/{key}` | Recall a previously computed result by cache key |
+| `GET`    | `/api/cache/custom` | List cached custom rules (notation, init, max_steps) |
+
+Long-running evolutions are fully async: `POST /api/custom` or `POST /api/extend` return
+immediately with a `job_id`; poll `GET /api/jobs/{job_id}` every 2 s until `status=done`.
 
 Interactive docs: `http://localhost:8080/docs`
 
@@ -99,6 +115,48 @@ In the UI, open the **Custom** panel, enter a rewrite notation
 (e.g. `{{x,y}} → {{x,z},{z,y}}`), set an initial condition and step
 count, and click **Run**. Results are cached server-side and survive
 restarts — use **Recent rules** to recall without recomputation.
+
+---
+
+## Canvas rendering (`?renderer=canvas`)
+
+Append `?renderer=canvas` to the URL to enable the experimental canvas rendering path
+for the spatial (main) view. In this mode the D3 force simulation runs in a dedicated
+Web Worker (`layout-worker.js`) — the main thread never blocks during layout:
+
+```
+http://localhost:8080/?renderer=canvas
+```
+
+The worker uses protocol v2 (graph-scoped `graph_id`, partial `update_options`, chain-only
+hyperedge physics). The SVG path remains the default and is always available as a fallback.
+
+---
+
+## Performance notes
+
+### Engine
+
+| Scenario | Before | After | Speedup |
+|----------|--------|-------|---------|
+| Rule 1, step 12→13 (7,114 edges) | 117.6 s | 1.05 s | **112×** |
+| Rule 1, step 13→14 (14,052 edges) | ~470 s est. | 2.3 s live | **>100×** |
+| Rule 4, step 10 (59,049 edges) | 2.7 s | 0.8 s | **3.3×** |
+
+Key techniques: node-to-edges index (O(E × avg_degree) matching replaces O(E²)),
+produced-edge index for causal attribution (O(k) per event replaces O(N²) scan).
+
+### Causal view
+
+The causal view uses a static step-layered layout (O(N)) and caps display at 8,000
+events (most recent shown). This avoids the D3 force simulation that froze the browser
+at rule 1 step 13 (7,129 events), rule 4 step 9 (9,841 events), and rule 3 step 15
+(32,767 events).
+
+### Multiway view
+
+The multiway view is engine-bounded at `max_states=300` and uses static layout —
+no force simulation at any scale.
 
 ---
 
@@ -136,7 +194,9 @@ Full deploy verification checklist: `knowledge/devx/deploy-verification-plan.md`
 ## Development Workflow
 
 This repo uses a **single shared clone**. The `main` branch is protected
-by a pre-commit hook — direct commits are blocked.
+by a pre-commit hook — direct commits are blocked. Emergency bypass
+(`git commit --no-verify`) requires **Coach pre-authorization** — message
+Coach first, then announce on broadcast with the approval reference.
 
 ```bash
 git pull --rebase
