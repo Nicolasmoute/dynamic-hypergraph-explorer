@@ -539,3 +539,100 @@ class TestCausalIndexRec2:
         assert len(set(causes)) == 3, (
             f"step-2 events share producers: {causes} — queue not draining correctly"
         )
+
+# ── causal_graph_for_path ─────────────────────────────────────────────
+
+class TestCausalGraphForPath:
+    """Tests for the selected-path causal replay helper."""
+
+    def setup_method(self):
+        engine.reset(1)
+
+    def test_empty_path_returns_empty(self):
+        """Zero match_indices → zero events, zero causal_edges, one state (init)."""
+        parsed = engine.parse_notation("{x,y} -> {x,y}")
+        result = engine.causal_graph_for_path([[1, 2]], parsed["lhs"], parsed["rhs"], [])
+        assert result["events"] == []
+        assert result["causal_edges"] == []
+        assert len(result["states"]) == 1  # just init_state
+
+    def test_single_step_no_prior_produces_no_causal_edge(self):
+        """First match in the path can have no causal parents (init state edges unattributed)."""
+        parsed = engine.parse_notation("{x,y} -> {x,z},{z,y}")
+        result = engine.causal_graph_for_path([[0, 1]], parsed["lhs"], parsed["rhs"], [0])
+        assert len(result["events"]) == 1
+        assert result["causal_edges"] == []  # nothing produced the initial edge
+        assert len(result["states"]) == 2
+
+    def test_two_step_path_has_causal_edge(self):
+        """Event 1 should be caused by event 0 when event 1 consumes an edge event 0 produced."""
+        parsed = engine.parse_notation("{x,y} -> {x,z},{z,y}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        # Step 0 splits [0,1] into [0,2],[2,1]; step 1 splits [0,2] (match 0)
+        result = engine.causal_graph_for_path([[0, 1]], lhs, rhs, [0, 0])
+        events = result["events"]
+        causal = result["causal_edges"]
+        assert len(events) == 2
+        ev0_id, ev1_id = events[0]["id"], events[1]["id"]
+        # ev1 consumed a edge produced by ev0
+        assert [ev0_id, ev1_id] in causal
+
+    def test_states_length_equals_steps_plus_one(self):
+        """states list has len(match_indices)+1 entries."""
+        parsed = engine.parse_notation("{x,y} -> {x,y},{y,z}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        for n_steps in (1, 3, 5):
+            engine.reset(1)
+            result = engine.causal_graph_for_path([[0, 1]], lhs, rhs, [0] * n_steps)
+            assert len(result["states"]) == n_steps + 1
+
+    def test_event_ids_are_sequential(self):
+        """Event IDs should be 0, 1, 2, ... in order."""
+        parsed = engine.parse_notation("{x,y} -> {x,y},{y,z}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        result = engine.causal_graph_for_path([[0, 1]], lhs, rhs, [0, 0, 0])
+        ids = [ev["id"] for ev in result["events"]]
+        assert ids == list(range(len(ids)))
+
+    def test_invalid_match_idx_raises(self):
+        """match_idx out of range must raise ValueError."""
+        parsed = engine.parse_notation("{x,y} -> {x,z},{z,y}")
+        import pytest
+        with pytest.raises(ValueError, match="match_idx"):
+            engine.causal_graph_for_path([[0, 1]], parsed["lhs"], parsed["rhs"], [99])
+
+    def test_causal_edges_reference_valid_event_ids(self):
+        """All causal edge endpoints must be valid event IDs."""
+        parsed = engine.parse_notation("{x,y} -> {x,y},{y,z}")
+        lhs, rhs = parsed["lhs"], parsed["rhs"]
+        result = engine.causal_graph_for_path([[0, 1]], lhs, rhs, [0, 0, 0, 0])
+        valid_ids = {ev["id"] for ev in result["events"]}
+        for src, dst in result["causal_edges"]:
+            assert src in valid_ids, f"src {src} not a valid event ID"
+            assert dst in valid_ids, f"dst {dst} not a valid event ID"
+            assert src != dst, f"self-causal edge {src} -> {dst}"
+
+    def test_path_causal_duplicate_attribution_correct(self):
+        """Duplicate edges on the path each trace to their own distinct producer."""
+        engine.reset(0)
+        # Identity rule: {x,y} -> {x,y} — produces same edge content it consumed
+        lhs = [["x", "y"]]
+        rhs = [["x", "y"]]
+        # Two-step path: step 0 applies to [1,2] (only one match), step 1 also
+        result = engine.causal_graph_for_path([[1, 2]], lhs, rhs, [0, 0])
+        events = result["events"]
+        assert len(events) == 2
+        ev0_id, ev1_id = events[0]["id"], events[1]["id"]
+        causal = result["causal_edges"]
+        # ev1 consumed the edge produced by ev0 → causal edge 0→1
+        assert [ev0_id, ev1_id] in causal
+
+    def test_multiway_match_idx_present_on_edges(self):
+        """compute_multiway edges now include match_idx field."""
+        parsed = engine.parse_notation("{x,y} -> {x,y},{y,z}")
+        init = [[0, 1]]
+        result = engine.compute_multiway(init, parsed["lhs"], parsed["rhs"], max_steps=2)
+        for edge in result["edges"]:
+            assert "match_idx" in edge, f"edge missing match_idx: {edge}"
+            assert isinstance(edge["match_idx"], int)
+            assert edge["match_idx"] >= 0

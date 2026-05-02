@@ -12,7 +12,9 @@ from typing import Optional
 # value so old files remain on disk but are no longer read.
 # v1 → v2: §5.4 dimension fix — incidence-based BFS replaces clique projection.
 #   Ternary hyperedges (Rules 4, 5) produce different (more correct) estimates.
-CACHE_VERSION = "v2"
+# v2 → v3: multiway edges now carry match_idx field (Phase A: path-causal replay).
+#   Old multiway cache files lack match_idx; reload forces recomputation.
+CACHE_VERSION = "v3"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -830,7 +832,7 @@ def compute_multiway(init_state: Hypergraph, lhs, rhs, max_steps=4, max_states=3
                 new_branches[child_hash] = result["state"]
                 ev = {"id": event_id, "consumed": result["event"]["consumed"], "produced": result["event"]["produced"]}
                 event_id += 1
-                mw_edges.append({"from": parent_hash, "to": child_hash, "event": ev})
+                mw_edges.append({"from": parent_hash, "to": child_hash, "event": ev, "match_idx": mi_idx})
 
             if too_many:
                 break
@@ -857,6 +859,96 @@ def compute_multiway(init_state: Hypergraph, lhs, rhs, max_steps=4, max_states=3
         "defaultPathEventIds": list(default_path_event_ids),
         "defaultPathHashes": list(default_path_hashes),
     }
+
+# ── selected-path causal replay ──────────────────────────────────────
+
+def causal_graph_for_path(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    match_indices: list[int],
+) -> dict:
+    """Compute the causal graph for a specific history through the multiway system.
+
+    A "path" is a sequence of single-match applications starting from init_state.
+    At each step, match_indices[k] selects which match (by index into find_matches()
+    results) to apply to the current state.  This produces a concrete linear history —
+    a valid branch through the multiway exploration — and returns its causal graph.
+
+    The causal graph is computed exactly like evolve() but for one match per step:
+    each event's consumed edges are traced back to the event that produced them via
+    produced_index (defaultdict(list) for correct duplicate-instance attribution).
+
+    Typical caller: POST /api/path-causal, where the client passes match_indices
+    extracted from the multiway graph's edge payloads (each edge carries match_idx).
+
+    Note on isomorphism: compute_multiway() merges isomorphic states by canonical
+    hash, so the representative state at a given hash may differ (up to relabelling)
+    from the state this replay produces.  Match indices from edges in the multiway
+    graph are relative to their stored representative parent state, which may diverge
+    from the replayed state after the first step when states merge.  The causal graph
+    returned is structurally correct for the replayed sequence; node-label values may
+    differ from what the UI displays for isomorphic-but-merged states.
+
+    Args:
+        init_state:    Initial hypergraph (same as passed to compute_multiway).
+        lhs:           Parsed left-hand-side pattern.
+        rhs:           Parsed right-hand-side pattern.
+        match_indices: One match index per step.  Length = number of steps.
+
+    Returns:
+        {
+          "events":       list of {id, consumed, produced} — one per step.
+          "causal_edges": list of [src_id, dst_id] pairs.
+          "states":       list of states — init_state + state_after_step_k for k in 0..n-1.
+        }
+
+    Raises:
+        ValueError: if match_indices[k] is out of range for the current replayed state.
+    """
+    max_n = max((n for e in init_state for n in e), default=0)
+    reset(max_n)
+
+    state: Hypergraph = [e[:] for e in init_state]
+    events: list[dict] = []
+    causal_edges: list[list[int]] = []
+    states: list[Hypergraph] = [[e[:] for e in state]]
+    produced_index: dict[tuple, list[int]] = defaultdict(list)
+
+    for step, match_idx in enumerate(match_indices):
+        result = apply_rule_once(state, lhs, rhs, match_idx)
+        if result is None:
+            raise ValueError(
+                f"step {step}: match_idx {match_idx} is out of range "
+                f"(only {len(find_matches(state, lhs))} matches available)"
+            )
+        ev_id = len(events)
+        ev = {
+            "id": ev_id,
+            "consumed": result["event"]["consumed"],
+            "produced": result["event"]["produced"],
+        }
+
+        # Causal lookup — FIFO pop so duplicate instances trace to their own producer.
+        seen_cause_ids: set[int] = set()
+        for consumed_edge in ev["consumed"]:
+            q = produced_index[tuple(consumed_edge)]
+            if q:
+                cause_id = q.pop(0)
+                if cause_id not in seen_cause_ids:
+                    seen_cause_ids.add(cause_id)
+                    causal_edges.append([cause_id, ev_id])
+
+        # Register produced edges for future lookup.
+        for produced_edge in ev["produced"]:
+            produced_index[tuple(produced_edge)].append(ev_id)
+
+        events.append(ev)
+        state = result["state"]
+        states.append([e[:] for e in state])
+
+    return {"events": events, "causal_edges": causal_edges, "states": states}
+
 
 # ── notation parser ───────────────────────────────────────────────────
 import re

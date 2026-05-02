@@ -497,6 +497,97 @@ class TestExtend:
         assert len(data["states"]) == len(direct["states"])
 
 
+# ── POST /api/path-causal ─────────────────────────────────────────────
+
+class TestPathCausal:
+    """Tests for the selected-path causal replay endpoint."""
+
+    def test_builtin_rule_single_step(self, client):
+        """Single-step path on rule3 (binary tree) returns one event, no causal edges."""
+        r = client.post("/api/path-causal", json={"rule_id": "rule3", "match_indices": [0]})
+        assert r.status_code == 200
+        data = r.json()
+        assert "events" in data
+        assert "causal_edges" in data
+        assert "states" in data
+        assert len(data["events"]) == 1
+        assert len(data["states"]) == 2  # init + after step 0
+        # First event has no causal parents (consumed from initial state)
+        assert data["causal_edges"] == []
+
+    def test_builtin_rule_two_steps_has_causal_edge(self, client):
+        """Two-step path: step 1 event should be caused by step 0 event."""
+        r = client.post("/api/path-causal", json={"rule_id": "rule3", "match_indices": [0, 0]})
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["events"]) == 2
+        ev_ids = {ev["id"] for ev in data["events"]}
+        for src, dst in data["causal_edges"]:
+            assert src in ev_ids
+            assert dst in ev_ids
+        # There must be at least one causal edge (step 1 consumes step 0's product)
+        assert len(data["causal_edges"]) > 0
+
+    def test_custom_rule_path(self, client):
+        """Custom notation + init works without rule_id."""
+        r = client.post("/api/path-causal", json={
+            "notation": "{x,y} -> {x,y},{y,z}",
+            "init": [[0, 1]],
+            "match_indices": [0, 0],
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["events"]) == 2
+
+    def test_states_length_correct(self, client):
+        """states list has len(match_indices)+1 elements."""
+        n = 4
+        r = client.post("/api/path-causal", json={"rule_id": "rule3", "match_indices": [0] * n})
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["states"]) == n + 1
+
+    def test_missing_rule_id_and_notation_returns_400(self, client):
+        r = client.post("/api/path-causal", json={"match_indices": [0]})
+        assert r.status_code == 400
+
+    def test_unknown_rule_id_returns_404(self, client):
+        r = client.post("/api/path-causal", json={"rule_id": "nope", "match_indices": [0]})
+        assert r.status_code == 404
+
+    def test_empty_match_indices_returns_400(self, client):
+        r = client.post("/api/path-causal", json={"rule_id": "rule3", "match_indices": []})
+        assert r.status_code == 400
+
+    def test_too_many_match_indices_returns_400(self, client):
+        r = client.post("/api/path-causal", json={"rule_id": "rule3", "match_indices": list(range(21))})
+        assert r.status_code == 400
+
+    def test_out_of_range_match_idx_returns_422(self, client):
+        r = client.post("/api/path-causal", json={"rule_id": "rule3", "match_indices": [999]})
+        assert r.status_code == 422
+
+    def test_multiway_edges_have_match_idx(self, client):
+        """GET /api/rules/rule3/multiway edges must include match_idx field."""
+        r = client.get("/api/rules/rule3/multiway")
+        assert r.status_code == 200
+        data = r.json()
+        for edge in data["edges"]:
+            assert "match_idx" in edge, f"edge missing match_idx: {edge}"
+            assert isinstance(edge["match_idx"], int)
+
+    def test_causal_edge_ids_reference_valid_events(self, client):
+        """All causal edge src/dst must be event IDs present in events list."""
+        r = client.post("/api/path-causal", json={"rule_id": "rule1", "match_indices": [0, 0, 0]})
+        assert r.status_code == 200
+        data = r.json()
+        valid_ids = {ev["id"] for ev in data["events"]}
+        for src, dst in data["causal_edges"]:
+            assert src in valid_ids, f"src {src} not in event IDs"
+            assert dst in valid_ids, f"dst {dst} not in event IDs"
+            assert src != dst, "self-causal edge detected"
+
+
 # ── / (serve index.html) ──────────────────────────────────────────────
 
 class TestServeClient:

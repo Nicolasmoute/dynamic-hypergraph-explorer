@@ -941,6 +941,83 @@ def list_custom_cache():
     return result
 
 
+# ── Path-causal endpoint ─────────────────────────────────────────────
+
+class PathCausalRequest(BaseModel):
+    rule_id: Optional[str] = None
+    notation: Optional[str] = None
+    init: Optional[list[list[int]]] = None
+    match_indices: list[int]
+
+
+@app.post("/api/path-causal")
+def path_causal(req: PathCausalRequest):
+    """Compute the causal graph for a selected path through the multiway system.
+
+    The path is encoded as a sequence of match_indices (one per step), where
+    each value is the index of the match chosen at that step from the current
+    replayed state.  These indices come from the `match_idx` field on multiway
+    graph edges (added to GET /api/rules/{rule_id}/multiway responses).
+
+    Two ways to identify the rule:
+      rule_id               — one of the five built-in rule IDs ("rule1"…"rule5").
+      notation + init       — a custom rule: notation string and initial state.
+
+    Constraints:
+      1 ≤ len(match_indices) ≤ 20
+
+    Response:
+      {
+        "events":       [{id, consumed, produced}, ...],  // one per step
+        "causal_edges": [[src_id, dst_id], ...],
+        "states":       [state_0, state_1, ...],          // len = steps + 1
+      }
+
+    Errors:
+      400 — bad request (missing fields, bad indices count, unparseable notation).
+      404 — rule_id not found.
+      422 — match_idx out of range for the replayed state at that step.
+    """
+    # Resolve rule notation + init state
+    if req.rule_id is not None:
+        rule = next((r for r in RULES if r["id"] == req.rule_id), None)
+        if not rule:
+            raise HTTPException(404, f"Rule '{req.rule_id}' not found")
+        notation = rule["notation"]
+        init: list[list[int]] = rule["init"]
+    elif req.notation is not None and req.init is not None:
+        notation = req.notation
+        init = req.init
+    else:
+        raise HTTPException(400, "Provide either rule_id or both notation and init")
+
+    if not req.match_indices:
+        raise HTTPException(400, "match_indices must be non-empty")
+    if len(req.match_indices) > 20:
+        raise HTTPException(400, "match_indices length must be ≤ 20")
+    if any(idx < 0 for idx in req.match_indices):
+        raise HTTPException(400, "All match_indices must be ≥ 0")
+
+    parsed = engine.parse_notation(notation)
+    if not parsed:
+        raise HTTPException(400, "Cannot parse notation")
+    if not parsed["lhs"] or not parsed["rhs"]:
+        raise HTTPException(400, "LHS and RHS must be non-empty")
+
+    try:
+        result = engine.causal_graph_for_path(
+            init, parsed["lhs"], parsed["rhs"], req.match_indices
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    return {
+        "events": result["events"],
+        "causal_edges": result["causal_edges"],
+        "states": result["states"],
+    }
+
+
 # ── Serve client ──────────────────────────────────────────────────────
 CLIENT_DIR = Path(__file__).parent.parent / "client"
 
