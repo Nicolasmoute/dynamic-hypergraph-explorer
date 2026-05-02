@@ -1610,7 +1610,10 @@ function renderCausal() {
   const visibleIds = new Set(visibleEvents.map(e => e.id));
   const filteredEdges = allCausalEdges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
 
-  // ── 8 K node cap ─────────────────────────────────────────────────────────
+  // ── 8 K node cap — truncate, not blank ───────────────────────────────────
+  // Show a truncated graph (first 8 K events in causal order) rather than a
+  // blank placeholder, so the view remains useful even at high step counts.
+  // A fixed banner records that truncation occurred.
   const CAUSAL_NODE_CAP = 8000;
   if (visibleEvents.length === 0) {
     svg.append('text').attr('x', width/2).attr('y', height/2)
@@ -1618,30 +1621,26 @@ function renderCausal() {
       .attr('font-size', 14).text('No causal data at this step');
     return;
   }
-  if (visibleEvents.length > CAUSAL_NODE_CAP) {
-    svg.append('text').attr('x', width/2).attr('y', height/2 - 12)
-      .attr('text-anchor', 'middle').attr('fill', isDark ? '#888' : '#666')
-      .attr('font-size', 14)
-      .text(`Causal graph too large to display`);
-    svg.append('text').attr('x', width/2).attr('y', height/2 + 12)
-      .attr('text-anchor', 'middle').attr('fill', isDark ? '#666' : '#999')
-      .attr('font-size', 12)
-      .text(`(${visibleEvents.length.toLocaleString()} events — cap is ${CAUSAL_NODE_CAP.toLocaleString()})`);
-    return;
-  }
+  const totalVisible = visibleEvents.length;
+  const truncated = totalVisible > CAUSAL_NODE_CAP;
+  const renderEvents = truncated ? visibleEvents.slice(0, CAUSAL_NODE_CAP) : visibleEvents;
+  const renderIds    = new Set(renderEvents.map(e => e.id));
+  const renderEdges  = truncated
+    ? filteredEdges.filter(e => renderIds.has(e.source) && renderIds.has(e.target))
+    : filteredEdges;
 
   // ── Static step-layered layout ────────────────────────────────────────────
   // Nodes are positioned purely by their causal step (y-axis) and their index
   // within that step (x-axis).  No force simulation is needed — the causal
   // graph is a DAG with a natural step ordering from the engine.
-  const maxCausalStep = Math.max(1, ...visibleEvents.map(e => e.step));
-  const PAD_X = 40, PAD_Y = 50;
+  const maxCausalStep = Math.max(1, ...renderEvents.map(e => e.step));
+  const PAD_X = 40, PAD_Y = truncated ? 28 : 50;  // leave room for banner when truncated
   const usableW = width  - 2 * PAD_X;
-  const usableH = height - 2 * PAD_Y;
+  const usableH = height - PAD_Y - 10;
 
   // Group nodes by causal step
   const stepGroups = new Map();
-  for (const ev of visibleEvents) {
+  for (const ev of renderEvents) {
     if (!stepGroups.has(ev.step)) stepGroups.set(ev.step, []);
     stepGroups.get(ev.step).push(ev);
   }
@@ -1658,7 +1657,7 @@ function renderCausal() {
     });
   }
 
-  const nodes = visibleEvents.map(ev => posById.get(ev.id));
+  const nodes = renderEvents.map(ev => posById.get(ev.id));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.2);
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -1671,7 +1670,7 @@ function renderCausal() {
     .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', '#ff4444');
 
   // Edges — source/target are plain event IDs (no forceLink transform)
-  g.append('g').selectAll('line').data(filteredEdges).join('line')
+  g.append('g').selectAll('line').data(renderEdges).join('line')
     .attr('stroke', '#ff444480')
     .attr('stroke-width', 2)
     .attr('marker-end', 'url(#arrow-causal)')
@@ -1702,6 +1701,18 @@ function renderCausal() {
       );
     })
     .on('mouseleave', hideTooltip);
+
+  // Fixed truncation banner — outside the zoom group so it stays at the top
+  // even when the user pans/zooms the graph.
+  if (truncated) {
+    svg.append('text')
+      .attr('x', width / 2).attr('y', 14)
+      .attr('text-anchor', 'middle')
+      .attr('fill', isDark ? '#f0a040' : '#b06000')
+      .attr('font-size', 11)
+      .attr('font-family', "'JetBrains Mono', monospace")
+      .text(`Showing first ${CAUSAL_NODE_CAP.toLocaleString()} of ${totalVisible.toLocaleString()} events`);
+  }
 }
 
 // =========================================================================
