@@ -14,9 +14,11 @@
 #   across shell invocations.  Direct-to-main incidents have occurred;
 #   this hook is the safety net.
 #
-# BYPASS (genuine emergencies only)
-#   git commit --no-verify -m "..."
-#   Announce the bypass on broadcast BEFORE using it.
+# BYPASS (genuine emergencies only — Coach pre-authorization required)
+#   1. Message Coach and get explicit approval BEFORE bypassing.
+#   2. Announce on broadcast with the approval reference.
+#   3. Then run: git commit --no-verify -m "..."
+#   Undocumented bypasses will be flagged in the next review.
 #
 # INSTALLATION (already done for the shared clone)
 #   git config core.hooksPath .githooks
@@ -41,8 +43,10 @@ if [ "$BRANCH" = "main" ]; then
   echo "    git push -u origin feat/<your-name>-<slug>" >&2
   echo "    # fast-forward merge to main only after tests pass" >&2
   echo "" >&2
-  echo "  Emergency bypass (announce on broadcast first):" >&2
-  echo "    git commit --no-verify -m \"...\"" >&2
+  echo "  Emergency bypass — Coach pre-authorization required:" >&2
+  echo "    1. Get Coach approval first (message Coach, note the task/reason)." >&2
+  echo "    2. Announce on broadcast with the approval reference." >&2
+  echo "    3. git commit --no-verify -m \"...\"" >&2
   echo "" >&2
   exit 1
 fi
