@@ -12,7 +12,10 @@ from typing import Optional
 # value so old files remain on disk but are no longer read.
 # v1 → v2: §5.4 dimension fix — incidence-based BFS replaces clique projection.
 #   Ternary hyperedges (Rules 4, 5) produce different (more correct) estimates.
-CACHE_VERSION = "v2"
+# v2 → v3: Phase B1/B2 — occurrence-based multiway BFS adds match_idx /
+#   branch_path fields; multiway_causal_graph() payload uses occ_id as event id.
+#   Old multiway cache entries lack these fields; must be invalidated.
+CACHE_VERSION = "v3"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1078,6 +1081,17 @@ def compute_multiway_occurrences(
             break
         frontier = new_frontier
 
+    # Rin audit: determine whether the frontier at max_steps has further matches.
+    # multiway_causal_graph() uses this to distinguish "BFS stopped at the
+    # requested depth with work remaining" (→ max_depth truncation) from
+    # "system naturally ran out of matches" (→ NOT truncated).
+    # We check now while _state is still present; it will be stripped below.
+    frontier_can_extend: bool = False
+    if not truncated and max_steps > 0 and frontier:
+        frontier_can_extend = any(
+            bool(find_matches(occ["_state"], lhs)) for occ in frontier
+        )
+
     # Strip internal _state field before returning (keep payload compact).
     public_occs = [{k: v for k, v in occ.items() if k != "_state"} for occ in occurrences]
 
@@ -1086,6 +1100,7 @@ def compute_multiway_occurrences(
         "root_hash": root_hash,
         "truncated": truncated,
         "truncation_reason": truncation_reason,
+        "frontier_can_extend": frontier_can_extend,
     }
 
 
@@ -1180,6 +1195,201 @@ def causal_graph_for_path(
         states.append([e[:] for e in state])
 
     return {"events": events, "causal_edges": causal_edges, "states": states}
+
+
+# ── multiway causal graph (Phase B2) ─────────────────────────────────
+
+def multiway_causal_graph(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    max_steps: int = 4,
+    max_occurrences: int = 5000,
+    max_time_ms: int = 5000,
+) -> dict:
+    """Compute the multiway causal graph: events DAG across all branches.
+
+    Builds the cross-branch causal DAG by running the occurrence BFS
+    (``compute_multiway_occurrences``) and then — for each non-root
+    occurrence — constructing its ancestry-produced index to find which
+    earlier event produced each consumed edge.
+
+    **Co-historical guarantee (Sofia's requirement)**
+
+    Causal edge ``A → B`` exists iff:
+
+    - B's ``consumed`` set contains edge ``h``, AND
+    - the ancestry chain from root to B's *parent* contains an occurrence
+      whose ``produced`` list includes ``h`` and whose ``occ_id == A``.
+
+    Causal edges from events outside B's ancestry are never added.
+    Cross-branch causal edges arise naturally when a shared canonical state
+    is reached from two different rule applications; descendant occurrences
+    from one branch will have ancestors produced by the other branch only if
+    those ancestors appear literally in their ancestry chain.
+
+    **Greedy default path**
+
+    ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
+    reached by always selecting ``match_idx=0`` at each step (the first
+    available match — the same deterministic choice ``evolve()`` makes).
+    These events are colored red client-side; off-path events are green.
+
+    **Truncation**
+
+    Three stop conditions, all surfaced as ``truncated=True``:
+
+    - ``"max_occurrences"`` — BFS reached ``max_occurrences`` total.
+    - ``"max_time_ms"``     — wall-clock cap exceeded.
+    - ``"max_depth"``       — BFS stopped at ``max_steps`` depth (Rin
+      audit: honest about depth-cap even when other caps don't fire).
+
+    **CACHE_VERSION** is bumped to ``v3`` alongside this function to
+    invalidate cached multiway payloads (new ``match_idx`` / ``branch_path``
+    fields make old payloads incompatible).
+
+    Args:
+        init_state:      Initial hypergraph.
+        lhs:             Parsed LHS pattern (from ``parse_notation``).
+        rhs:             Parsed RHS pattern.
+        max_steps:       Maximum BFS depth (rewrite steps from root).
+        max_occurrences: Total occurrence cap (default 5 000).
+        max_time_ms:     Wall-clock cap in milliseconds (default 5 000).
+
+    Returns::
+
+        {
+          "events": [
+            {
+              "id":             int,           # == occ_id (>0)
+              "step":           int,           # depth from root
+              "occ_id":         int,           # same as id
+              "parent_occ_id":  int | None,
+              "match_idx":      int,
+              "consumed":       list[list[int]],
+              "produced":       list[list[int]],
+              "branch_path":    list[int],     # replay-stable path token
+            }, ...
+          ],
+          "causal_edges":            [[from_id, to_id], ...],
+          "default_path_event_ids":  [int, ...],
+          "truncated":               bool,
+          "truncation_reason":       str | None,
+        }
+    """
+    # ── 1. Occurrence BFS ─────────────────────────────────────────────
+    bfs = compute_multiway_occurrences(
+        init_state, lhs, rhs,
+        max_steps=max_steps,
+        max_occurrences=max_occurrences,
+        max_time_ms=max_time_ms,
+    )
+
+    occs: list[dict] = bfs["occurrences"]
+    truncated: bool = bfs["truncated"]
+    truncation_reason: Optional[str] = bfs["truncation_reason"]
+
+    # Rin audit (B2.1 fix): only report max_depth when the frontier actually has
+    # more matches available — not when the system terminated naturally at depth.
+    # compute_multiway_occurrences() checks this while _state is still live.
+    if not truncated and max_steps > 0 and bfs.get("frontier_can_extend", False):
+        truncated = True
+        truncation_reason = "max_depth"
+
+    # ── 2. Index occurrences and build events list ────────────────────
+    by_id: dict[int, dict] = {o["occ_id"]: o for o in occs}
+
+    events: list[dict] = [
+        {
+            "id": occ["occ_id"],
+            "step": occ["step"],
+            "occ_id": occ["occ_id"],
+            "parent_occ_id": occ["parent_occ_id"],
+            "match_idx": occ["match_idx"],
+            "consumed": occ["consumed"],
+            "produced": occ["produced"],
+            "branch_path": occ["branch_path"],
+        }
+        for occ in occs
+        if occ["occ_id"] != 0  # root has no rewrite event
+    ]
+
+    # ── 3. Cross-branch causal edges via per-occurrence replay ────────
+    #
+    # Sofia audit (B2.1 blocker): the previous ancestry-produced-index approach
+    # indexed every ancestor's produced edges but never drained edges consumed
+    # by intermediate ancestors.  When identical edge content is produced and
+    # re-consumed along one branch (e.g. rule3: [0,1] is consumed and re-produced
+    # at every step), FIFO-pop incorrectly attributed the later consumer to the
+    # oldest stale producer instead of the live, immediately-preceding one.
+    #
+    # Fix: for each occurrence B, replay its branch_path using
+    # causal_graph_for_path(), which maintains a live produced_index (popping
+    # consumed instances before adding new produced instances — exactly like
+    # evolve()).  The causal edges targeting B's own event (local index d-1)
+    # give the correct co-historical causal parents.  Mapping local event index
+    # i → chain[i].occ_id converts replay-local IDs to occurrence IDs.
+    #
+    # Cost: O(total_occurrences × depth × apply_rule_once).  Bounded by caps
+    # (default 5 000 occurrences × 4 depth = 20 000 apply_rule_once calls).
+    causal_edges: list[list[int]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for occ in occs:
+        if occ["occ_id"] == 0:
+            continue
+
+        d = len(occ["branch_path"])
+        if d == 0:
+            continue  # root (defensive; already handled above)
+
+        # Build ancestry chain ordered oldest→newest:
+        # chain[0] = step-1 ancestor, ..., chain[d-1] = occ itself.
+        chain_rev: list[dict] = []
+        cur: Optional[dict] = occ
+        while cur is not None and cur["occ_id"] != 0:
+            chain_rev.append(cur)
+            cur = by_id.get(cur["parent_occ_id"])
+        chain: list[dict] = list(reversed(chain_rev))
+
+        # Replay the full path to get correct live-provenance causal edges.
+        replay = causal_graph_for_path(init_state, lhs, rhs, occ["branch_path"])
+
+        # Add only causal edges whose target is B's event (local index d-1).
+        # Edges targeting earlier ancestors are emitted when those ancestor
+        # occurrences are processed — no duplication, full coverage.
+        for src_local, dst_local in replay["causal_edges"]:
+            if dst_local == d - 1:
+                src_occ_id = chain[src_local]["occ_id"]
+                pair = (src_occ_id, occ["occ_id"])
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    causal_edges.append(list(pair))
+
+    # ── 4. Default (greedy) path: always match_idx=0 ─────────────────
+    children_by_parent: dict[int, list[dict]] = defaultdict(list)
+    for occ in occs:
+        if occ["parent_occ_id"] is not None:
+            children_by_parent[occ["parent_occ_id"]].append(occ)
+
+    default_path_event_ids: list[int] = []
+    cur_occ: dict = by_id[0]  # start at root
+    while True:
+        kids = children_by_parent.get(cur_occ["occ_id"], [])
+        if not kids:
+            break
+        # Pick the child with the smallest match_idx (0 when BFS not truncated)
+        greedy_child = min(kids, key=lambda o: o["match_idx"])
+        default_path_event_ids.append(greedy_child["occ_id"])
+        cur_occ = greedy_child
+
+    return {
+        "events": events,
+        "causal_edges": causal_edges,
+        "default_path_event_ids": default_path_event_ids,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+    }
 
 
 # ── notation parser ───────────────────────────────────────────────────

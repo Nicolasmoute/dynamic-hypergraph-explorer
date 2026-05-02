@@ -816,3 +816,332 @@ class TestCausalGraphForPath:
         assert [0, 1] in r["causal_edges"], (
             f"Expected causal edge [0,1] but got: {r['causal_edges']}"
         )
+
+
+# ── multiway_causal_graph ─────────────────────────────────────────────
+
+class TestMultiwayCausalGraph:
+    """Tests for the cross-branch multiway causal DAG (Phase B2)."""
+
+    _RULE = "{{x,y}} -> {{x,y},{y,z}}"
+
+    def _parsed(self):
+        return engine.parse_notation(self._RULE)
+
+    def setup_method(self):
+        engine.reset(1)
+
+    # ── return-shape invariants ────────────────────────────────────────
+
+    def test_required_keys_present(self):
+        """Result must contain events, causal_edges, default_path_event_ids,
+        truncated, truncation_reason."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        for key in ("events", "causal_edges", "default_path_event_ids",
+                    "truncated", "truncation_reason"):
+            assert key in r, f"missing key: {key!r}"
+
+    def test_events_have_required_fields(self):
+        """Each event must have id, step, occ_id, parent_occ_id, match_idx,
+        consumed, produced, branch_path."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        for ev in r["events"]:
+            for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
+                          "consumed", "produced", "branch_path"):
+                assert field in ev, f"event missing field {field!r}: {ev}"
+
+    def test_event_ids_are_unique(self):
+        """All event IDs must be distinct."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=2
+        )
+        ids = [ev["id"] for ev in r["events"]]
+        assert len(ids) == len(set(ids)), "duplicate event IDs"
+
+    def test_causal_edges_reference_valid_event_ids(self):
+        """Every [src, dst] in causal_edges must reference a valid event id."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+        )
+        valid_ids = {ev["id"] for ev in r["events"]}
+        for src, dst in r["causal_edges"]:
+            assert src in valid_ids, f"causal src {src} not in event IDs"
+            assert dst in valid_ids, f"causal dst {dst} not in event IDs"
+
+    def test_causal_edges_are_pairs(self):
+        """Every causal edge must be a 2-element list."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        for edge in r["causal_edges"]:
+            assert len(edge) == 2, f"causal edge not a pair: {edge}"
+
+    def test_no_self_causal_edges(self):
+        """No event should be listed as its own causal predecessor."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+        )
+        for src, dst in r["causal_edges"]:
+            assert src != dst, f"self-causal edge: {src} → {dst}"
+
+    # ── zero / greedy-only cases ───────────────────────────────────────
+
+    def test_zero_steps_returns_no_events(self):
+        """max_steps=0 → no events, no causal edges, empty default path."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=0)
+        assert r["events"] == []
+        assert r["causal_edges"] == []
+        assert r["default_path_event_ids"] == []
+        assert r["truncated"] is False
+
+    def test_single_step_no_causal_edges(self):
+        """After one step on a single-edge init there are no prior producers → no causal edges."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=1)
+        # Step 1 events consume from init_state (no prior events) → no causal edges
+        assert r["causal_edges"] == []
+
+    def test_multi_step_has_causal_edges(self):
+        """After 3 steps there must be causal edges (produced edges are consumed downstream)."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        assert len(r["causal_edges"]) > 0
+
+    # ── default path ──────────────────────────────────────────────────
+
+    def test_default_path_is_nonempty(self):
+        """A matchable rule with max_steps≥1 must produce a nonempty default path."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        assert len(r["default_path_event_ids"]) >= 1
+
+    def test_default_path_ids_are_valid_event_ids(self):
+        """All default_path_event_ids must appear in events."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+        )
+        valid_ids = {ev["id"] for ev in r["events"]}
+        for eid in r["default_path_event_ids"]:
+            assert eid in valid_ids, f"default path id {eid} not in events"
+
+    def test_default_path_steps_are_sequential(self):
+        """Default path events must be at steps 1, 2, 3, … in order."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        steps = [ev_by_id[eid]["step"] for eid in r["default_path_event_ids"]]
+        assert steps == list(range(1, len(steps) + 1)), (
+            f"Default path steps not sequential: {steps}"
+        )
+
+    def test_default_path_events_use_match_idx_zero(self):
+        """Greedy path must always use match_idx=0."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        for eid in r["default_path_event_ids"]:
+            assert ev_by_id[eid]["match_idx"] == 0, (
+                f"Default path event {eid} has match_idx={ev_by_id[eid]['match_idx']}, expected 0"
+            )
+
+    # ── co-historical guarantee (Sofia) ───────────────────────────────
+
+    def test_causal_edges_respect_ancestry(self):
+        """Causal edge src must be an ancestor of dst.
+
+        For each causal edge [A, B], A.step < B.step must hold (a cause
+        precedes its effect in step order).
+        """
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=4
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        for src, dst in r["causal_edges"]:
+            assert ev_by_id[src]["step"] < ev_by_id[dst]["step"], (
+                f"Causal edge {src}(step={ev_by_id[src]['step']}) → "
+                f"{dst}(step={ev_by_id[dst]['step']}) violates ordering"
+            )
+
+    def test_causal_src_is_strict_ancestor_via_parent_chain(self):
+        """For each causal edge [A, B], A must appear in B's parent_occ_id chain.
+
+        This verifies the co-historical guarantee: only events in B's
+        actual history (ancestry) can be causal predecessors of B.
+        """
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=4
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+
+        def ancestry_ids(ev: dict) -> set[int]:
+            """Walk parent_occ_id chain from ev back to root; return all occ_ids seen."""
+            ids: set[int] = set()
+            cur_id = ev["parent_occ_id"]
+            while cur_id is not None:
+                ids.add(cur_id)
+                parent_ev = ev_by_id.get(cur_id)
+                if parent_ev is None:
+                    break  # reached root (occ_id=0, no event entry)
+                cur_id = parent_ev["parent_occ_id"]
+            return ids
+
+        for src, dst in r["causal_edges"]:
+            dst_ev = ev_by_id[dst]
+            ancestors = ancestry_ids(dst_ev)
+            assert src in ancestors, (
+                f"Causal edge {src} → {dst}: {src} is not in {dst}'s ancestry {ancestors}"
+            )
+
+    # ── caps ───────────────────────────────────────────────────────────
+
+    def test_max_occurrences_cap_triggers_truncation(self):
+        """Capping at a small number of occurrences sets truncated=True."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"],
+            max_steps=10,
+            max_occurrences=5,
+        )
+        assert r["truncated"] is True
+        assert r["truncation_reason"] in ("max_occurrences", "max_time_ms", "max_depth")
+
+    def test_max_depth_truncation_reported(self):
+        """When BFS stops at max_steps depth, truncated=True with reason 'max_depth'."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=2,
+            max_occurrences=5000,
+            max_time_ms=5000,
+        )
+        # The BFS stops at step 2 (there are occurrences at step=2), so must report max_depth
+        has_step2 = any(ev["step"] == 2 for ev in r["events"])
+        if has_step2:
+            assert r["truncated"] is True
+            assert r["truncation_reason"] == "max_depth"
+
+    def test_no_truncation_for_zero_steps(self):
+        """max_steps=0 must NOT report truncation (there is literally nothing to cut)."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=0)
+        assert r["truncated"] is False
+
+    # ── multi-branch: events span branches ────────────────────────────
+
+    def test_multi_branch_has_more_events_than_greedy(self):
+        """The total event count must exceed the default path length when branching occurs."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=2
+        )
+        assert len(r["events"]) > len(r["default_path_event_ids"]), (
+            "Expected off-path events but events == default path"
+        )
+
+    # ── B2.1 regression: live edge provenance (Sofia BLOCKER) ─────────
+
+    def test_live_provenance_identity_rule_default_path(self):
+        """Identity rule: causal chain on default path must be step-by-step.
+
+        Sofia's repro (adapted): identity {x,y}->{x,y} on [[1,2]] with 3 steps.
+        The default path events are e1, e2, e3 where each consumes and
+        re-produces the same edge content.  Correct live provenance gives
+        e1→e2 and e2→e3.  The stale bug (B2 before fix) gave e1→e3 instead
+        of e2→e3, because the ancestry-produced index never drained e1's
+        produced edge when e2 consumed it.
+        """
+        engine.reset(0)
+        lhs = [["x", "y"]]
+        rhs = [["x", "y"]]  # identity — same edge content produced at every step
+        r = engine.multiway_causal_graph([[1, 2]], lhs, rhs, max_steps=3,
+                                         max_occurrences=100)
+        default = r["default_path_event_ids"]
+        assert len(default) == 3, f"Expected 3 default path events, got {len(default)}: {default}"
+        e1, e2, e3 = default
+        causal = r["causal_edges"]
+
+        # Live: e2 consumes the edge produced by e1
+        assert [e1, e2] in causal, f"Missing live causal edge {[e1, e2]}; causal={causal}"
+        # Live: e3 consumes the edge produced by e2 (NOT e1 — that instance was consumed by e2)
+        assert [e2, e3] in causal, f"Missing live causal edge {[e2, e3]}; causal={causal}"
+        # Stale attribution must not appear
+        assert [e1, e3] not in causal, (
+            f"Stale causal edge {[e1, e3]} found — live provenance bug!"
+        )
+
+    def test_live_provenance_rule3_path_0_0_2(self):
+        """Sofia's exact repro: rule3 path [0,0,2] must not show stale attribution.
+
+        On path [0,0,2]:
+        - occ_a (branch_path=[0]):     consumes [[0,1]], produces [[0,1],[1,2]]
+        - occ_b (branch_path=[0,0]):   consumes [[0,1]], produces [[0,1],[1,3]]
+        - occ_c (branch_path=[0,0,2]): consumes [[0,1]], produces [[0,1],[1,4]]
+
+        occ_b consumes the [[0,1]] instance produced by occ_a; occ_c consumes
+        the [[0,1]] instance re-produced by occ_b.  The correct causal edge is
+        occ_b → occ_c.  The stale bug (ancestry-only) would emit occ_a → occ_c
+        because occ_a is the oldest producer and the consumed instance was not
+        drained from the ancestry index when occ_b consumed it.
+        """
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"],
+                                         max_steps=3, max_occurrences=500)
+
+        ev_by_path = {tuple(ev["branch_path"]): ev for ev in r["events"]}
+        occ_a = ev_by_path.get((0,))
+        occ_b = ev_by_path.get((0, 0))
+        occ_c = ev_by_path.get((0, 0, 2))
+
+        if occ_a is None or occ_b is None or occ_c is None:
+            pytest.skip("Path [0,0,2] not available (truncated or BFS order changed)")
+
+        causal = r["causal_edges"]
+        # Live: occ_c's [0,1] was most recently produced by occ_b
+        assert [occ_b["id"], occ_c["id"]] in causal, (
+            f"Missing live causal edge [{occ_b['id']}, {occ_c['id']}]; "
+            f"causal={causal}"
+        )
+        # Stale: occ_a's [0,1] instance was already consumed by occ_b
+        assert [occ_a["id"], occ_c["id"]] not in causal, (
+            f"Stale causal edge [{occ_a['id']}, {occ_c['id']}] found — "
+            f"live provenance bug!"
+        )
+
+    # ── B2.1 regression: max_depth only when matches remain (Rin MEDIUM-1) ─
+
+    def test_no_max_depth_when_frontier_naturally_terminates(self):
+        """No max_depth truncation when the frontier has no further matches.
+
+        A rule that creates ternary edges from a binary LHS can only fire once
+        on a binary init state.  After step 1 the state is all ternary; the
+        binary LHS matches nothing.  max_depth must NOT be reported because
+        the system terminated naturally, not because the depth cap cut it.
+        """
+        p = engine.parse_notation("{{x,y}} -> {{x,y,z}}")
+        assert p is not None
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=1)
+        # Frontier at step 1 has ternary edges — binary LHS has 0 matches
+        assert not (r["truncated"] and r["truncation_reason"] == "max_depth"), (
+            f"Should not report max_depth truncation for naturally-terminating frontier; "
+            f"got truncated={r['truncated']} reason={r['truncation_reason']!r}"
+        )
+
+    def test_max_depth_reported_when_frontier_has_matches(self):
+        """max_depth IS reported when the frontier at max_steps still has matches."""
+        p = self._parsed()  # rule3: always has binary matches
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        # rule3 frontier at step 2 still has matches → must report max_depth
+        has_step2 = any(ev["step"] == 2 for ev in r["events"])
+        if has_step2:
+            assert r["truncated"] is True
+            assert r["truncation_reason"] == "max_depth"
