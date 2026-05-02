@@ -16,6 +16,11 @@ const CanvasRenderer = (() => {
   let _height   = 0;
   let _transform = { x: 0, y: 0, k: 1 };  // current d3 zoom transform
 
+  // LEVER-4: hull throttle — recompute polygonHull every N frames, cache results
+  let _hullCache         = [];   // [{hull, color}] per hyperedge (null if skipped)
+  let _hullFrameCount    = 0;
+  const _HULL_RECOMPUTE_EVERY = 5;
+
   // ── Helpers ────────────────────────────────────────────────────────────────
   // Convert a hex colour + alpha to an rgba() string.  Handles 3- and 6-char hex.
   function _rgba(hex, alpha) {
@@ -98,19 +103,35 @@ const CanvasRenderer = (() => {
   // ── Private drawing routines ───────────────────────────────────────────────
 
   function _drawHulls(ctx, hyperedges, nodeById, selectedEdges) {
-    for (const h of hyperedges) {
-      if (h.nodes.length <= 2) continue;
-      const pts = h.nodes.map(nid => {
-        const n = nodeById.get(nid);
-        return (n && n.x != null) ? [n.x, n.y] : null;
-      }).filter(Boolean);
-      if (pts.length < 3) continue;
-      const hull = d3.polygonHull(pts);
-      if (!hull) continue;
-      const color = h._color || '#888';
+    // LEVER-4: recompute convex hulls only every _HULL_RECOMPUTE_EVERY frames.
+    // Between recomputes, draw from _hullCache (positions have moved <1px visually).
+    const recompute = (_hullFrameCount % _HULL_RECOMPUTE_EVERY) === 0;
+    _hullFrameCount++;
+
+    if (recompute) {
+      // Ensure cache length matches hyperedges array
+      if (_hullCache.length !== hyperedges.length) _hullCache = new Array(hyperedges.length).fill(null);
+      for (let i = 0; i < hyperedges.length; i++) {
+        const h = hyperedges[i];
+        if (h.nodes.length <= 2) { _hullCache[i] = null; continue; }
+        const pts = h.nodes.map(nid => {
+          const n = nodeById.get(nid);
+          return (n && n.x != null) ? [n.x, n.y] : null;
+        }).filter(Boolean);
+        if (pts.length < 3) { _hullCache[i] = null; continue; }
+        const hull = d3.polygonHull(pts);
+        _hullCache[i] = hull ? { hull, color: h._color || '#888' } : null;
+      }
+    }
+
+    // Draw from cache
+    for (let i = 0; i < _hullCache.length; i++) {
+      const entry = _hullCache[i];
+      if (!entry) continue;
+      const { hull, color } = entry;
       ctx.beginPath();
       ctx.moveTo(hull[0][0], hull[0][1]);
-      for (let i = 1; i < hull.length; i++) ctx.lineTo(hull[i][0], hull[i][1]);
+      for (let j = 1; j < hull.length; j++) ctx.lineTo(hull[j][0], hull[j][1]);
       ctx.closePath();
       ctx.fillStyle   = _rgba(color, 0.06);
       ctx.fill();
@@ -118,6 +139,12 @@ const CanvasRenderer = (() => {
       ctx.lineWidth   = 1;
       ctx.stroke();
     }
+  }
+
+  /** Force hull recompute on the next drawFrame call (e.g. after step change). */
+  function invalidateHullCache() {
+    _hullFrameCount = 0;
+    _hullCache      = [];
   }
 
   function _drawEdges(ctx, links, baseEdgeWidth, isDark, selectedEdges, getEdgeSelColor) {
@@ -220,5 +247,5 @@ const CanvasRenderer = (() => {
   }
 
   // ── Exported interface ─────────────────────────────────────────────────────
-  return { init, resize, setTransform, drawFrame };
+  return { init, resize, setTransform, drawFrame, invalidateHullCache };
 })();

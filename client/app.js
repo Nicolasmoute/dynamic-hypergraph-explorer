@@ -319,6 +319,21 @@ let _isScrubbing      = false;
 let _scrubEndTimer    = null;
 const _SCRUB_END_MS        = 250;  // ms after last slider move before overlay rebuild
 const _OVERLAY_NODE_THRESH = 200;  // node count above which scrub skip applies
+// LEVER-1: throttle SVG overlay setAttribute storm to ≤10fps during worker ticks.
+// setAttribute accounts for 8-19% of CPU at spec scale (CDP profile 2026-05-02).
+let _lastOverlayUpdateMs          = 0;
+let _overlayNeedsImmediateUpdate  = false; // set on pointerdown → click targets stay fresh
+const _OVERLAY_UPDATE_INTERVAL_MS = 100;   // 10fps maximum for overlay attr updates
+// LEVER-2: cache canvas-area bounding rect (invalidated by ResizeObserver).
+// Eliminates getBoundingClientRect() call on every step change (2-3% during scrub).
+let _canvasAreaRect = { width: 0, height: 0 };
+// LEVER-3: reuse topology arrays across step changes to reduce GC pressure (4-5% scrub).
+// Safe: old rAF is always cancelled before renderSpatialCanvas() reuses these.
+let _reuseLinks        = [];
+let _reuseSelfLoops    = [];
+let _reuseHyperedges   = [];
+let _reuseWorkerEdges  = [];
+let _reuseWorkerHypers = [];
 
 // Options
 let opts = { labels: false, colors: true, hulls: true, nudge: false };
@@ -406,6 +421,18 @@ async function init() {
     // Show UI immediately with rule cards
     overlay.style.display = 'none';
     renderRuleCards();
+
+    // LEVER-2: prime the canvas-area rect cache and keep it fresh via ResizeObserver.
+    const _cae = document.getElementById('canvas-area');
+    if (_cae) {
+      const _refreshRect = () => {
+        const r = _cae.getBoundingClientRect();
+        _canvasAreaRect.width = r.width;
+        _canvasAreaRect.height = r.height;
+      };
+      _refreshRect();
+      if (typeof ResizeObserver !== 'undefined') new ResizeObserver(_refreshRect).observe(_cae);
+    }
 
     // Start loading first rule (shows per-rule loading in canvas area)
     selectRule(RULES[0].id);
@@ -686,7 +713,9 @@ function setStepFromSlider(step) {
   if (selectedEdges.length > 0) recomputeLineage();
   // PERF-SCRUB: mark as scrubbing so renderSpatialCanvas skips expensive SVG overlay
   // rebuild on large graphs.  250 ms after the last slider move, rebuild the full overlay.
+  // LEVER-4: invalidate hull cache on every step change so new topology gets fresh hulls.
   if (USE_CANVAS && !_canvasWorkerDisabled) {
+    CanvasRenderer.invalidateHullCache();
     _isScrubbing = true;
     if (_scrubEndTimer) clearTimeout(_scrubEndTimer);
     _scrubEndTimer = setTimeout(() => {
@@ -1032,10 +1061,11 @@ function renderSpatialCanvas() {
     : data.states[currentStep];
 
   // ── Build graph topology (same as renderSpatial) ─────────────────────────
+  // LEVER-3: reuse pre-allocated arrays (clear + push) to reduce per-step GC pressure.
   const nodeSet  = new Set();
-  const links    = [];
-  const selfLoops = [];
-  const hyperedges = [];
+  _reuseLinks.length = 0;       const links        = _reuseLinks;
+  _reuseSelfLoops.length = 0;   const selfLoops    = _reuseSelfLoops;
+  _reuseHyperedges.length = 0;  const hyperedges   = _reuseHyperedges;
   state.forEach((edge, idx) => {
     edge.forEach(n => nodeSet.add(n));
     hyperedges.push({ id: idx, nodes: edge });
@@ -1123,9 +1153,14 @@ function renderSpatialCanvas() {
   });
 
   // ── Canvas setup ──────────────────────────────────────────────────────────
+  // LEVER-2: use cached rect (populated by ResizeObserver in init()) instead of
+  // a live getBoundingClientRect() on every step change (saves 2-3% CPU during scrub).
   const canvasEl = document.getElementById('main-canvas');
-  const rect = document.getElementById('canvas-area').getBoundingClientRect();
-  const width = rect.width, height = rect.height;
+  if (!_canvasAreaRect.width) {
+    const _r = document.getElementById('canvas-area').getBoundingClientRect();
+    _canvasAreaRect.width = _r.width; _canvasAreaRect.height = _r.height;
+  }
+  const width = _canvasAreaRect.width, height = _canvasAreaRect.height;
   canvasEl.style.display = '';
   CanvasRenderer.init(canvasEl);
   CanvasRenderer.resize(width, height);
@@ -1139,6 +1174,9 @@ function renderSpatialCanvas() {
   // skip interaction on <circle> and <path> elements only.
   svg.on('mousedown.nudge', null).on('mousemove.nudge', null).on('mouseup.nudge', null);
   svg.on('click', function(e) { if (e.target === this) clearLineage(); });
+  // LEVER-1: force an immediate overlay position refresh on the next _drawTick()
+  // before any pointerdown event resolves to a click, ensuring hit-test accuracy.
+  svg.on('pointerdown.overlayRefresh', () => { _overlayNeedsImmediateUpdate = true; });
 
   const overlayG     = svg.append('g');
   const overlayEdgeG = overlayG.append('g');  // edges below nodes (z-order)
@@ -1224,8 +1262,9 @@ function renderSpatialCanvas() {
   //   workerEdges:      arity-2 non-self-loop only  → worker adds one link each
   //   workerHyperedges: arity>2 only                → worker expands to chain
   //   (self-loops and arity-1: no force links needed)
-  const workerEdges      = [];
-  const workerHyperedges = [];
+  // LEVER-3: reuse pre-allocated arrays for worker edge lists too.
+  _reuseWorkerEdges.length = 0;   const workerEdges      = _reuseWorkerEdges;
+  _reuseWorkerHypers.length = 0;  const workerHyperedges = _reuseWorkerHypers;
   state.forEach((edge, idx) => {
     if (edge.length === 2 && edge[0] !== edge[1]) {
       workerEdges.push({ source: edge[0], target: edge[1], id: idx });
@@ -1242,14 +1281,23 @@ function renderSpatialCanvas() {
       nodes, nodeById, links, selfLoops, hyperedges,
       nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
     });
-    // PERF-SCRUB: skip SVG overlay attr updates while scrubbing large graphs.
-    // Overlay elements don't exist during scrub (see join section below), so
-    // these selections are empty and updating them wastes O(n) time for nothing.
-    if (!_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH) {
-      overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
-      overlayNodeG.selectAll('circle')
-        .attr('cx', d => d.x != null ? d.x : 0)
-        .attr('cy', d => d.y != null ? d.y : 0);
+    // PERF-SCRUB: skip overlay attr updates during scrub on large graphs.
+    // LEVER-1: throttle overlay setAttribute storm to ≤10fps (100ms interval).
+    // The overlay is used for click/drag hit-testing; positions only need to be
+    // fresh when the user is about to interact, not at full simulation frame rate.
+    // _overlayNeedsImmediateUpdate is set on pointerdown so click targets are
+    // always accurate at the moment the user clicks.
+    const overlayActive = !_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH;
+    if (overlayActive) {
+      const now = performance.now();
+      if (_overlayNeedsImmediateUpdate || now - _lastOverlayUpdateMs >= _OVERLAY_UPDATE_INTERVAL_MS) {
+        _lastOverlayUpdateMs = now;
+        _overlayNeedsImmediateUpdate = false;
+        overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
+        overlayNodeG.selectAll('circle')
+          .attr('cx', d => d.x != null ? d.x : 0)
+          .attr('cy', d => d.y != null ? d.y : 0);
+      }
     }
   }
 
