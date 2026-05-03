@@ -11,6 +11,7 @@ Run from the repo root:
 """
 from __future__ import annotations
 import time
+import importlib
 import pytest
 from fastapi.testclient import TestClient
 from server import main
@@ -134,6 +135,29 @@ class TestBuiltinMultiwayCausalWarm:
         main._precompute_builtin_multiway_causal()
 
         assert calls == []
+
+    def test_env_opt_out_disables_warmup(self, monkeypatch):
+        calls: list[tuple[str, int, int, int]] = []
+
+        def fake_get_multiway_causal(rule_id: str, max_steps: int, max_occurrences: int, max_time_ms: int):
+            calls.append((rule_id, max_steps, max_occurrences, max_time_ms))
+            return {
+                "events": [],
+                "causal_edges": [],
+                "default_path_event_ids": [],
+                "truncated": False,
+                "truncation_reason": None,
+            }
+
+        monkeypatch.setenv("DH_PRECOMPUTE_MULTIWAY_CAUSAL", "0")
+        reloaded = importlib.reload(main)
+        monkeypatch.setattr(reloaded, "get_multiway_causal", fake_get_multiway_causal)
+
+        reloaded._precompute_builtin_multiway_causal()
+        assert calls == []
+
+        monkeypatch.delenv("DH_PRECOMPUTE_MULTIWAY_CAUSAL", raising=False)
+        importlib.reload(reloaded)
 
 
 # ── /api/rules/{rule_id} ──────────────────────────────────────────────

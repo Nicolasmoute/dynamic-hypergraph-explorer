@@ -59,7 +59,7 @@ _MW_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_MAX_TIME_MS", "3000"))
 _MWCAUSAL_MAX_STEPS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_STEPS", "4"))
 _MWCAUSAL_MAX_OCCURRENCES: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_OCCURRENCES", "5000"))
 _MWCAUSAL_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_TIME_MS", "5000"))
-_PRECOMPUTE_MULTIWAY_CAUSAL: bool = os.environ.get("DH_PRECOMPUTE_MULTIWAY_CAUSAL", "0").strip().lower() in (
+_PRECOMPUTE_MULTIWAY_CAUSAL: bool = os.environ.get("DH_PRECOMPUTE_MULTIWAY_CAUSAL", "1").strip().lower() in (
     "1",
     "true",
     "yes",
