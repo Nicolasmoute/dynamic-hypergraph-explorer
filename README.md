@@ -34,7 +34,7 @@ the browser.
 
 | View | Renderer | Notes |
 |------|----------|-------|
-| Spatial (main graph) | Canvas (default) or SVG (`?renderer=svg`) | Canvas uses an off-thread Web Worker for D3 force layout |
+| Spatial (main graph) | Canvas by default, SVG via `?renderer=svg` | Canvas uses an off-thread Web Worker for D3 force layout |
 | Causal graph | SVG, static step-layered layout | O(N); no force sim; capped at 8,000 visible events |
 | Multiway system | SVG, static step-layered layout | Bounded at 300 states by the engine |
 | Multiway Causal | SVG, lazy-loaded on tab open | Static step-layered DAG with cross-branch causal edges |
@@ -123,14 +123,13 @@ restarts — use **Recent rules** to recall without recomputation.
 
 ## Canvas rendering
 
-The spatial (main) view uses Canvas by default. Append `?renderer=svg` to force the
-legacy SVG path, or `?renderer=canvas` if you want to be explicit about the canvas
-renderer. In this mode the D3 force simulation runs in a dedicated Web Worker
-(`layout-worker.js`) — the main thread never blocks during layout:
+Canvas is the default renderer for the spatial (main) view. Append `?renderer=svg`
+to force the legacy SVG path. In this mode the D3 force simulation runs in a
+dedicated Web Worker (`layout-worker.js`) — the main thread never blocks during
+layout:
 
 ```
 http://localhost:8080/?renderer=svg
-http://localhost:8080/?renderer=canvas
 ```
 
 The worker uses protocol v2 (graph-scoped `graph_id`, partial `update_options`, chain-only

@@ -724,8 +724,24 @@ function setView(view, el) {
   document.getElementById('multiway-view').className = 'causal-overlay' + (view === 'multiway' ? ' active' : '');
   document.getElementById('multiway-causal-view').className = 'causal-overlay' + (view === 'multiway-causal' ? ' active' : '');
   document.getElementById('growth-view').style.display = view === 'growth' ? '' : 'none';
+  updateCausalViewLabel(view);
   if (view !== 'spatial') document.getElementById('lineage-bar').classList.remove('active');
   renderCurrentView();
+}
+
+function updateCausalViewLabel(view) {
+  const label = document.getElementById('causal-label');
+  if (!label) return;
+  if (view === 'causal') {
+    label.style.display = '';
+    label.textContent = 'Single-history: red = realized/default path';
+  } else if (view === 'multiway-causal') {
+    label.style.display = '';
+    label.textContent = 'Multiway Causal: red = default path, green = off-path structure';
+  } else {
+    label.style.display = 'none';
+    label.textContent = '';
+  }
 }
 
 function renderCurrentView() {
