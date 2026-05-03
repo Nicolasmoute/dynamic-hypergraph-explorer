@@ -22,6 +22,7 @@ const USE_CANVAS = new URLSearchParams(location.search).get('renderer') !== 'svg
 let RULES = [];        // [{id, name, notation, desc, tag, tagClass}]
 let DATA = {};         // ruleId -> {states, events, causal_edges, stats, lineage, birthSteps}
 let MULTIWAY = {};     // ruleId -> server multiway data
+let MWCAUSAL = {};     // ruleId -> server multiway-causal data
 let activeRule = null;
 let currentStep = 0;
 let currentView = 'spatial';
@@ -450,6 +451,7 @@ async function init() {
 
 // Track loading state per rule
 const _loading = {};
+const _mwCausalLoading = {};
 
 async function loadRuleData(ruleId) {
   if (DATA[ruleId]) return DATA[ruleId];
@@ -489,6 +491,7 @@ async function loadRuleData(ruleId) {
         const _blurbEl = document.getElementById('theory-blurb');
         if (_blurbEl) _blurbEl.textContent = (_rule && _rule.blurb) || '';
         if (!MULTIWAY[ruleId] && !ruleId.startsWith('custom_')) loadMultiway(ruleId);
+        if (!MWCAUSAL[ruleId]) loadMultiwayCausal(ruleId);
         updateExtendRow();
         renderCurrentView();
       }
@@ -518,6 +521,43 @@ async function loadMultiway(ruleId) {
   } catch (e) {
     console.warn('Failed to load multiway for', ruleId, e);
   }
+}
+
+async function loadMultiwayCausal(ruleId) {
+  if (MWCAUSAL[ruleId]) return MWCAUSAL[ruleId];
+  if (_mwCausalLoading[ruleId]) return _mwCausalLoading[ruleId];
+
+  _mwCausalLoading[ruleId] = (async () => {
+    try {
+      if (ruleId.startsWith('custom_')) {
+        const rule = RULES.find(r => r.id === ruleId);
+        const data = DATA[ruleId];
+        if (!rule || !data || !Array.isArray(data.states) || !data.states[0]) return null;
+        MWCAUSAL[ruleId] = await apiFetch('/api/custom/multiway-causal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            notation: rule.notation,
+            init: data.states[0],
+            max_steps: 4,
+            max_occurrences: 5000,
+            max_time_ms: 5000,
+          }),
+        });
+      } else {
+        MWCAUSAL[ruleId] = await apiFetch('/api/rules/' + ruleId + '/multiway-causal');
+      }
+      if (activeRule === ruleId && currentView === 'multiway-causal') renderMultiwayCausal();
+      return MWCAUSAL[ruleId];
+    } catch (e) {
+      console.warn('Failed to load multiway-causal for', ruleId, e);
+      return null;
+    } finally {
+      delete _mwCausalLoading[ruleId];
+    }
+  })();
+
+  return _mwCausalLoading[ruleId];
 }
 
 // =========================================================================
@@ -612,6 +652,8 @@ function removeCustomRule(ruleId) {
   RULES.splice(idx, 1);
   delete DATA[ruleId];
   delete MULTIWAY[ruleId];
+  delete MWCAUSAL[ruleId];
+  delete _mwCausalLoading[ruleId];
   if (activeRule === ruleId) selectRule(RULES[0].id);
   renderRuleCards();
 }
@@ -664,6 +706,7 @@ function selectRule(ruleId) {
   if (!MULTIWAY[ruleId] && !ruleId.startsWith('custom_')) {
     loadMultiway(ruleId);
   }
+  if (!MWCAUSAL[ruleId]) loadMultiwayCausal(ruleId);
 
   updateExtendRow();
   renderCurrentView();
@@ -682,6 +725,7 @@ function setView(view, el) {
   if (USE_CANVAS && !_canvasWorkerDisabled) document.getElementById('main-canvas').style.display = view === 'spatial' ? '' : 'none';
   document.getElementById('causal-view').className = 'causal-overlay' + (view === 'causal' ? ' active' : '');
   document.getElementById('multiway-view').className = 'causal-overlay' + (view === 'multiway' ? ' active' : '');
+  document.getElementById('multiway-causal-view').className = 'causal-overlay' + (view === 'multiway-causal' ? ' active' : '');
   document.getElementById('growth-view').style.display = view === 'growth' ? '' : 'none';
   if (view !== 'spatial') document.getElementById('lineage-bar').classList.remove('active');
   renderCurrentView();
@@ -692,6 +736,7 @@ function renderCurrentView() {
   if (currentView === 'spatial') { if (USE_CANVAS && !_canvasWorkerDisabled) renderSpatialCanvas(); else renderSpatial(); }
   else if (currentView === 'causal') renderCausal();
   else if (currentView === 'multiway') renderMultiway();
+  else if (currentView === 'multiway-causal') renderMultiwayCausal();
   else if (currentView === 'growth') renderGrowthAnalysis();
   updateStats();
 }
@@ -2389,6 +2434,134 @@ function renderMultiway() {
     .attr('text-anchor', 'middle').attr('fill', isDark ? '#555' : '#999')
     .attr('font-size', 11)
     .text(`${Object.keys(mw.states).length} states, ${mw.edges.length} transitions (${Math.min(4, maxStep)} steps)`);
+}
+
+function renderMultiwayCausal() {
+  const data = MWCAUSAL[activeRule];
+  const svg = d3.select('#multiway-causal-svg');
+  svg.selectAll('*').remove();
+  const rect = document.getElementById('canvas-area').getBoundingClientRect();
+  const width = rect.width, height = rect.height;
+  svg.attr('width', width).attr('height', height);
+
+  if (!data || !Array.isArray(data.events) || data.events.length === 0) {
+    svg.append('text').attr('x', width / 2).attr('y', height / 2)
+      .attr('text-anchor', 'middle').attr('fill', isDark ? '#666' : '#999')
+      .attr('font-size', 14).text(data ? 'Multiway causal graph has no events' : 'Loading multiway causal graph...');
+    if (!data && activeRule) loadMultiwayCausal(activeRule);
+    return;
+  }
+
+  const eventInfo = {};
+  const events = data.events.slice().sort((a, b) => (a.step - b.step) || (a.id - b.id));
+  for (const ev of events) eventInfo[ev.id] = ev;
+
+  const CAUSAL_NODE_CAP = 8000;
+  const totalVisible = events.length;
+  const serverTruncated = !!data.truncated;
+  const clientTruncated = totalVisible > CAUSAL_NODE_CAP;
+  const truncated = serverTruncated || clientTruncated;
+  const renderEvents = clientTruncated ? events.slice(-CAUSAL_NODE_CAP) : events;
+  const renderIds = new Set(renderEvents.map(ev => ev.id));
+  const renderEdges = (data.causal_edges || []).filter(([src, dst]) => renderIds.has(src) && renderIds.has(dst));
+  const defaultPathIds = new Set(data.default_path_event_ids || []);
+
+  const g = svg.append('g');
+  svg.call(d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => g.attr('transform', e.transform)));
+
+  const stepGroups = new Map();
+  for (const ev of renderEvents) {
+    if (!stepGroups.has(ev.step)) stepGroups.set(ev.step, []);
+    stepGroups.get(ev.step).push(ev);
+  }
+
+  const maxStep = Math.max(1, ...renderEvents.map(ev => ev.step || 0));
+  const PAD_X = 40;
+  const PAD_Y = truncated ? 28 : 50;
+  const usableW = width - 2 * PAD_X;
+  const usableH = height - PAD_Y - 16;
+  const posById = new Map();
+
+  for (const [step, group] of stepGroups.entries()) {
+    const y = PAD_Y + step * usableH / maxStep;
+    group.forEach((ev, i) => {
+      const x = group.length === 1
+        ? width / 2
+        : PAD_X + usableW * i / (group.length - 1);
+      posById.set(ev.id, { x, y, step });
+    });
+  }
+
+  const nodes = renderEvents.map(ev => Object.assign({ id: ev.id }, posById.get(ev.id)));
+  const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
+
+  g.append('defs').append('marker')
+    .attr('id', 'mwc-arrow-red').attr('viewBox', '0 -3 6 6').attr('refX', 8)
+    .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', '#ff4444');
+
+  g.append('defs').append('marker')
+    .attr('id', 'mwc-arrow-green').attr('viewBox', '0 -3 6 6').attr('refX', 8)
+    .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', '#44dd88');
+
+  g.append('g').selectAll('line').data(renderEdges).join('line')
+    .attr('x1', d => (posById.get(d[0]) || {}).x || 0)
+    .attr('y1', d => (posById.get(d[0]) || {}).y || 0)
+    .attr('x2', d => (posById.get(d[1]) || {}).x || 0)
+    .attr('y2', d => (posById.get(d[1]) || {}).y || 0)
+    .attr('stroke', d => (defaultPathIds.has(d[0]) && defaultPathIds.has(d[1])) ? '#ff444480' : '#44dd8880')
+    .attr('stroke-width', 2)
+    .attr('marker-end', d => (defaultPathIds.has(d[0]) && defaultPathIds.has(d[1])) ? 'url(#mwc-arrow-red)' : 'url(#mwc-arrow-green)');
+
+  g.append('g').selectAll('circle').data(nodes).join('circle')
+    .attr('cx', d => d.x)
+    .attr('cy', d => d.y)
+    .attr('r', d => defaultPathIds.has(d.id) ? nodeR * 1.35 : nodeR)
+    .attr('fill', d => defaultPathIds.has(d.id) ? '#ff4444' : '#44dd88')
+    .attr('fill-opacity', 1)
+    .attr('stroke', d => defaultPathIds.has(d.id) ? '#ff444480' : '#44dd8880')
+    .attr('stroke-width', d => defaultPathIds.has(d.id) ? 2 : 1.5)
+    .style('cursor', 'default')
+    .on('mouseenter', (ev, d) => {
+      const info = eventInfo[d.id];
+      if (!info) {
+        showTooltip(ev, `Event ${d.id} (step ${d.step})`);
+        return;
+      }
+      const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
+      const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
+      const branch = defaultPathIds.has(d.id) ? 'default path' : 'off-path branch';
+      showTooltip(ev,
+        `Event #${d.id}  (step ${d.step})\n` +
+        `${branch}\n` +
+        `Match: ${info.match_idx != null ? info.match_idx : '--'}\n` +
+        `Consumed: ${consumed || 'none'}\n` +
+        `Produced: ${produced || 'none'}`
+      );
+    })
+    .on('mouseleave', hideTooltip);
+
+  const lg = g.append('g').attr('transform', `translate(${width - 200}, 20)`);
+  lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');
+  lg.append('text').attr('x', 10).attr('y', 4).attr('fill', isDark ? '#aaa' : '#555')
+    .attr('font-size', 11).text('Default path');
+  lg.append('circle').attr('cx', 0).attr('cy', 20).attr('r', 5).attr('fill', '#44dd88');
+  lg.append('text').attr('x', 10).attr('y', 24).attr('fill', isDark ? '#aaa' : '#555')
+    .attr('font-size', 11).text('Off-path branch');
+
+  if (truncated) {
+    const bannerText = clientTruncated
+      ? `Showing most recent ${CAUSAL_NODE_CAP.toLocaleString()} of ${totalVisible.toLocaleString()} events`
+      : (data.truncation_reason || 'Multiway causal graph truncated');
+    svg.append('text')
+      .attr('x', width / 2).attr('y', 14)
+      .attr('text-anchor', 'middle')
+      .attr('fill', isDark ? '#f0a040' : '#b06000')
+      .attr('font-size', 11)
+      .attr('font-family', "'JetBrains Mono', monospace")
+      .text(bannerText);
+  }
 }
 
 function tracePathTo(mw, targetHash) {

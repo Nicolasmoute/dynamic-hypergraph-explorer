@@ -379,6 +379,7 @@
       <button class="view-tab active" onclick="setView('spatial', this)">Spatial Graph</button>
       <button class="view-tab" onclick="setView('causal', this)">Causal Graph</button>
       <button class="view-tab" onclick="setView('multiway', this)">Multiway</button>
+      <button class="view-tab" onclick="setView('multiway-causal', this)">Multiway Causal</button>
       <button class="view-tab" onclick="setView('growth', this)">Growth Analysis</button>
     </div>
     <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle light/dark mode">&#9790;</button>
@@ -487,6 +488,7 @@
     <svg id="main-svg"></svg>
     <div class="causal-overlay" id="causal-view"><svg id="causal-svg"></svg></div>
     <div class="causal-overlay" id="multiway-view"><svg id="multiway-svg"></svg></div>
+    <div class="causal-overlay" id="multiway-causal-view"><svg id="multiway-causal-svg"></svg></div>
     <div id="growth-view" style="display:none; position:absolute; inset:0; background:var(--bg); overflow-y:auto; padding: 32px;"></div>
     <div id="compute-overlay">
       <svg class="co-spinner" viewBox="0 0 20 20" aria-hidden="true">
