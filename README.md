@@ -79,8 +79,8 @@ pytest
 
 | File | What it covers | Count |
 |------|---------------|-------|
-| `tests/test_engine.py`       | Engine unit tests (parse, match, evolve, causal index, lineage, hash, dimension) | 53 |
-| `tests/test_api.py`          | FastAPI endpoint integration tests (all routes, job polling, extend, abort, stale-but-done) | 43 |
+| `tests/test_engine.py`       | Engine unit tests (parse, match, evolve, causal index, lineage, hash, dimension) | 98 |
+| `tests/test_api.py`          | FastAPI endpoint integration tests (all routes, job polling, extend, abort, stale-but-done, multiway-causal) | 80 |
 | `tests/test_smoke.py`        | Serving-layer smoke tests (MIME types, /health, rules list) | 12 |
 | `tests/test_dimension.py`    | Dimension estimation correctness (incidence-BFS metric) | 6 |
 | `tests/test_browser_smoke.py`| Playwright E2E browser tests — skipped by default; `--run-slow` to enable | — |
@@ -95,8 +95,10 @@ pytest
 | `GET`    | `/api/rules` | List all built-in rules |
 | `GET`    | `/api/rules/{id}` | Full evolution data (states, events, causal graph) |
 | `GET`    | `/api/rules/{id}/multiway` | Multiway system for a rule |
+| `GET`    | `/api/rules/{id}/multiway-causal` | Multiway causal graph for a built-in rule |
 | `GET`    | `/api/rules/{id}/descendants` | Trace edge descendants across steps |
 | `POST`   | `/api/custom` | Start async evolution (`notation`, `init`, `steps`) → `{job_id, status}` |
+| `POST`   | `/api/custom/multiway-causal` | Compute a custom multiway causal graph synchronously |
 | `GET`    | `/api/jobs/{job_id}` | Poll job status (`running` / `done` / `stale`) |
 | `DELETE` | `/api/jobs/{job_id}` | Abort a running job cooperatively |
 | `POST`   | `/api/extend` | Extend a cached result by more steps (`key`, `extra_steps`) |
@@ -176,7 +178,7 @@ at runtime (defaults to 8080 if unset).
 
 ### Persistent cache volume (required)
 
-The server caches computed results under `/data/cache/v2/`. Without a
+The server caches computed results under `/data/cache/v3/`. Without a
 persistent volume this directory is lost on every deploy restart. Configure it
 once in the Zeabur dashboard:
 
