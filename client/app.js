@@ -491,7 +491,6 @@ async function loadRuleData(ruleId) {
         const _blurbEl = document.getElementById('theory-blurb');
         if (_blurbEl) _blurbEl.textContent = (_rule && _rule.blurb) || '';
         if (!MULTIWAY[ruleId] && !ruleId.startsWith('custom_')) loadMultiway(ruleId);
-        if (!MWCAUSAL[ruleId]) loadMultiwayCausal(ruleId);
         updateExtendRow();
         renderCurrentView();
       }
@@ -706,8 +705,6 @@ function selectRule(ruleId) {
   if (!MULTIWAY[ruleId] && !ruleId.startsWith('custom_')) {
     loadMultiway(ruleId);
   }
-  if (!MWCAUSAL[ruleId]) loadMultiwayCausal(ruleId);
-
   updateExtendRow();
   renderCurrentView();
 }
