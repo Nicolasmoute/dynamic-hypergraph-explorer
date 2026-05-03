@@ -59,6 +59,12 @@ _MW_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_MAX_TIME_MS", "3000"))
 _MWCAUSAL_MAX_STEPS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_STEPS", "4"))
 _MWCAUSAL_MAX_OCCURRENCES: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_OCCURRENCES", "5000"))
 _MWCAUSAL_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_TIME_MS", "5000"))
+_PRECOMPUTE_MULTIWAY_CAUSAL: bool = os.environ.get("DH_PRECOMPUTE_MULTIWAY_CAUSAL", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # ── CORS (§5.5) ───────────────────────────────────────────────────────
 # Production recommendation: set DH_CORS_ORIGINS to your Zeabur domain,
@@ -424,6 +430,44 @@ def get_multiway_causal(
         return result
 
 
+def _precompute_builtin_multiway_causal() -> None:
+    """Warm built-in multiway-causal cache entries in the background.
+
+    This is intentionally isolated from lifespan() so tests can exercise the
+    warm path deterministically without waiting on server startup timing.
+    """
+    if not _PRECOMPUTE_MULTIWAY_CAUSAL:
+        logger.info("precompute multiway-causal disabled")
+        return
+
+    for r in RULES:
+        logger.info("precompute multiway-causal start rule_id=%s", r["id"])
+        started_at = _time.time()
+        try:
+            result = get_multiway_causal(
+                r["id"],
+                _MWCAUSAL_MAX_STEPS,
+                _MWCAUSAL_MAX_OCCURRENCES,
+                _MWCAUSAL_MAX_TIME_MS,
+            )
+            elapsed_ms = int((_time.time() - started_at) * 1000)
+            logger.info(
+                "precompute multiway-causal done rule_id=%s events=%d edges=%d truncated=%s reason=%s elapsed_ms=%d",
+                r["id"],
+                len(result.get("events", [])),
+                len(result.get("causal_edges", [])),
+                result.get("truncated"),
+                result.get("truncation_reason"),
+                elapsed_ms,
+            )
+        except Exception as e:
+            logger.error(
+                "precompute multiway-causal failed rule_id=%s error=%s",
+                r["id"],
+                e,
+            )
+
+
 def _preload_disk_cache() -> int:
     """Scan CACHE_DIR and pre-populate in-memory CACHE from disk.
 
@@ -466,6 +510,7 @@ async def lifespan(app: FastAPI):
                 logger.info("precompute multiway done rule_id=%s", r["id"])
             except Exception as e:
                 logger.error("precompute multiway failed rule_id=%s error=%s", r["id"], e)
+        _precompute_builtin_multiway_causal()
         logger.info("precompute complete: all rules ready")
 
     threading.Thread(target=_precompute, daemon=True).start()

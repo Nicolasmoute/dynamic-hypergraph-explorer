@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 import pytest
 from fastapi.testclient import TestClient
+from server import main
 from server.main import app
 
 
@@ -84,6 +85,55 @@ class TestListRules:
         rule = client.get("/api/rules").json()[0]
         for field in ("id", "name", "notation", "desc", "tag", "tagClass"):
             assert field in rule, f"Missing field: {field}"
+
+
+# ── background warm ──────────────────────────────────────────────────
+
+class TestBuiltinMultiwayCausalWarm:
+    def test_warms_each_builtin_with_default_caps(self, monkeypatch):
+        calls: list[tuple[str, int, int, int]] = []
+
+        def fake_get_multiway_causal(rule_id: str, max_steps: int, max_occurrences: int, max_time_ms: int):
+            calls.append((rule_id, max_steps, max_occurrences, max_time_ms))
+            return {
+                "events": [],
+                "causal_edges": [],
+                "default_path_event_ids": [],
+                "truncated": False,
+                "truncation_reason": None,
+            }
+
+        monkeypatch.setattr(main, "_PRECOMPUTE_MULTIWAY_CAUSAL", True)
+        monkeypatch.setattr(main, "get_multiway_causal", fake_get_multiway_causal)
+
+        main._precompute_builtin_multiway_causal()
+
+        assert [rule_id for rule_id, *_ in calls] == [r["id"] for r in main.RULES]
+        assert all(
+            (steps, occurrences, time_ms)
+            == (main._MWCAUSAL_MAX_STEPS, main._MWCAUSAL_MAX_OCCURRENCES, main._MWCAUSAL_MAX_TIME_MS)
+            for _, steps, occurrences, time_ms in calls
+        )
+
+    def test_disabled_flag_skips_warmup(self, monkeypatch):
+        calls: list[tuple[str, int, int, int]] = []
+
+        def fake_get_multiway_causal(rule_id: str, max_steps: int, max_occurrences: int, max_time_ms: int):
+            calls.append((rule_id, max_steps, max_occurrences, max_time_ms))
+            return {
+                "events": [],
+                "causal_edges": [],
+                "default_path_event_ids": [],
+                "truncated": False,
+                "truncation_reason": None,
+            }
+
+        monkeypatch.setattr(main, "_PRECOMPUTE_MULTIWAY_CAUSAL", False)
+        monkeypatch.setattr(main, "get_multiway_causal", fake_get_multiway_causal)
+
+        main._precompute_builtin_multiway_causal()
+
+        assert calls == []
 
 
 # ── /api/rules/{rule_id} ──────────────────────────────────────────────
