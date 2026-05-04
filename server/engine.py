@@ -15,7 +15,10 @@ from typing import Optional
 # v2 → v3: Phase B1/B2 — occurrence-based multiway BFS adds match_idx /
 #   branch_path fields; multiway_causal_graph() payload uses occ_id as event id.
 #   Old multiway cache entries lack these fields; must be invalidated.
-CACHE_VERSION = "v3"
+# v3 → v4: multiway_causal_graph() adds a realized greedy-parallel causal
+#   slice for red rendering while keeping occurrence-level events as green
+#   multiway alternatives.
+CACHE_VERSION = "v4"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1240,6 +1243,48 @@ def _causal_edges_from_event_stream(events: list[dict]) -> list[list[int]]:
     return causal_edges
 
 
+def _realized_greedy_slice(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    max_steps: int,
+    max_time_ms: int,
+) -> dict:
+    """Return the greedy-parallel causal slice used for red MWC rendering."""
+    realized = evolve(
+        init_state,
+        lhs,
+        rhs,
+        steps=max_steps,
+        time_limit_ms=max_time_ms,
+    )
+
+    id_map: dict[int, str] = {}
+    realized_events: list[dict] = []
+    for step_idx, step_events in enumerate(realized["events"], start=1):
+        for ev in step_events:
+            rid = f"r{ev['id']}"
+            id_map[ev["id"]] = rid
+            realized_events.append({
+                "id": rid,
+                "step": step_idx,
+                "greedy_event_id": ev["id"],
+                "consumed": ev["consumed"],
+                "produced": ev["produced"],
+                "source": "greedy_parallel",
+            })
+
+    realized_causal_edges: list[list[str]] = []
+    for src, dst in realized["causal_edges"]:
+        if src in id_map and dst in id_map:
+            realized_causal_edges.append([id_map[src], id_map[dst]])
+
+    return {
+        "events": realized_events,
+        "causal_edges": realized_causal_edges,
+    }
+
+
 # ── multiway causal graph (Phase B2) ─────────────────────────────────
 
 def multiway_causal_graph(
@@ -1271,12 +1316,17 @@ def multiway_causal_graph(
     from one branch will have ancestors produced by the other branch only if
     those ancestors appear literally in their ancestry chain.
 
-    **Greedy default path**
+    **Serial default path and realized greedy slice**
 
     ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
     reached by always selecting ``match_idx=0`` at each step (the first
-    available match — the same deterministic choice ``evolve()`` makes).
-    These events are colored red client-side; off-path events are green.
+    available match).  It is retained for compatibility and for inspecting one
+    serial branch through the occurrence tree.
+
+    ``realized_events`` and ``realized_causal_edges`` contain the separate
+    greedy-parallel evolution slice computed with ``evolve()``.  These events
+    are the red client-side structure; occurrence-level events remain green
+    multiway alternatives.
 
     **Truncation**
 
@@ -1287,9 +1337,8 @@ def multiway_causal_graph(
     - ``"max_depth"``       — BFS stopped at ``max_steps`` depth (Rin
       audit: honest about depth-cap even when other caps don't fire).
 
-    **CACHE_VERSION** is bumped to ``v3`` alongside this function to
-    invalidate cached multiway payloads (new ``match_idx`` / ``branch_path``
-    fields make old payloads incompatible).
+    **CACHE_VERSION** is bumped when this payload shape changes so stale
+    multiway-causal cache entries are not reused.
 
     Args:
         init_state:      Initial hypergraph.
@@ -1316,6 +1365,9 @@ def multiway_causal_graph(
           ],
           "causal_edges":            [[from_id, to_id], ...],
           "default_path_event_ids":  [int, ...],
+          "realized_events":         [{id, step, greedy_event_id, ...}, ...],
+          "realized_causal_edges":   [[from_id, to_id], ...],
+          "stats":                   dict,
           "truncated":               bool,
           "truncation_reason":       str | None,
         }
@@ -1427,10 +1479,34 @@ def multiway_causal_graph(
         default_path_event_ids.append(greedy_child["occ_id"])
         cur_occ = greedy_child
 
+    # ── 5. Realized greedy-parallel slice for red rendering ───────────
+    realized = _realized_greedy_slice(
+        init_state,
+        lhs,
+        rhs,
+        max_steps=max_steps,
+        max_time_ms=max_time_ms,
+    )
+
+    stats = {
+        "event_count": len(events),
+        "off_default_event_count": len(events),
+        "realized_event_count": len(realized["events"]),
+        "realized_causal_edge_count": len(realized["causal_edges"]),
+        "serial_default_path_event_count": len(default_path_event_ids),
+        "max_steps": max_steps,
+        "max_occurrences": max_occurrences,
+        "max_time_ms": max_time_ms,
+        "truncation_reason": truncation_reason,
+    }
+
     return {
         "events": events,
         "causal_edges": causal_edges,
         "default_path_event_ids": default_path_event_ids,
+        "realized_events": realized["events"],
+        "realized_causal_edges": realized["causal_edges"],
+        "stats": stats,
         "truncated": truncated,
         "truncation_reason": truncation_reason,
     }

@@ -893,8 +893,20 @@ class TestMultiwayCausalGraph:
         p = self._parsed()
         r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
         for key in ("events", "causal_edges", "default_path_event_ids",
+                    "realized_events", "realized_causal_edges", "stats",
                     "truncated", "truncation_reason"):
             assert key in r, f"missing key: {key!r}"
+
+    def test_realized_events_have_required_fields(self):
+        """The red slice uses stable string IDs disjoint from occurrence IDs."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
+        for ev in r["realized_events"]:
+            for field in ("id", "step", "greedy_event_id", "consumed",
+                          "produced", "source"):
+                assert field in ev, f"realized event missing field {field!r}: {ev}"
+            assert isinstance(ev["id"], str) and ev["id"].startswith("r")
+            assert ev["source"] == "greedy_parallel"
 
     def test_events_have_required_fields(self):
         """Each event must have id, step, occ_id, parent_occ_id, match_idx,
@@ -951,6 +963,8 @@ class TestMultiwayCausalGraph:
         assert r["events"] == []
         assert r["causal_edges"] == []
         assert r["default_path_event_ids"] == []
+        assert r["realized_events"] == []
+        assert r["realized_causal_edges"] == []
         assert r["truncated"] is False
 
     def test_single_step_no_causal_edges(self):
@@ -1101,6 +1115,44 @@ class TestMultiwayCausalGraph:
         assert len(r["events"]) > len(r["default_path_event_ids"]), (
             "Expected off-path events but events == default path"
         )
+
+    def test_realized_slice_matches_parallel_evolve_rule1_count(self):
+        """Rule1's red slice is greedy-parallel, not one serial event per depth."""
+        p = engine.parse_notation("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}")
+        r = engine.multiway_causal_graph(
+            [[0, 1], [0, 2]],
+            p["lhs"],
+            p["rhs"],
+            max_steps=4,
+            max_occurrences=5000,
+            max_time_ms=5000,
+        )
+        assert len(r["realized_events"]) == 15
+        assert r["stats"]["realized_event_count"] == 15
+        assert len(r["default_path_event_ids"]) == 4
+
+    def test_realized_slice_matches_parallel_evolve_rule4_count(self):
+        """Rule4's red slice contains all greedy-parallel events per step."""
+        p = engine.parse_notation("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}")
+        r = engine.multiway_causal_graph(
+            [[0, 1, 2]],
+            p["lhs"],
+            p["rhs"],
+            max_steps=4,
+            max_occurrences=5000,
+            max_time_ms=5000,
+        )
+        assert len(r["realized_events"]) == 40
+        assert r["stats"]["realized_event_count"] == 40
+        assert len(r["default_path_event_ids"]) == 4
+
+    def test_realized_stats_match_payload_lengths(self):
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        assert r["stats"]["realized_event_count"] == len(r["realized_events"])
+        assert r["stats"]["realized_causal_edge_count"] == len(r["realized_causal_edges"])
+        assert r["stats"]["event_count"] == len(r["events"])
+        assert r["stats"]["off_default_event_count"] == len(r["events"])
 
     # ── B2.1 regression: live edge provenance (Sofia BLOCKER) ─────────
 
