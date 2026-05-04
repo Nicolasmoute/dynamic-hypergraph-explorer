@@ -583,6 +583,19 @@ def canonical_hash(hyp: Hypergraph) -> str:
     node_set = set(n for e in hyp for n in e)
     nodes = sorted(node_set)
     N, E = len(nodes), len(hyp)
+    edge_nodes: list[tuple[int, ...]] = [tuple(e) for e in hyp]
+    edge_lens: list[int] = [len(e) for e in hyp]
+
+    # Build a per-call node→incident-edge index so each refinement round only
+    # inspects the edges that actually touch a node, instead of scanning all
+    # edges for every node.
+    incident: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for edge_idx, edge in enumerate(edge_nodes):
+        counts: dict[int, int] = defaultdict(int)
+        for n in edge:
+            counts[n] += 1
+        for n, cnt in counts.items():
+            incident[n].append((edge_idx, cnt))
 
     def refine(color0: dict) -> dict:
         c = dict(color0)
@@ -590,11 +603,11 @@ def canonical_hash(hyp: Hypergraph) -> str:
             sigs = {}
             for n in nodes:
                 es = []
-                for e in hyp:
-                    cnt = e.count(n)
-                    if not cnt:
-                        continue
-                    es.append(f"{cnt}/{len(e)}:{','.join(str(c[x]) for x in sorted(e, key=lambda x: c[x]))}")
+                for edge_idx, cnt in incident.get(n, []):
+                    e = edge_nodes[edge_idx]
+                    es.append(
+                        f"{cnt}/{edge_lens[edge_idx]}:{','.join(str(c[x]) for x in sorted(e, key=lambda x: c[x]))}"
+                    )
                 es.sort()
                 sigs[n] = f"{c[n]}|{';'.join(es)}"
             uniq = sorted(set(sigs.values()))

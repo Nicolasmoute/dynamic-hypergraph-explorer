@@ -227,6 +227,12 @@ class TestCanonicalHash:
         h2 = [[1, 2], [0, 1]]
         assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
 
+    def test_duplicate_node_hyperedges_are_isomorphic(self):
+        """Repeated nodes inside hyperedges should remain hash-stable under relabeling."""
+        h1 = [[0, 0, 1], [1, 2, 3], [3, 4, 4]]
+        h2 = [[10, 10, 11], [11, 12, 13], [13, 14, 14]]
+        assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
+
 
 # ── estimate_dimension ────────────────────────────────────────────────
 
