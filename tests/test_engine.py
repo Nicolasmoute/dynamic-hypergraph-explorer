@@ -233,6 +233,18 @@ class TestCanonicalHash:
         h2 = [[10, 10, 11], [11, 12, 13], [13, 14, 14]]
         assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
 
+    def test_multi_digit_labels_keep_exact_canonical_form(self):
+        """Canonicalization must preserve the baseline exact string format."""
+        h1 = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [0, 5, 10]]
+        h2 = [[100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110], [100, 105, 110]]
+        assert engine.canonical_hash(h1) == "11:2:[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [8, 9, 10]]"
+        assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
+
+    def test_duplicate_node_edge_exact_format(self):
+        """Repeated nodes inside edges must preserve the old canonical ordering."""
+        hyp = [[1, 2, 4, 1, 3], [2, 4, 1, 3]]
+        assert engine.canonical_hash(hyp) == "4:2:[[0, 1, 2, 3], [0, 1, 2, 3, 3]]"
+
 
 # ── estimate_dimension ────────────────────────────────────────────────
 
@@ -893,8 +905,45 @@ class TestMultiwayCausalGraph:
         p = self._parsed()
         r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
         for key in ("events", "causal_edges", "default_path_event_ids",
-                    "truncated", "truncation_reason"):
+                    "truncated", "truncation_reason", "stats"):
             assert key in r, f"missing key: {key!r}"
+
+    def test_stats_have_counts_and_caps(self):
+        """Stats should describe the exact returned window, not just its shape."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3, max_occurrences=100
+        )
+        stats = r["stats"]
+        for key in (
+            "max_steps",
+            "max_occurrences",
+            "max_time_ms",
+            "occurrence_count",
+            "event_count",
+            "causal_edge_count",
+            "default_path_event_count",
+            "off_default_event_count",
+            "red_edge_count",
+            "off_default_edge_count",
+            "boundary_edge_count",
+            "frontier_can_extend",
+            "truncated",
+            "truncation_reason",
+        ):
+            assert key in stats, f"stats missing field {key!r}"
+
+        assert stats["event_count"] == len(r["events"])
+        assert stats["causal_edge_count"] == len(r["causal_edges"])
+        assert stats["default_path_event_count"] == len(r["default_path_event_ids"])
+        assert stats["off_default_event_count"] == stats["event_count"] - stats["default_path_event_count"]
+        assert stats["red_edge_count"] + stats["off_default_edge_count"] + stats["boundary_edge_count"] == stats["causal_edge_count"]
+        assert stats["occurrence_count"] >= stats["event_count"] + 1
+        assert stats["max_steps"] == 3
+        assert stats["max_occurrences"] == 100
+        assert stats["max_time_ms"] == 5000
+        assert stats["truncated"] == r["truncated"]
+        assert stats["truncation_reason"] == r["truncation_reason"]
 
     def test_events_have_required_fields(self):
         """Each event must have id, step, occ_id, parent_occ_id, match_idx,
@@ -1199,3 +1248,4 @@ class TestMultiwayCausalGraph:
         if has_step2:
             assert r["truncated"] is True
             assert r["truncation_reason"] == "max_depth"
+            assert r["stats"]["frontier_can_extend"] is True
