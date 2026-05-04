@@ -233,6 +233,12 @@ class TestCanonicalHash:
         h2 = [[10, 10, 11], [11, 12, 13], [13, 14, 14]]
         assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
 
+    def test_multi_digit_labels_remain_stable(self):
+        """Canonicalization must stay exact once labels reach two digits."""
+        h1 = [list(range(11)), [0, 5, 10]]
+        h2 = [list(range(100, 111)), [100, 105, 110]]
+        assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
+
 
 # ── estimate_dimension ────────────────────────────────────────────────
 

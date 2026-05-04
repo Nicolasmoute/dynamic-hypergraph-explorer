@@ -583,8 +583,10 @@ def canonical_hash(hyp: Hypergraph) -> str:
     node_set = set(n for e in hyp for n in e)
     nodes = sorted(node_set)
     N, E = len(nodes), len(hyp)
-    edge_nodes: list[tuple[int, ...]] = [tuple(e) for e in hyp]
+    node_pos = {n: i for i, n in enumerate(nodes)}
+    edge_nodes: list[tuple[int, ...]] = [tuple(node_pos[n] for n in e) for e in hyp]
     edge_lens: list[int] = [len(e) for e in hyp]
+    label_text = [str(i) for i in range(N)]
 
     # Build a per-call node→incident-edge index so each refinement round only
     # inspects the edges that actually touch a node, instead of scanning all
@@ -592,50 +594,60 @@ def canonical_hash(hyp: Hypergraph) -> str:
     incident: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for edge_idx, edge in enumerate(edge_nodes):
         counts: dict[int, int] = defaultdict(int)
-        for n in edge:
-            counts[n] += 1
-        for n, cnt in counts.items():
-            incident[n].append((edge_idx, cnt))
+        for pos in edge:
+            counts[pos] += 1
+        for pos, cnt in counts.items():
+            incident[pos].append((edge_idx, cnt))
 
-    def refine(color0: dict) -> dict:
-        c = dict(color0)
+    def refine(color0: list[int]) -> list[int]:
+        c = list(color0)
         for _ in range(10):
-            sigs = {}
-            for n in nodes:
+            sigs: list[str] = [""] * N
+            for pos in range(N):
                 es = []
-                for edge_idx, cnt in incident.get(n, []):
+                for edge_idx, cnt in incident.get(pos, []):
                     e = edge_nodes[edge_idx]
                     es.append(
-                        f"{cnt}/{edge_lens[edge_idx]}:{','.join(str(c[x]) for x in sorted(e, key=lambda x: c[x]))}"
+                        f"{cnt}/{edge_lens[edge_idx]}:{','.join(str(c[x]) for x in sorted(e, key=c.__getitem__))}"
                     )
                 es.sort()
-                sigs[n] = f"{c[n]}|{';'.join(es)}"
-            uniq = sorted(set(sigs.values()))
+                sigs[pos] = f"{c[pos]}|{';'.join(es)}"
+            uniq = sorted(set(sigs))
             idx = {v: i for i, v in enumerate(uniq)}
             changed = False
-            for n in nodes:
-                nv = idx[sigs[n]]
-                if nv != c[n]:
+            for pos in range(N):
+                nv = idx[sigs[pos]]
+                if nv != c[pos]:
                     changed = True
-                c[n] = nv
+                c[pos] = nv
             if not changed:
                 break
         return c
 
-    def edge_str(relabel: dict) -> str:
-        edges = [sorted(relabel[n] for n in e) for e in hyp]
+    def edge_strings_from_labels(labels: list[int]) -> tuple[str, ...]:
+        edges = []
+        append = edges.append
+        for e in edge_nodes:
+            edge = [label_text[labels[pos]] for pos in e]
+            edge.sort()
+            append(f"[{', '.join(edge)}]")
         edges.sort()
-        return str(edges)
+        return tuple(edges)
+
+    def edge_strings_from_pos_map(relabel: dict[int, int]) -> tuple[str, ...]:
+        labels = [relabel[pos] for pos in range(N)]
+        return edge_strings_from_labels(labels)
 
     init_c = defaultdict(int)
-    for e in hyp:
-        for n in e:
-            init_c[n] += 1
-    color = refine(dict(init_c))
+    for e in edge_nodes:
+        for pos in e:
+            init_c[pos] += 1
+    init_colors = [init_c[pos] for pos in range(N)]
+    color = refine(init_colors)
 
     cells: dict[int, list] = defaultdict(list)
-    for n in nodes:
-        cells[color[n]].append(n)
+    for pos in range(N):
+        cells[color[pos]].append(pos)
     color_order = sorted(cells.keys())
 
     total_perms = 1
@@ -648,26 +660,28 @@ def canonical_hash(hyp: Hypergraph) -> str:
             break
 
     if total_perms <= 5000:
-        best = None
+        best_tokens: tuple[str, ...] | None = None
         cell_arrays = [cells[c] for c in color_order]
+        labels = [-1] * N
 
-        def try_cells(ci, relabel, next_lbl):
-            nonlocal best
+        def try_cells(ci, next_lbl):
+            nonlocal best_tokens
             if ci >= len(cell_arrays):
-                s = edge_str(relabel)
-                if best is None or s < best:
-                    best = s
+                edge_key = edge_strings_from_labels(labels)
+                if best_tokens is None or edge_key < best_tokens:
+                    best_tokens = edge_key
                 return
             for perm in itertools.permutations(cell_arrays[ci]):
-                r = dict(relabel)
                 lbl = next_lbl
-                for n in perm:
-                    r[n] = lbl
+                for pos in perm:
+                    labels[pos] = lbl
                     lbl += 1
-                try_cells(ci + 1, r, lbl)
+                try_cells(ci + 1, lbl)
+                for _ in perm:
+                    labels[_] = -1
 
-        try_cells(0, {}, 0)
-        return f"{N}:{E}:{best}"
+        try_cells(0, 0)
+        return f"{N}:{E}:[{', '.join(best_tokens or ())}]"
 
     # fallback: individualization-refinement with timeout
     t0 = time.time()
@@ -681,18 +695,18 @@ def canonical_hash(hyp: Hypergraph) -> str:
             # at different recursion depths.
             r = {}
             lbl = 0
-            for n in sorted(nodes, key=lambda n: (color[n], n)):
-                r[n] = lbl
+            for pos in sorted(range(N), key=lambda pos: (color[pos], nodes[pos])):
+                r[pos] = lbl
                 lbl += 1
-            return edge_str(r)
+            return f"[{', '.join(edge_strings_from_pos_map(r))}]"
 
-        unassigned = [n for n in nodes if n not in assigned]
+        unassigned = [pos for pos in range(N) if pos not in assigned]
         if not unassigned:
-            return edge_str(assigned)
+            return f"[{', '.join(edge_strings_from_pos_map(assigned))}]"
 
         by_c: dict[int, list] = defaultdict(list)
-        for n in unassigned:
-            by_c[col[n]].append(n)
+        for pos in unassigned:
+            by_c[col[pos]].append(pos)
         c_keys = sorted(by_c.keys())
 
         r = dict(assigned)
@@ -706,14 +720,14 @@ def canonical_hash(hyp: Hypergraph) -> str:
                 ambig = (c, by_c[c])
                 break
         if ambig is None:
-            return edge_str(r)
+            return f"[{', '.join(edge_strings_from_pos_map(r))}]"
 
         best = None
-        for n in ambig[1]:
+        for pos in ambig[1]:
             nr = dict(r)
-            nr[n] = lbl
-            nc = dict(col)
-            nc[n] = max(col[m] for m in nodes) + 1
+            nr[pos] = lbl
+            nc = list(col)
+            nc[pos] = max(col) + 1
             refined = refine(nc)
             candidate = solve(refined, nr, lbl + 1)
             if best is None or candidate < best:
