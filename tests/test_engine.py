@@ -543,6 +543,33 @@ class TestCausalIndexRec2:
 
 # ── compute_multiway_occurrences ──────────────────────────────────────
 
+class TestApplyMatch:
+    """Tests for the private preselected-match rewrite helper."""
+
+    def setup_method(self):
+        engine.reset(1)
+
+    def test_selected_match_matches_apply_rule_once(self):
+        """Preselected-match application must match the indexed public path."""
+        p = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        hyp = [[0, 1], [0, 1], [1, 2]]
+        matches = engine.find_matches(hyp, p["lhs"])
+        assert matches, "expected at least one match"
+
+        mi, binding = matches[0]
+        binding_before = dict(binding)
+        max_node = max(n for edge in hyp for n in edge)
+
+        engine.reset(max_node)
+        helper_result = engine._apply_match(hyp, p["lhs"], p["rhs"], mi, binding)
+
+        engine.reset(max_node)
+        indexed_result = engine.apply_rule_once([e[:] for e in hyp], p["lhs"], p["rhs"], 0)
+
+        assert helper_result == indexed_result
+        assert binding == binding_before, "helper must not mutate the precomputed binding"
+
+
 class TestComputeMultiwayOccurrences:
     """Tests for the occurrence-based multiway BFS (Phase B1)."""
 

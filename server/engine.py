@@ -239,12 +239,10 @@ def _find_matches_gen(hyp: Hypergraph, pattern: list[list[str]],
     yield from rec(0, [], {}, set())
 
 # ── single-match application ─────────────────────────────────────────
-def apply_rule_once(hyp: Hypergraph, lhs, rhs, match_idx: int):
-    matches = find_matches(hyp, lhs)
-    if match_idx >= len(matches):
-        return None
-    mi, binding = matches[match_idx]
+def _apply_match(hyp: Hypergraph, lhs, rhs, mi: list[int], binding: dict):
+    """Apply one preselected match without re-running match discovery."""
     nv = rule_new_vars(lhs, rhs)
+    binding = dict(binding)
     for v in nv:
         binding[v] = fresh()
     matched = set(mi)
@@ -254,6 +252,14 @@ def apply_rule_once(hyp: Hypergraph, lhs, rhs, match_idx: int):
         "state": remaining + produced,
         "event": {"consumed": [hyp[i] for i in mi], "produced": produced},
     }
+
+
+def apply_rule_once(hyp: Hypergraph, lhs, rhs, match_idx: int):
+    matches = find_matches(hyp, lhs)
+    if match_idx >= len(matches):
+        return None
+    mi, binding = matches[match_idx]
+    return _apply_match(hyp, lhs, rhs, mi, binding)
 
 # ── greedy (non-overlapping) application — Rec-1 lazy early-exit ─────
 def apply_all_non_overlapping(hyp: Hypergraph, lhs, rhs):
@@ -1047,9 +1053,8 @@ def compute_multiway_occurrences(
                     truncation_reason = "max_time_ms"
                     break
 
-                result = apply_rule_once([e[:] for e in parent_state], lhs, rhs, mi_idx)
-                if result is None:
-                    continue  # match_idx out of range (shouldn't happen)
+                mi, bind = matches[mi_idx]
+                result = _apply_match(parent_state, lhs, rhs, mi, bind)
 
                 # Normalize fresh node IDs so branch_path indices are replay-
                 # stable regardless of BFS expansion order.  See _normalize_new_nodes.
