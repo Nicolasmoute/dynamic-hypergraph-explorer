@@ -1202,6 +1202,31 @@ def causal_graph_for_path(
     return {"events": events, "causal_edges": causal_edges, "states": states}
 
 
+def _causal_edges_from_event_stream(events: list[dict]) -> list[list[int]]:
+    """Compute live causal edges for an already-ordered event stream.
+
+    Each event must provide ``consumed`` and ``produced`` lists.  This mirrors
+    the provenance bookkeeping in ``causal_graph_for_path()`` but skips rule
+    replay entirely, which is useful when the event stream is already known.
+    """
+    produced_index: dict[tuple, list[int]] = defaultdict(list)
+    causal_edges: list[list[int]] = []
+    for ev_id, ev in enumerate(events):
+        seen_cause_ids: set[int] = set()
+        for consumed_edge in ev["consumed"]:
+            q = produced_index[tuple(consumed_edge)]
+            if q:
+                cause_id = q.pop(0)
+                if cause_id not in seen_cause_ids:
+                    seen_cause_ids.add(cause_id)
+                    causal_edges.append([cause_id, ev_id])
+
+        for produced_edge in ev["produced"]:
+            produced_index[tuple(produced_edge)].append(ev_id)
+
+    return causal_edges
+
+
 # ── multiway causal graph (Phase B2) ─────────────────────────────────
 
 def multiway_causal_graph(
@@ -1357,13 +1382,14 @@ def multiway_causal_graph(
             cur = by_id.get(cur["parent_occ_id"])
         chain: list[dict] = list(reversed(chain_rev))
 
-        # Replay the full path to get correct live-provenance causal edges.
-        replay = causal_graph_for_path(init_state, lhs, rhs, occ["branch_path"])
+        # Reuse the already-recorded occurrence stream for this ancestry chain
+        # instead of replaying the path from scratch.
+        path_edges = _causal_edges_from_event_stream(chain)
 
         # Add only causal edges whose target is B's event (local index d-1).
         # Edges targeting earlier ancestors are emitted when those ancestor
         # occurrences are processed — no duplication, full coverage.
-        for src_local, dst_local in replay["causal_edges"]:
+        for src_local, dst_local in path_edges:
             if dst_local == d - 1:
                 src_occ_id = chain[src_local]["occ_id"]
                 pair = (src_occ_id, occ["occ_id"])

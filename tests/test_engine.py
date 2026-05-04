@@ -844,6 +844,27 @@ class TestCausalGraphForPath:
             f"Expected causal edge [0,1] but got: {r['causal_edges']}"
         )
 
+    def test_occurrence_chain_helper_matches_replay(self):
+        """The occurrence-stream helper must match replay on a live-provenance path."""
+        p = self._parsed()
+        init = [[0, 1]]
+        result = engine.compute_multiway_occurrences(init, p["lhs"], p["rhs"], max_steps=3)
+        by_id = {occ["occ_id"]: occ for occ in result["occurrences"]}
+        target = next(
+            occ for occ in result["occurrences"] if tuple(occ["branch_path"]) == (0, 0, 2)
+        )
+
+        chain = []
+        cur = target
+        while cur["occ_id"] != 0:
+            chain.append(cur)
+            cur = by_id[cur["parent_occ_id"]]
+        chain.reverse()
+
+        helper_edges = engine._causal_edges_from_event_stream(chain)
+        replay = engine.causal_graph_for_path(init, p["lhs"], p["rhs"], target["branch_path"])
+        assert helper_edges == replay["causal_edges"]
+
 
 # ── multiway_causal_graph ─────────────────────────────────────────────
 
