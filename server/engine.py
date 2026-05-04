@@ -15,7 +15,9 @@ from typing import Optional
 # v2 → v3: Phase B1/B2 — occurrence-based multiway BFS adds match_idx /
 #   branch_path fields; multiway_causal_graph() payload uses occ_id as event id.
 #   Old multiway cache entries lack these fields; must be invalidated.
-CACHE_VERSION = "v3"
+# v3 → v4: multiway-causal metadata adds stats fields and cap summaries.
+#   Old cached payloads lack the new metadata and must be regenerated.
+CACHE_VERSION = "v4"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1254,6 +1256,33 @@ def _causal_edges_from_event_stream(events: list[dict]) -> list[list[int]]:
     return causal_edges
 
 
+def _multiway_causal_edge_counts(
+    causal_edges: list[list[int]],
+    default_path_event_ids: list[int],
+) -> dict[str, int]:
+    """Classify causal edges relative to the greedy default path."""
+    default_ids = set(default_path_event_ids)
+    red_edge_count = 0
+    boundary_edge_count = 0
+    off_default_edge_count = 0
+
+    for src, dst in causal_edges:
+        src_on_default = src in default_ids
+        dst_on_default = dst in default_ids
+        if src_on_default and dst_on_default:
+            red_edge_count += 1
+        elif src_on_default or dst_on_default:
+            boundary_edge_count += 1
+        else:
+            off_default_edge_count += 1
+
+    return {
+        "red_edge_count": red_edge_count,
+        "boundary_edge_count": boundary_edge_count,
+        "off_default_edge_count": off_default_edge_count,
+    }
+
+
 # ── multiway causal graph (Phase B2) ─────────────────────────────────
 
 def multiway_causal_graph(
@@ -1441,12 +1470,34 @@ def multiway_causal_graph(
         default_path_event_ids.append(greedy_child["occ_id"])
         cur_occ = greedy_child
 
+    event_count = len(events)
+    causal_edge_count = len(causal_edges)
+    default_path_event_count = len(default_path_event_ids)
+    off_default_event_count = event_count - default_path_event_count
+    edge_counts = _multiway_causal_edge_counts(causal_edges, default_path_event_ids)
+
+    stats = {
+        "max_steps": max_steps,
+        "max_occurrences": max_occurrences,
+        "max_time_ms": max_time_ms,
+        "occurrence_count": len(occs),
+        "event_count": event_count,
+        "causal_edge_count": causal_edge_count,
+        "default_path_event_count": default_path_event_count,
+        "off_default_event_count": off_default_event_count,
+        "frontier_can_extend": bfs.get("frontier_can_extend", False),
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+        **edge_counts,
+    }
+
     return {
         "events": events,
         "causal_edges": causal_edges,
         "default_path_event_ids": default_path_event_ids,
         "truncated": truncated,
         "truncation_reason": truncation_reason,
+        "stats": stats,
     }
 
 

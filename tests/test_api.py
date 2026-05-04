@@ -210,7 +210,7 @@ class TestGetMultiwayCausal:
     def test_response_has_required_keys(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
         for key in ("events", "causal_edges", "default_path_event_ids",
-                    "truncated", "truncation_reason", "meta"):
+                    "truncated", "truncation_reason", "meta", "stats"):
             assert key in data, f"Missing key: {key}"
 
     def test_meta_has_rule_fields(self, client):
@@ -247,6 +247,18 @@ class TestGetMultiwayCausal:
     def test_truncated_field_is_bool(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
         assert isinstance(data["truncated"], bool)
+
+    def test_stats_expose_counts_and_caps(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal?max_steps=2&max_occurrences=100&max_time_ms=2000").json()
+        stats = data["stats"]
+        assert stats["max_steps"] == 2
+        assert stats["max_occurrences"] == 100
+        assert stats["max_time_ms"] == 2000
+        assert stats["event_count"] == len(data["events"])
+        assert stats["causal_edge_count"] == len(data["causal_edges"])
+        assert stats["default_path_event_count"] == len(data["default_path_event_ids"])
+        assert stats["truncated"] == data["truncated"]
+        assert stats["truncation_reason"] == data["truncation_reason"]
 
     def test_low_max_occurrences_triggers_truncation(self, client):
         r = client.get("/api/rules/rule3/multiway-causal?max_occurrences=5&max_steps=4")
@@ -329,7 +341,7 @@ class TestCustomMultiwayCausal:
     def test_response_has_required_keys(self):
         data = self._post().json()
         for key in ("events", "causal_edges", "default_path_event_ids",
-                    "truncated", "truncation_reason", "meta"):
+                    "truncated", "truncation_reason", "meta", "stats"):
             assert key in data, f"Missing key: {key}"
 
     def test_meta_has_notation_and_init(self):
@@ -352,6 +364,18 @@ class TestCustomMultiwayCausal:
     def test_truncated_field_is_bool(self):
         data = self._post().json()
         assert isinstance(data["truncated"], bool)
+
+    def test_stats_expose_counts_and_caps(self):
+        data = self._post(max_steps=2, max_occurrences=100, max_time_ms=2000).json()
+        stats = data["stats"]
+        assert stats["max_steps"] == 2
+        assert stats["max_occurrences"] == 100
+        assert stats["max_time_ms"] == 2000
+        assert stats["event_count"] == len(data["events"])
+        assert stats["causal_edge_count"] == len(data["causal_edges"])
+        assert stats["default_path_event_count"] == len(data["default_path_event_ids"])
+        assert stats["truncated"] == data["truncated"]
+        assert stats["truncation_reason"] == data["truncation_reason"]
 
     def test_low_max_occurrences_triggers_truncation(self):
         data = self._post(max_occurrences=3, max_steps=4).json()
