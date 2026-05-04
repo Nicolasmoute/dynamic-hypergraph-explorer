@@ -734,7 +734,7 @@ function updateCausalViewLabel(view) {
   if (!label) return;
   if (view === 'causal') {
     label.style.display = '';
-    label.textContent = 'Single-history: red = realized/default path';
+    label.textContent = 'Single-history: red = realized slice';
   } else if (view === 'multiway-causal') {
     label.style.display = '';
     label.textContent = 'Multiway Causal: red = default path, green = off-path structure';
@@ -2507,6 +2507,15 @@ function renderMultiwayCausal() {
 
   const nodes = renderEvents.map(ev => Object.assign({ id: ev.id }, posById.get(ev.id)));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
+  const stats = data.stats || {};
+  const statsHasSummary = stats && (
+    stats.event_count != null ||
+    stats.default_path_event_count != null ||
+    stats.off_default_event_count != null ||
+    stats.max_occurrences != null ||
+    stats.max_steps != null ||
+    stats.max_time_ms != null
+  );
 
   g.append('defs').append('marker')
     .attr('id', 'mwc-arrow-red').attr('viewBox', '0 -3 6 6').attr('refX', 8)
@@ -2558,12 +2567,39 @@ function renderMultiwayCausal() {
   const lg = g.append('g').attr('transform', `translate(${width - 200}, 20)`);
   lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');
   lg.append('text').attr('x', 10).attr('y', 4).attr('fill', isDark ? '#aaa' : '#555')
-    .attr('font-size', 11).text('Default path');
+    .attr('font-size', 11).text('Red = default path');
   lg.append('circle').attr('cx', 0).attr('cy', 20).attr('r', 5).attr('fill', '#44dd88');
   lg.append('text').attr('x', 10).attr('y', 24).attr('fill', isDark ? '#aaa' : '#555')
-    .attr('font-size', 11).text('Off-path branch');
+    .attr('font-size', 11).text('Green = off-default branch structure');
 
-  if (truncated) {
+  if (statsHasSummary || truncated) {
+    const eventCount = stats.event_count != null ? stats.event_count : totalVisible;
+    const defaultCount = stats.default_path_event_count != null ? stats.default_path_event_count : defaultPathIds.size;
+    const offDefaultCount = stats.off_default_event_count != null ? stats.off_default_event_count : Math.max(0, eventCount - defaultCount);
+    const capLabel = truncated
+      ? `capped by ${stats.truncation_reason || data.truncation_reason || 'display limit'}`
+      : 'complete';
+    const capSummary = stats.max_occurrences != null || stats.max_steps != null || stats.max_time_ms != null
+      ? [
+          stats.max_steps != null ? `depth ${stats.max_steps}` : null,
+          stats.max_occurrences != null ? `occ ${stats.max_occurrences.toLocaleString()}` : null,
+          stats.max_time_ms != null ? `time ${stats.max_time_ms}ms` : null,
+        ].filter(Boolean).join(' · ')
+      : '';
+    const bannerText = [
+      capLabel,
+      `${eventCount.toLocaleString()} events`,
+      `${defaultCount.toLocaleString()} default-path`,
+      `${offDefaultCount.toLocaleString()} off-default`
+    ].concat(capSummary ? [`limits ${capSummary}`] : []).join(' · ');
+    svg.append('text')
+      .attr('x', width / 2).attr('y', 14)
+      .attr('text-anchor', 'middle')
+      .attr('fill', isDark ? '#f0a040' : '#b06000')
+      .attr('font-size', 11)
+      .attr('font-family', "'JetBrains Mono', monospace")
+      .text(bannerText);
+  } else if (truncated) {
     const bannerText = clientTruncated
       ? `Showing most recent ${CAUSAL_NODE_CAP.toLocaleString()} of ${totalVisible.toLocaleString()} events`
       : (data.truncation_reason || 'Multiway causal graph truncated');
