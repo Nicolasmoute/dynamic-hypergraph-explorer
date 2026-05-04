@@ -233,11 +233,17 @@ class TestCanonicalHash:
         h2 = [[10, 10, 11], [11, 12, 13], [13, 14, 14]]
         assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
 
-    def test_multi_digit_labels_remain_stable(self):
-        """Canonicalization must stay exact once labels reach two digits."""
-        h1 = [list(range(11)), [0, 5, 10]]
-        h2 = [list(range(100, 111)), [100, 105, 110]]
+    def test_multi_digit_labels_keep_exact_canonical_form(self):
+        """Canonicalization must preserve the baseline exact string format."""
+        h1 = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [0, 5, 10]]
+        h2 = [[100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110], [100, 105, 110]]
+        assert engine.canonical_hash(h1) == "11:2:[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [8, 9, 10]]"
         assert engine.canonical_hash(h1) == engine.canonical_hash(h2)
+
+    def test_duplicate_node_edge_exact_format(self):
+        """Repeated nodes inside edges must preserve the old canonical ordering."""
+        hyp = [[1, 2, 4, 1, 3], [2, 4, 1, 3]]
+        assert engine.canonical_hash(hyp) == "4:2:[[0, 1, 2, 3], [0, 1, 2, 3, 3]]"
 
 
 # ── estimate_dimension ────────────────────────────────────────────────
