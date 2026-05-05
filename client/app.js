@@ -1247,13 +1247,22 @@ function renderSpatialCanvas() {
   // skip interaction on <circle> and <path> elements only.
   svg.on('mousedown.nudge', null).on('mousemove.nudge', null).on('mouseup.nudge', null);
   svg.on('click', function(e) { if (e.target === this) clearLineage(); });
-  // LEVER-1: on pointermove, flag an immediate overlay refresh so that hover intent
-  // keeps overlay positions fresh.  By the time the user clicks (mouse movement has
-  // stopped), the overlay was refreshed within the last rAF cycle (≤16ms stale rather
-  // than up to 100ms).  Note: browser hit-testing is resolved before any JS runs, so
-  // no JS-side handler can change the already-chosen click target — the ≤16ms bound
-  // is the best achievable accuracy with this throttle approach.
-  svg.on('pointermove.overlayRefresh', () => { _overlayNeedsImmediateUpdate = true; });
+  function _syncOverlayHitTestLayer() {
+    _lastOverlayUpdateMs = performance.now();
+    _overlayNeedsImmediateUpdate = false;
+    overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
+    overlayNodeG.selectAll('circle')
+      .attr('cx', d => d.x != null ? d.x : 0)
+      .attr('cy', d => d.y != null ? d.y : 0);
+  }
+  // LEVER-1: keep the SVG hit-test layer fresh on worker ticks, and force a
+  // synchronous refresh when the user is about to click or start a drag.  Pointer
+  // hover still marks the next tick as urgent, but click/drag entry gets an immediate
+  // overlay sync so stale geometry does not survive into the interaction.
+  svg.on(
+    'pointermove.overlayRefresh pointerdown.overlayRefresh mousedown.overlayRefresh touchstart.overlayRefresh',
+    () => { _overlayNeedsImmediateUpdate = true; _syncOverlayHitTestLayer(); }
+  );
 
   const overlayG     = svg.append('g');
   const overlayEdgeG = overlayG.append('g');  // edges below nodes (z-order)
@@ -1362,18 +1371,13 @@ function renderSpatialCanvas() {
     // LEVER-1: throttle overlay setAttribute storm to ≤10fps (100ms interval).
     // The overlay is used for click/drag hit-testing; positions only need to be
     // fresh when the user is about to interact, not at full simulation frame rate.
-    // _overlayNeedsImmediateUpdate is set on pointermove (see LEVER-1 above) so
-    // the overlay is fresh by the time the user lifts to click.
+    // Pointer entry marks the next worker tick urgent and also syncs the hit-test
+    // layer immediately so clicks and drags see the freshest SVG geometry.
     const overlayActive = !_isScrubbing || nodes.length <= _OVERLAY_NODE_THRESH;
     if (overlayActive) {
       const now = performance.now();
       if (_overlayNeedsImmediateUpdate || now - _lastOverlayUpdateMs >= _OVERLAY_UPDATE_INTERVAL_MS) {
-        _lastOverlayUpdateMs = now;
-        _overlayNeedsImmediateUpdate = false;
-        overlayEdgeG.selectAll('path').attr('d', _overlayEdgePath);
-        overlayNodeG.selectAll('circle')
-          .attr('cx', d => d.x != null ? d.x : 0)
-          .attr('cy', d => d.y != null ? d.y : 0);
+        _syncOverlayHitTestLayer();
       }
     }
   }
@@ -1593,6 +1597,7 @@ function renderSpatialCanvas() {
           .on('mouseleave', hideTooltip)
           .call(d3.drag()
             .on('start', (e, d) => {
+              _syncOverlayHitTestLayer();
               d.fx = d.x; d.fy = d.y;
               // Reheat the worker so it keeps ticking during the drag.
               if (_layoutWorker && _activeGraphId) {
