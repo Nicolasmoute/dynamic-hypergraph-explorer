@@ -9,6 +9,7 @@ For testing against a live Zeabur deployment, see:
   knowledge/devx/deploy-verification-plan.md
 """
 from __future__ import annotations
+from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from server.main import app
@@ -54,6 +55,13 @@ class TestClientServing:
         r = client.get("/app.js")
         if r.status_code == 200:
             assert "javascript" in r.headers.get("content-type", "")
+
+    def test_multiway_causal_red_uses_realized_events(self):
+        app_js = Path(__file__).resolve().parents[1] / "client" / "app.js"
+        text = app_js.read_text()
+        assert "data.realized_events" in text
+        assert "data.realized_causal_edges" in text
+        assert "Red = realized greedy evolution" in text
 
 
 class TestAPISurface:
