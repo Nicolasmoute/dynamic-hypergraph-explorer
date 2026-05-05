@@ -738,7 +738,7 @@ function updateCausalViewLabel(view) {
     label.textContent = 'Single-history: red = realized slice';
   } else if (view === 'multiway-causal') {
     label.style.display = '';
-    label.textContent = 'Multiway Causal: red = default path, green = off-path structure';
+    label.textContent = 'Multiway Causal: red = realized greedy evolution, green = alternative structure';
   } else {
     label.style.display = 'none';
     label.textContent = '';
