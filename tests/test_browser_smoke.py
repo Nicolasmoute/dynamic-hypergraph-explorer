@@ -195,3 +195,74 @@ class TestBrowserSmoke:
         assert result["redCount"] == 15
         assert result["uniqueRedCount"] == 15
         assert result["yMultiplicity"] == [1, 2, 4, 8]
+
+    def test_multiway_causal_coordinates_ignore_red_membership(
+        self, live_server: str, page: Page
+    ) -> None:
+        """Contract §6: Lambda(event) is independent of default_path_event_ids."""
+        self._wait_for_app_ready(page, live_server)
+
+        page.locator("#card-rule3").click()
+        page.wait_for_function(
+            "() => MWCAUSAL && MWCAUSAL.rule3 && MWCAUSAL.rule3.events",
+            timeout=_LOAD_TIMEOUT,
+        )
+        page.get_by_role("button", name="Multiway Causal").click()
+        page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
+        page.wait_for_function(
+            """() => document.querySelectorAll(
+                '#multiway-causal-svg circle[data-event-id]'
+            ).length > 0""",
+            timeout=_LOAD_TIMEOUT,
+        )
+
+        comparison = page.evaluate(
+            """() => {
+                function coords() {
+                    const out = {};
+                    document.querySelectorAll('#multiway-causal-svg circle[data-event-id]')
+                        .forEach(n => {
+                            out[n.getAttribute('data-event-id')] = {
+                                x: Number(n.getAttribute('cx')),
+                                y: Number(n.getAttribute('cy')),
+                                red: n.getAttribute('data-red') === 'true',
+                            };
+                        });
+                    return out;
+                }
+
+                const original = MWCAUSAL.rule3;
+                const redIds = original.default_path_event_ids.map(String);
+                renderMultiwayCausal();
+                const withRed = coords();
+
+                MWCAUSAL.rule3 = {
+                    ...original,
+                    default_path_event_ids: [],
+                    events: original.events.map(ev => {
+                        const copy = {...ev};
+                        if (redIds.includes(String(copy.id))) {
+                            copy.layout = undefined;
+                        }
+                        return copy;
+                    }),
+                };
+                renderMultiwayCausal();
+                const withoutRed = coords();
+                MWCAUSAL.rule3 = original;
+                renderMultiwayCausal();
+
+                return redIds.map(id => ({
+                    id,
+                    before: withRed[id],
+                    after: withoutRed[id],
+                }));
+            }"""
+        )
+
+        assert comparison
+        for item in comparison:
+            assert item["before"] is not None, item
+            assert item["after"] is not None, item
+            assert item["before"]["x"] == item["after"]["x"], item
+            assert item["before"]["y"] == item["after"]["y"], item

@@ -2490,7 +2490,7 @@ function renderMultiwayCausal() {
   // styling red/green; never lay out a separate red-only node set.
   const layoutDepth = ev => {
     if (ev.layout && ev.layout.depth != null) return ev.layout.depth;
-    if (defaultPathIds.has(ev.id) && ev.single_history_step != null) return ev.single_history_step;
+    if (ev.single_history_step != null) return ev.single_history_step;
     return ev.step || 0;
   };
   const layoutOrder = ev => {

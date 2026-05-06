@@ -1090,6 +1090,7 @@ class TestMultiwayCausalGraph:
             assert ev["greedy_index"] is not None
 
     @pytest.mark.parametrize("notation, init, expected_batches", [
+        ("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}", [[0, 0], [0, 0]], [1, 2, 4, 8]),
         ("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], [1, 2, 4, 8]),
         ("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}", [[0, 1, 2]], [1, 3, 9, 27]),
         (
