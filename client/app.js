@@ -2539,14 +2539,23 @@ function renderMultiwayCausal() {
   const usableH = height - PAD_Y - 16;
   const posById = new Map();
 
+  const canonicalLayerOrder = (a, b) =>
+    (layoutOrder(a) - layoutOrder(b)) ||
+    layoutKey(a).localeCompare(layoutKey(b)) ||
+    String(a.id).localeCompare(String(b.id));
+
   for (const [step, group] of stepGroups.entries()) {
     const y = PAD_Y + step * usableH / maxStep;
-    group.sort((a, b) =>
-      (layoutOrder(a) - layoutOrder(b)) ||
-      layoutKey(a).localeCompare(layoutKey(b)) ||
-      String(a.id).localeCompare(String(b.id))
-    );
-    group.forEach((ev, i) => {
+    const sorted = group.slice().sort(canonicalLayerOrder);
+    const reds = sorted.filter(ev => defaultPathIds.has(ev.id));
+    const greens = sorted.filter(ev => !defaultPathIds.has(ev.id));
+    const greenSplit = Math.ceil(greens.length / 2);
+    const ordered = reds.length > 0
+      ? greens.slice(0, greenSplit)
+          .concat(reds)
+          .concat(greens.slice(greenSplit))
+      : sorted;
+    ordered.forEach((ev, i) => {
       const x = group.length === 1
         ? width / 2
         : PAD_X + usableW * i / (group.length - 1);
