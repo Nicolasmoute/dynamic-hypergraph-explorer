@@ -1468,28 +1468,62 @@ def multiway_causal_graph(
     events_by_step: dict[int, list[dict]] = defaultdict(list)
     for ev in events:
         events_by_step[ev["step"]].append(ev)
+    incoming_by_event_id: dict[int, list[int]] = defaultdict(list)
+    for src, dst in causal_edges:
+        incoming_by_event_id[dst].append(src)
+    greedy_step_by_event_id: dict[int, int] = {
+        ev["id"]: step
+        for step, step_events in enumerate(greedy["events"], start=1)
+        for ev in step_events
+    }
+    greedy_causes_by_event_id: dict[int, list[int]] = defaultdict(list)
+    for src, dst in greedy["causal_edges"]:
+        greedy_causes_by_event_id[dst].append(src)
 
     default_path_event_ids: list[int] = []
     used_event_ids: set[int] = set()
-    for step, step_events in enumerate(greedy["events"], start=1):
+    red_event_ids: set[int] = set()
+    greedy_to_occ_id: dict[int, int] = {}
+    for greedy_event in (
+        ev for step_events in greedy["events"] for ev in step_events
+    ):
+        step = greedy_step_by_event_id[greedy_event["id"]]
         candidates = events_by_step.get(step, [])
-        for greedy_event in step_events:
-            signature = _event_shape_signature(greedy_event)
-            match = next(
-                (
-                    ev for ev in candidates
-                    if ev["id"] not in used_event_ids
-                    and _event_shape_signature(ev) == signature
-                ),
-                None,
-            )
-            if match is None:
-                # The occurrence BFS may be truncated before all greedy events
-                # at this step have appeared.  Keep the embedded set honest:
-                # every returned red ID is an existing occurrence event.
-                continue
-            used_event_ids.add(match["id"])
-            default_path_event_ids.append(match["id"])
+        signature = _event_shape_signature(greedy_event)
+        expected_red_causes = sorted(
+            greedy_to_occ_id[cause_id]
+            for cause_id in greedy_causes_by_event_id[greedy_event["id"]]
+            if cause_id in greedy_to_occ_id
+        )
+        exact_match = next(
+            (
+                ev for ev in candidates
+                if ev["id"] not in used_event_ids
+                and _event_shape_signature(ev) == signature
+                and sorted(
+                    src for src in incoming_by_event_id.get(ev["id"], [])
+                    if src in red_event_ids
+                ) == expected_red_causes
+            ),
+            None,
+        )
+        match = exact_match or next(
+            (
+                ev for ev in candidates
+                if ev["id"] not in used_event_ids
+                and _event_shape_signature(ev) == signature
+            ),
+            None,
+        )
+        if match is None:
+            # The occurrence BFS may be truncated before all greedy events at
+            # this step have appeared.  Keep the embedded set honest: every
+            # returned red ID is an existing occurrence event.
+            continue
+        used_event_ids.add(match["id"])
+        red_event_ids.add(match["id"])
+        greedy_to_occ_id[greedy_event["id"]] = match["id"]
+        default_path_event_ids.append(match["id"])
 
     embedded_red_count = len(default_path_event_ids)
     stats = {
