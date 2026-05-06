@@ -24,7 +24,9 @@ from typing import Optional
 #   multiway occurrence-ID space.
 # v6 → v7: default_path_event_ids now embeds the full Single-History greedy
 #   parallel event set, not one serial child per depth.
-CACHE_VERSION = "v7"
+# v7 → v8: embedded red IDs use an explicit Single-History occurrence trace so
+#   the induced red causal topology matches evolve() for duplicate-heavy rules.
+CACHE_VERSION = "v8"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1278,6 +1280,72 @@ def _event_shape_signature(ev: dict) -> tuple:
     )
 
 
+def _single_history_occurrence_trace(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    max_steps: int,
+    start_occ_id: int,
+    time_limit_ms: int = 5000,
+) -> dict:
+    """Build red occurrence events from the exact Single-History evolution.
+
+    The multiway occurrence BFS branches one serial rewrite at a time.  A
+    Single-History step, however, fires all non-overlapping matches in parallel;
+    for duplicate-heavy multi-edge rules, selecting same-depth sibling
+    occurrences by local shape can leave stale duplicate instances in ancestry
+    and changes the induced red causal topology.  This helper embeds the actual
+    ``evolve()`` event stream as occurrence events in the same ``events`` array
+    and maps ``evolve()["causal_edges"]`` onto those occurrence IDs.
+    """
+    greedy = evolve(
+        init_state,
+        lhs,
+        rhs,
+        max_steps,
+        time_limit_ms=time_limit_ms,
+    )
+
+    red_events: list[dict] = []
+    default_path_event_ids: list[int] = []
+    greedy_to_occ_id: dict[int, int] = {}
+    next_occ_id = start_occ_id
+    parent_occ_id: Optional[int] = None
+    branch_path: list[int] = [-1]
+
+    for step, step_events in enumerate(greedy["events"], start=1):
+        for step_event_index, ev in enumerate(step_events):
+            occ_id = next_occ_id
+            next_occ_id += 1
+            greedy_to_occ_id[ev["id"]] = occ_id
+            default_path_event_ids.append(occ_id)
+            branch_path = branch_path + [step_event_index]
+            red_events.append({
+                "id": occ_id,
+                "step": step,
+                "occ_id": occ_id,
+                "parent_occ_id": parent_occ_id,
+                "match_idx": step_event_index,
+                "consumed": ev["consumed"],
+                "produced": ev["produced"],
+                "branch_path": branch_path[:],
+            })
+            parent_occ_id = occ_id
+
+    red_causal_edges = [
+        [greedy_to_occ_id[src], greedy_to_occ_id[dst]]
+        for src, dst in greedy["causal_edges"]
+        if src in greedy_to_occ_id and dst in greedy_to_occ_id
+    ]
+
+    return {
+        "events": red_events,
+        "causal_edges": red_causal_edges,
+        "default_path_event_ids": default_path_event_ids,
+        "greedy_event_count": sum(len(step_events) for step_events in greedy["events"]),
+    }
+
+
 # ── multiway causal graph (Phase B2) ─────────────────────────────────
 
 def multiway_causal_graph(
@@ -1311,12 +1379,11 @@ def multiway_causal_graph(
 
     **Embedded Single-History greedy event set**
 
-    ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
-    whose normalized consumed/produced event shapes are fired by deterministic
-    Single-History greedy evolution (``evolve()``, via
-    ``apply_all_non_overlapping()``).  These occurrence IDs are the red embedded
-    event set in the client; all other occurrence events remain green multiway
-    alternatives.
+    ``default_path_event_ids`` contains the ``occ_id``\\s of explicit
+    occurrence events for deterministic Single-History greedy evolution
+    (``evolve()``, via ``apply_all_non_overlapping()``).  These occurrence IDs
+    are the red embedded event set in the client; all other occurrence events
+    remain green multiway alternatives.
 
     **Truncation**
 
@@ -1453,77 +1520,34 @@ def multiway_causal_graph(
     # ── 4. Embedded Single-History greedy event set ──────────────────
     #
     # Red is not a separate realized namespace.  It is the full event set fired
-    # by Single-History greedy parallel evolution, projected onto existing
-    # multiway occurrence IDs.  We compare alpha-normalized event shapes because
-    # parallel evolution and occurrence replay allocate fresh node IDs in
-    # different, but locally isomorphic, contexts.
-    greedy = evolve(
+    # by Single-History greedy parallel evolution, embedded as occurrence events
+    # in the same events/causal_edges payload so the induced red topology is
+    # exactly the Single-History causal topology.
+    red_trace = _single_history_occurrence_trace(
         init_state,
         lhs,
         rhs,
         max_steps,
+        start_occ_id=(max((ev["id"] for ev in events), default=0) + 1),
         time_limit_ms=max_time_ms,
     )
-    greedy_flat_event_count = sum(len(step_events) for step_events in greedy["events"])
-    events_by_step: dict[int, list[dict]] = defaultdict(list)
-    for ev in events:
-        events_by_step[ev["step"]].append(ev)
-    incoming_by_event_id: dict[int, list[int]] = defaultdict(list)
-    for src, dst in causal_edges:
-        incoming_by_event_id[dst].append(src)
-    greedy_step_by_event_id: dict[int, int] = {
-        ev["id"]: step
-        for step, step_events in enumerate(greedy["events"], start=1)
-        for ev in step_events
-    }
-    greedy_causes_by_event_id: dict[int, list[int]] = defaultdict(list)
-    for src, dst in greedy["causal_edges"]:
-        greedy_causes_by_event_id[dst].append(src)
+    events.extend(red_trace["events"])
+    causal_edges.extend(red_trace["causal_edges"])
+    default_path_event_ids: list[int] = red_trace["default_path_event_ids"]
+    greedy_flat_event_count = red_trace["greedy_event_count"]
 
-    default_path_event_ids: list[int] = []
-    used_event_ids: set[int] = set()
-    red_event_ids: set[int] = set()
-    greedy_to_occ_id: dict[int, int] = {}
-    for greedy_event in (
-        ev for step_events in greedy["events"] for ev in step_events
-    ):
-        step = greedy_step_by_event_id[greedy_event["id"]]
-        candidates = events_by_step.get(step, [])
-        signature = _event_shape_signature(greedy_event)
-        expected_red_causes = sorted(
-            greedy_to_occ_id[cause_id]
-            for cause_id in greedy_causes_by_event_id[greedy_event["id"]]
-            if cause_id in greedy_to_occ_id
-        )
-        exact_match = next(
-            (
-                ev for ev in candidates
-                if ev["id"] not in used_event_ids
-                and _event_shape_signature(ev) == signature
-                and sorted(
-                    src for src in incoming_by_event_id.get(ev["id"], [])
-                    if src in red_event_ids
-                ) == expected_red_causes
-            ),
-            None,
-        )
-        match = exact_match or next(
-            (
-                ev for ev in candidates
-                if ev["id"] not in used_event_ids
-                and _event_shape_signature(ev) == signature
-            ),
-            None,
-        )
-        if match is None:
-            # The occurrence BFS may be truncated before all greedy events at
-            # this step have appeared.  Keep the embedded set honest: every
-            # returned red ID is an existing occurrence event.
-            continue
-        used_event_ids.add(match["id"])
-        red_event_ids.add(match["id"])
-        greedy_to_occ_id[greedy_event["id"]] = match["id"]
-        default_path_event_ids.append(match["id"])
+    if len(events) > max_occurrences and len(default_path_event_ids) < max_occurrences:
+        red_id_set = set(default_path_event_ids)
+        green_budget = max_occurrences - len(default_path_event_ids)
+        kept_green_events = [ev for ev in events if ev["id"] not in red_id_set][:green_budget]
+        events = kept_green_events + red_trace["events"]
+        kept_event_ids = {ev["id"] for ev in events}
+        causal_edges = [
+            [src, dst] for src, dst in causal_edges
+            if src in kept_event_ids and dst in kept_event_ids
+        ]
+        truncated = True
+        truncation_reason = truncation_reason or "max_occurrences"
 
     embedded_red_count = len(default_path_event_ids)
     stats = {

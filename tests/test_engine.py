@@ -1067,6 +1067,28 @@ class TestMultiwayCausalGraph:
 
         assert induced_red_edges == greedy_edges
 
+    def test_rule1_default_path_induced_edges_match_single_history(self):
+        """Repeated same-shape multi-edge events keep evolve() topology."""
+        p = engine.parse_notation("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}")
+        init = [[0, 0], [0, 0]]
+        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
+        red_index = {
+            event_id: idx
+            for idx, event_id in enumerate(r["default_path_event_ids"])
+        }
+        induced_red_edges = sorted(
+            (red_index[src], red_index[dst])
+            for src, dst in r["causal_edges"]
+            if src in red_index and dst in red_index
+        )
+        greedy_edges = sorted(
+            tuple(edge)
+            for edge in engine.evolve(init, p["lhs"], p["rhs"], 4)["causal_edges"]
+        )
+
+        assert len(r["default_path_event_ids"]) == 15
+        assert induced_red_edges == greedy_edges
+
     # ── co-historical guarantee (Sofia) ───────────────────────────────
 
     def test_causal_edges_respect_ancestry(self):
