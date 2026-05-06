@@ -2486,7 +2486,13 @@ function renderMultiwayCausal() {
   const eventInfo = {};
   const occurrenceEvents = data.events.map(ev => Object.assign({ mwcKind: 'occurrence' }, ev));
   const realizedEvents = Array.isArray(data.realized_events)
-    ? data.realized_events.map(ev => Object.assign({ mwcKind: 'realized' }, ev))
+    ? data.realized_events
+        .map(ev => Object.assign(
+          {},
+          ev,
+          { mwcKind: 'realized', step: Math.max(0, (ev.step || 0) - 1) }
+        ))
+        .filter(ev => ev.step < currentStep)
     : [];
   const events = occurrenceEvents.concat(realizedEvents)
     .sort((a, b) => (a.step - b.step) || String(a.id).localeCompare(String(b.id)));
@@ -2601,9 +2607,9 @@ function renderMultiwayCausal() {
     .attr('font-size', 11).text('Green = alternative multiway structure');
 
   if (statsHasSummary || truncated) {
-    const eventCount = stats.event_count != null ? stats.event_count : occurrenceEvents.length;
-    const realizedCount = stats.realized_event_count != null ? stats.realized_event_count : realizedEvents.length;
-    const offDefaultCount = stats.off_default_event_count != null ? stats.off_default_event_count : eventCount;
+    const eventCount = totalVisible;
+    const realizedCount = realizedEvents.length;
+    const offDefaultCount = stats.off_default_event_count != null ? stats.off_default_event_count : occurrenceEvents.length;
     const capLabel = truncated
       ? `capped by ${stats.truncation_reason || data.truncation_reason || 'display limit'}`
       : 'complete';
