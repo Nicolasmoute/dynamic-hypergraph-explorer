@@ -5,6 +5,7 @@ Run from the repo root:
     pytest
 """
 from __future__ import annotations
+from collections import Counter
 import pytest
 from server import engine
 
@@ -910,8 +911,11 @@ class TestMultiwayCausalGraph:
         r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=2)
         for ev in r["events"]:
             for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
-                          "consumed", "produced", "branch_path"):
+                          "consumed", "produced", "branch_path", "serial_depth",
+                          "single_history_step", "single_history_batch_index",
+                          "greedy_index", "layout"):
                 assert field in ev, f"event missing field {field!r}: {ev}"
+            assert "depth" in ev["layout"], f"event missing layout.depth: {ev}"
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""
@@ -1050,6 +1054,66 @@ class TestMultiwayCausalGraph:
             for ev in greedy_events
         ]
 
+    def test_rule3_red_layout_depth_uses_greedy_batches_not_serial_depth(self):
+        """Contract §6: red visual layers follow greedy batches, not branch depth."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
+
+        assert len(red_events) == 15
+        assert Counter(ev["layout"]["depth"] for ev in red_events) == Counter({
+            1: 1, 2: 2, 3: 4, 4: 8,
+        })
+        assert [ev["serial_depth"] for ev in red_events] == list(range(1, 16))
+        assert Counter(ev["serial_depth"] for ev in red_events) != Counter(
+            ev["layout"]["depth"] for ev in red_events
+        )
+
+    def test_rule3_red_ids_have_no_sentinel_or_realized_coordinates(self):
+        """Contract §6/§9: red is ordinary-event layout metadata, not a red axis."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        for eid in r["default_path_event_ids"]:
+            ev = ev_by_id[eid]
+            assert all(idx >= 0 for idx in ev["branch_path"])
+            assert ev.get("mwcKind") != "realized"
+            assert ev["layout"]["depth"] == ev["single_history_step"]
+            assert ev["single_history_batch_index"] is not None
+            assert ev["greedy_index"] is not None
+
+    @pytest.mark.parametrize("notation, init, expected_batches", [
+        ("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]], [1, 2, 4, 8]),
+        ("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}", [[0, 1, 2]], [1, 3, 9, 27]),
+        (
+            "{{x,y,z},{z,u,v}} -> {{y,z,u},{v,w,x},{w,y,v}}",
+            [[0,1,2],[2,3,4],[4,5,6],[6,7,8],[8,9,0],[1,3,5],[5,7,9],[9,1,3]],
+            [4, 6, 7, 12],
+        ),
+    ])
+    def test_red_layout_depth_multiplicities_match_greedy_batches(
+        self, notation, init, expected_batches
+    ):
+        """Contract §8/§11: visual red layers match Single-History batches."""
+        p = engine.parse_notation(notation)
+        r = engine.multiway_causal_graph(
+            init, p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
+        assert [
+            Counter(ev["layout"]["depth"] for ev in red_events)[depth]
+            for depth in range(1, len(expected_batches) + 1)
+        ] == expected_batches
+
     @pytest.mark.parametrize("notation, init", [
         ("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}", [[0, 0], [0, 0]]),
         ("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]]),
@@ -1092,6 +1156,44 @@ class TestMultiwayCausalGraph:
 
         assert len(r["default_path_event_ids"]) == greedy_count
         assert induced_red_edges == greedy_edges
+
+    def test_rule1_exact_induced_red_edges(self):
+        """Duplicate-sensitive contract fixture: rule1 exact red topology."""
+        p = engine.parse_notation("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}")
+        r = engine.multiway_causal_graph(
+            [[0, 0], [0, 0]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
+        red_index = {eid: idx for idx, eid in enumerate(r["default_path_event_ids"])}
+        induced_red_edges = sorted(
+            (red_index[src], red_index[dst])
+            for src, dst in r["causal_edges"]
+            if src in red_index and dst in red_index
+        )
+        assert induced_red_edges == [
+            (0,1),(0,2),(1,3),(1,4),(1,5),(2,4),(2,5),(2,6),
+            (3,7),(3,8),(4,9),(4,10),(4,11),(5,10),(5,11),
+            (5,12),(5,13),(6,12),(6,13),(6,14),
+        ]
+
+    def test_rule3_exact_induced_red_edges(self):
+        """Contract fixture: rule3 exact red topology plus 15 event count."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
+        red_index = {eid: idx for idx, eid in enumerate(r["default_path_event_ids"])}
+        induced_red_edges = sorted(
+            (red_index[src], red_index[dst])
+            for src, dst in r["causal_edges"]
+            if src in red_index and dst in red_index
+        )
+        assert len(r["default_path_event_ids"]) == 15
+        assert induced_red_edges == [
+            (0,1),(0,2),(1,3),(1,4),(2,5),(2,6),(3,7),(3,8),
+            (4,9),(4,10),(5,11),(5,12),(6,13),(6,14),
+        ]
 
     # ── co-historical guarantee (Sofia) ───────────────────────────────
 
@@ -1157,6 +1259,24 @@ class TestMultiwayCausalGraph:
         )
         assert r["truncated"] is True
         assert r["truncation_reason"] in ("max_occurrences", "max_time_ms", "max_depth")
+
+    def test_low_cap_red_prefix_preserves_layout_metadata(self):
+        """Low-cap red prefix keeps full greedy count plus prefix layout layers."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=5, max_time_ms=1000,
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
+
+        assert r["truncated"] is True
+        assert r["stats"]["single_history_greedy_event_count"] == 15
+        assert r["stats"]["embedded_red_event_count"] == len(red_events)
+        assert [ev["greedy_index"] for ev in red_events] == list(range(len(red_events)))
+        assert Counter(ev["layout"]["depth"] for ev in red_events) == Counter({
+            1: 1, 2: 2, 3: 1,
+        })
 
     def test_max_depth_truncation_reported(self):
         """When BFS stops at max_steps depth, truncated=True with reason 'max_depth'."""

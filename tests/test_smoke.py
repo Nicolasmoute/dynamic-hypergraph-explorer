@@ -62,8 +62,14 @@ class TestClientServing:
         assert "default_path_event_ids" in text
         assert "data.realized_events" not in text
         assert "data.realized_causal_edges" not in text
+        assert "branch_path=[-1]" not in text
+        assert "mwcKind: 'realized'" not in text
         assert "Red = Single-History greedy events" in text
         assert "serial occurrence path" not in text
+        assert "layoutDepth" in text
+        assert "ev.layout.depth" in text
+        assert "data-event-id" in text
+        assert "data-red" in text
 
 
 class TestAPISurface:

@@ -26,7 +26,9 @@ from typing import Optional
 #   parallel event set, not one serial child per depth.
 # v7 → v8: the greedy Single-History serial occurrence path is guaranteed to be
 #   present in the multiway occurrence set before event/causal-edge construction.
-CACHE_VERSION = "v8"
+# v8 → v9: multiway_causal_graph() adds explicit serial/layout metadata and
+#   embeds red by private edge-instance identity instead of local shape fallback.
+CACHE_VERSION = "v9"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1280,6 +1282,130 @@ def _event_shape_signature(ev: dict) -> tuple:
     )
 
 
+def _edge_token_state(init_state: Hypergraph) -> list[dict]:
+    """Return tokenized live edge instances for a private replay helper."""
+    return [
+        {"edge": edge[:], "token": ("init", idx)}
+        for idx, edge in enumerate(init_state)
+    ]
+
+
+def _public_state(token_state: list[dict]) -> Hypergraph:
+    return [item["edge"][:] for item in token_state]
+
+
+def _apply_greedy_token_step(
+    token_state: list[dict],
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    next_greedy_index: int,
+) -> tuple[list[dict], list[dict]]:
+    """Mirror apply_all_non_overlapping while preserving edge-instance tokens."""
+    public_state = _public_state(token_state)
+    nv = rule_new_vars(lhs, rhs)
+    pe_len = len(lhs[0]) if lhs else 0
+    selected: list[tuple[list[int], dict]] = []
+
+    if len(lhs) == 1:
+        pe = lhs[0]
+        for i, edge in enumerate(public_state):
+            if len(edge) != pe_len:
+                continue
+            if i & 1023 == 0 and _is_cancelled():
+                break
+            perms = _edge_perms(edge)
+            bind = dict(zip(pe, perms[0]))
+            selected.append(([i], bind))
+    else:
+        free_by_len: Counter = Counter(len(edge) for edge in public_state)
+        lhs_needs: Counter = Counter(len(pe) for pe in lhs)
+        if any(free_by_len[L] < lhs_needs[L] for L in lhs_needs):
+            return token_state, []
+
+        committed: set[int] = set()
+        for mi, bind in _find_matches_gen(public_state, lhs, committed=committed):
+            if any(i in committed for i in mi):
+                continue
+            selected.append((mi, bind))
+            committed.update(mi)
+            for i in mi:
+                free_by_len[len(public_state[i])] -= 1
+            if any(free_by_len[L] < lhs_needs[L] for L in lhs_needs):
+                break
+
+    if not selected:
+        return token_state, []
+
+    matched = {idx for mi, _ in selected for idx in mi}
+    remaining = [
+        {"edge": item["edge"][:], "token": item["token"]}
+        for idx, item in enumerate(token_state)
+        if idx not in matched
+    ]
+    events: list[dict] = []
+    produced_items: list[dict] = []
+
+    for batch_index, (mi, bind) in enumerate(selected):
+        bind = dict(bind)
+        for v in nv:
+            bind[v] = fresh()
+        greedy_index = next_greedy_index + batch_index
+        produced = [[bind[v] for v in re] for re in rhs]
+        produced_tokens = [
+            ("greedy", greedy_index, rhs_idx)
+            for rhs_idx in range(len(produced))
+        ]
+        produced_items.extend(
+            {"edge": edge[:], "token": token}
+            for edge, token in zip(produced, produced_tokens)
+        )
+        events.append({
+            "greedy_index": greedy_index,
+            "single_history_batch_index": batch_index,
+            "consumed": [public_state[i][:] for i in mi],
+            "produced": [edge[:] for edge in produced],
+            "consumed_tokens": tuple(token_state[i]["token"] for i in mi),
+            "produced_tokens": tuple(produced_tokens),
+        })
+
+    return remaining + produced_items, events
+
+
+def _single_history_greedy_token_trace(
+    init_state: Hypergraph,
+    lhs: list[list[str]],
+    rhs: list[list[str]],
+    max_steps: int,
+    time_limit_ms: int = 5000,
+) -> dict:
+    """Build the flattened Single-History greedy event trace with private tokens.
+
+    Contract §5: red event identity is edge-instance identity, not local shape.
+    """
+    max_n = max((n for e in init_state for n in e), default=0)
+    reset(max_n)
+
+    t0 = time.time()
+    token_state = _edge_token_state(init_state)
+    events: list[dict] = []
+    batch_counts: list[int] = []
+
+    for single_history_step in range(1, max_steps + 1):
+        if time_limit_ms and (time.time() - t0) * 1000 > time_limit_ms:
+            break
+        token_state, step_events = _apply_greedy_token_step(
+            token_state, lhs, rhs, len(events)
+        )
+        if not step_events:
+            break
+        for ev in step_events:
+            ev["single_history_step"] = single_history_step
+        batch_counts.append(len(step_events))
+        events.extend(step_events)
+
+    return {"events": events, "batch_counts": batch_counts}
+
+
 def _single_history_greedy_occurrence_path(
     init_state: Hypergraph,
     lhs: list[list[str]],
@@ -1297,97 +1423,92 @@ def _single_history_greedy_occurrence_path(
     Missing records from this path can then be merged into the ordinary
     occurrence set before causal edges are built, so red IDs remain normal
     occurrence IDs with normal branch paths.
+
+    Contract §6: serial branch_path depth is provenance only; red layout depth
+    is the Single-History greedy step recorded on each path record.
     """
-    greedy = evolve(
-        init_state,
-        lhs,
-        rhs,
-        max_steps,
-        time_limit_ms=time_limit_ms,
+    greedy = _single_history_greedy_token_trace(
+        init_state, lhs, rhs, max_steps, time_limit_ms=time_limit_ms
     )
 
     max_n = max((n for e in init_state for n in e), default=0)
     reset(max_n)
     state: Hypergraph = [e[:] for e in init_state]
+    token_state: list[dict] = _edge_token_state(init_state)
     path_records: list[dict] = []
     branch_path: list[int] = []
     parent_branch_path: tuple[int, ...] = ()
 
-    for step, step_events in enumerate(greedy["events"], start=1):
-        for greedy_event in step_events:
-            if max_path_events is not None and len(path_records) >= max_path_events:
-                return {
-                    "occurrences": path_records,
-                    "branch_paths": [tuple(rec["branch_path"]) for rec in path_records],
-                    "greedy_event_count": sum(
-                        len(step_events) for step_events in greedy["events"]
-                    ),
-                }
-            signature = _event_shape_signature(greedy_event)
-            selected_match: Optional[tuple[int, list[int], dict]] = None
-            shape_fallback: Optional[tuple[int, dict, Hypergraph]] = None
-            matches = find_matches(state, lhs)
+    for greedy_event in greedy["events"]:
+        if max_path_events is not None and len(path_records) >= max_path_events:
+            break
+        selected_match: Optional[tuple[int, list[int], dict]] = None
+        matches = find_matches(state, lhs)
+        for match_idx, (mi, bind) in enumerate(matches):
+            consumed_tokens = tuple(token_state[i]["token"] for i in mi)
+            if consumed_tokens == greedy_event["consumed_tokens"]:
+                selected_match = (match_idx, mi, bind)
+                break
 
-            for match_idx, (mi, bind) in enumerate(matches):
-                if [state[i] for i in mi] == greedy_event["consumed"]:
-                    selected_match = (match_idx, mi, bind)
-                    break
+        if selected_match is None:
+            break
 
-            if selected_match is not None:
-                match_idx, mi, bind = selected_match
-                result = _apply_match(state, lhs, rhs, mi, bind)
-                parent_nodes: set[int] = set(n for e in state for n in e)
-                norm_state, norm_produced = _normalize_new_nodes(
-                    parent_nodes, result["state"], result["event"]["produced"]
+        match_idx, mi, bind = selected_match
+        result = _apply_match(state, lhs, rhs, mi, bind)
+        parent_nodes: set[int] = set(n for e in state for n in e)
+        norm_state, norm_produced = _normalize_new_nodes(
+            parent_nodes, result["state"], result["event"]["produced"]
+        )
+        matched = set(mi)
+        remaining_tokens = [
+            item["token"] for idx, item in enumerate(token_state)
+            if idx not in matched
+        ]
+        token_state = (
+            [
+                {"edge": edge[:], "token": token}
+                for edge, token in zip(
+                    [edge for idx, edge in enumerate(norm_state) if idx < len(remaining_tokens)],
+                    remaining_tokens,
                 )
-                event = {
-                    "consumed": result["event"]["consumed"],
-                    "produced": norm_produced,
-                }
-                selected = (match_idx, event, norm_state)
-            else:
-                selected = None
-                for match_idx, (mi, bind) in enumerate(matches):
-                    result = _apply_match(state, lhs, rhs, mi, bind)
-                    parent_nodes = set(n for e in state for n in e)
-                    norm_state, norm_produced = _normalize_new_nodes(
-                        parent_nodes, result["state"], result["event"]["produced"]
-                    )
-                    event = {
-                        "consumed": result["event"]["consumed"],
-                        "produced": norm_produced,
-                    }
-                    if _event_shape_signature(event) == signature:
-                        shape_fallback = (match_idx, event, norm_state)
-                        break
-                selected = shape_fallback
-
-            if selected is None:
-                return {
-                    "occurrences": path_records,
-                    "branch_paths": [tuple(rec["branch_path"]) for rec in path_records],
-                    "greedy_event_count": sum(
-                        len(step_events) for step_events in greedy["events"]
-                    ),
-                }
-
-            match_idx, event, state = selected
-            branch_path = branch_path + [match_idx]
-            path_records.append({
-                "step": len(branch_path),
-                "canonical_hash": canonical_hash(state),
-                "_parent_branch_path": parent_branch_path,
-                "match_idx": match_idx,
-                "branch_path": branch_path[:],
-                "consumed": event["consumed"],
-                "produced": event["produced"],
-            })
-            parent_branch_path = tuple(branch_path)
+            ]
+            + [
+                {"edge": edge[:], "token": token}
+                for edge, token in zip(norm_produced, greedy_event["produced_tokens"])
+            ]
+        )
+        state = norm_state
+        branch_path = branch_path + [match_idx]
+        serial_depth = len(branch_path)
+        path_records.append({
+            "step": serial_depth,
+            "serial_depth": serial_depth,
+            "single_history_step": greedy_event["single_history_step"],
+            "single_history_batch_index": greedy_event["single_history_batch_index"],
+            "greedy_index": greedy_event["greedy_index"],
+            "layout": {
+                "depth": greedy_event["single_history_step"],
+                "branch_key": [
+                    greedy_event["single_history_step"],
+                    greedy_event["single_history_batch_index"],
+                    greedy_event["greedy_index"],
+                ],
+                "order": greedy_event["single_history_batch_index"],
+            },
+            "canonical_hash": canonical_hash(state),
+            "_parent_branch_path": parent_branch_path,
+            "match_idx": match_idx,
+            "branch_path": branch_path[:],
+            "consumed": result["event"]["consumed"],
+            "produced": norm_produced,
+        })
+        parent_branch_path = tuple(branch_path)
 
     return {
         "occurrences": path_records,
         "branch_paths": [tuple(rec["branch_path"]) for rec in path_records],
-        "greedy_event_count": sum(len(step_events) for step_events in greedy["events"]),
+        "greedy_event_count": len(greedy["events"]),
+        "batch_counts": greedy["batch_counts"],
     }
 
 
@@ -1509,6 +1630,13 @@ def multiway_causal_graph(
         branch_path_key = tuple(record["branch_path"])
         existing = by_branch_path.get(branch_path_key)
         if existing is not None:
+            existing.update({
+                "serial_depth": record["serial_depth"],
+                "single_history_step": record["single_history_step"],
+                "single_history_batch_index": record["single_history_batch_index"],
+                "greedy_index": record["greedy_index"],
+                "layout": record["layout"],
+            })
             default_path_branch_paths.append(branch_path_key)
             continue
 
@@ -1523,6 +1651,11 @@ def multiway_causal_graph(
             "parent_occ_id": parent["occ_id"],
             "match_idx": record["match_idx"],
             "branch_path": record["branch_path"],
+            "serial_depth": record["serial_depth"],
+            "single_history_step": record["single_history_step"],
+            "single_history_batch_index": record["single_history_batch_index"],
+            "greedy_index": record["greedy_index"],
+            "layout": record["layout"],
             "consumed": record["consumed"],
             "produced": record["produced"],
         }
@@ -1565,6 +1698,15 @@ def multiway_causal_graph(
         {
             "id": occ["occ_id"],
             "step": occ["step"],
+            "serial_depth": occ.get("serial_depth", len(occ["branch_path"])),
+            "single_history_step": occ.get("single_history_step"),
+            "single_history_batch_index": occ.get("single_history_batch_index"),
+            "greedy_index": occ.get("greedy_index"),
+            "layout": occ.get("layout", {
+                "depth": occ["step"],
+                "branch_key": occ["branch_path"],
+                "order": occ["occ_id"],
+            }),
             "occ_id": occ["occ_id"],
             "parent_occ_id": occ["parent_occ_id"],
             "match_idx": occ["match_idx"],
@@ -1649,6 +1791,7 @@ def multiway_causal_graph(
         "green_event_count": max(0, len(events) - embedded_red_count),
         "single_history_greedy_event_count": greedy_flat_event_count,
         "serial_default_path_event_count": embedded_red_count,
+        "single_history_batch_counts": greedy_path.get("batch_counts", []),
         "max_steps": max_steps,
         "max_occurrences": max_occurrences,
         "max_time_ms": max_time_ms,

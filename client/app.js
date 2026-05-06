@@ -2486,8 +2486,29 @@ function renderMultiwayCausal() {
   const eventInfo = {};
   const occurrenceEvents = data.events.map(ev => Object.assign({ mwcKind: 'occurrence' }, ev));
   const defaultPathIds = new Set(data.default_path_event_ids || []);
+  // Contract §6: compute one unified coordinate per ordinary event before
+  // styling red/green; never lay out a separate red-only node set.
+  const layoutDepth = ev => {
+    if (ev.layout && ev.layout.depth != null) return ev.layout.depth;
+    if (defaultPathIds.has(ev.id) && ev.single_history_step != null) return ev.single_history_step;
+    return ev.step || 0;
+  };
+  const layoutOrder = ev => {
+    if (ev.layout && ev.layout.order != null) return ev.layout.order;
+    if (ev.single_history_batch_index != null) return ev.single_history_batch_index;
+    return ev.id;
+  };
+  const layoutKey = ev => {
+    const key = ev.layout ? ev.layout.branch_key : ev.branch_path;
+    return Array.isArray(key) ? JSON.stringify(key) : String(key == null ? '' : key);
+  };
   const events = occurrenceEvents
-    .sort((a, b) => (a.step - b.step) || String(a.id).localeCompare(String(b.id)));
+    .sort((a, b) =>
+      (layoutDepth(a) - layoutDepth(b)) ||
+      (layoutOrder(a) - layoutOrder(b)) ||
+      layoutKey(a).localeCompare(layoutKey(b)) ||
+      String(a.id).localeCompare(String(b.id))
+    );
   for (const ev of events) eventInfo[ev.id] = ev;
 
   const CAUSAL_NODE_CAP = 8000;
@@ -2506,11 +2527,12 @@ function renderMultiwayCausal() {
 
   const stepGroups = new Map();
   for (const ev of renderEvents) {
-    if (!stepGroups.has(ev.step)) stepGroups.set(ev.step, []);
-    stepGroups.get(ev.step).push(ev);
+    const depth = layoutDepth(ev);
+    if (!stepGroups.has(depth)) stepGroups.set(depth, []);
+    stepGroups.get(depth).push(ev);
   }
 
-  const maxStep = Math.max(1, ...renderEvents.map(ev => ev.step || 0));
+  const maxStep = Math.max(1, ...renderEvents.map(layoutDepth));
   const PAD_X = 40;
   const PAD_Y = truncated ? 28 : 50;
   const usableW = width - 2 * PAD_X;
@@ -2519,6 +2541,11 @@ function renderMultiwayCausal() {
 
   for (const [step, group] of stepGroups.entries()) {
     const y = PAD_Y + step * usableH / maxStep;
+    group.sort((a, b) =>
+      (layoutOrder(a) - layoutOrder(b)) ||
+      layoutKey(a).localeCompare(layoutKey(b)) ||
+      String(a.id).localeCompare(String(b.id))
+    );
     group.forEach((ev, i) => {
       const x = group.length === 1
         ? width / 2
@@ -2559,6 +2586,8 @@ function renderMultiwayCausal() {
     .attr('marker-end', d => (defaultPathIds.has(d.source) && defaultPathIds.has(d.target)) ? 'url(#mwc-arrow-red)' : 'url(#mwc-arrow-green)');
 
   g.append('g').selectAll('circle').data(nodes).join('circle')
+    .attr('data-event-id', d => d.id)
+    .attr('data-red', d => defaultPathIds.has(d.id) ? 'true' : 'false')
     .attr('cx', d => d.x)
     .attr('cy', d => d.y)
     .attr('r', d => defaultPathIds.has(d.id) ? nodeR * 1.35 : nodeR)

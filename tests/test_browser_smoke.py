@@ -18,6 +18,13 @@ from __future__ import annotations
 import pytest
 from playwright.sync_api import Page, expect
 
+try:
+    import pytest_playwright  # noqa: F401
+except Exception:  # pragma: no cover - exercised only when plugin is absent
+    @pytest.fixture
+    def page():
+        pytest.skip("pytest-playwright plugin is not installed")
+
 # Timeouts (milliseconds)
 _LOAD_TIMEOUT = 20_000   # server startup + rule precompute on cold cache
 _RENDER_TIMEOUT = 10_000  # D3 drawing after data arrives
@@ -142,3 +149,49 @@ class TestBrowserSmoke:
             f"Expected #causal-svg to contain D3-rendered elements after switching "
             f"to Causal Graph view, got {child_count} children"
         )
+
+    def test_multiway_causal_red_overlay_uses_unified_layout(
+        self, live_server: str, page: Page
+    ) -> None:
+        """Rule3 red nodes render as ordinary event nodes in greedy-step layers."""
+        self._wait_for_app_ready(page, live_server)
+
+        page.locator("#card-rule3").click()
+        page.get_by_role("button", name="Multiway Causal").click()
+        page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
+        page.wait_for_function(
+            """() => {
+                const svg = document.querySelector('#multiway-causal-svg');
+                return svg && svg.querySelectorAll('circle[data-event-id]').length > 0;
+            }""",
+            timeout=_LOAD_TIMEOUT,
+        )
+
+        result = page.evaluate(
+            """() => {
+                const nodes = [...document.querySelectorAll(
+                    '#multiway-causal-svg circle[data-event-id]'
+                )];
+                const ids = nodes.map(n => n.getAttribute('data-event-id'));
+                const red = nodes.filter(n => n.getAttribute('data-red') === 'true');
+                const redIds = red.map(n => n.getAttribute('data-event-id'));
+                const redY = red.map(n => Number(n.getAttribute('cy')));
+                const yCounts = {};
+                for (const y of redY) {
+                    const key = y.toFixed(3);
+                    yCounts[key] = (yCounts[key] || 0) + 1;
+                }
+                return {
+                    nodeCount: nodes.length,
+                    uniqueNodeCount: new Set(ids).size,
+                    redCount: red.length,
+                    uniqueRedCount: new Set(redIds).size,
+                    yMultiplicity: Object.values(yCounts).sort((a, b) => a - b),
+                };
+            }"""
+        )
+
+        assert result["nodeCount"] == result["uniqueNodeCount"]
+        assert result["redCount"] == 15
+        assert result["uniqueRedCount"] == 15
+        assert result["yMultiplicity"] == [1, 2, 4, 8]

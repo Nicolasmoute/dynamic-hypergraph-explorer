@@ -10,6 +10,7 @@ Run from the repo root:
     pytest
 """
 from __future__ import annotations
+from collections import Counter
 import time
 import importlib
 import pytest
@@ -228,8 +229,11 @@ class TestGetMultiwayCausal:
     def test_event_fields_present(self, client):
         events = client.get("/api/rules/rule3/multiway-causal").json()["events"]
         for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
-                      "consumed", "produced", "branch_path"):
+                      "consumed", "produced", "branch_path", "serial_depth",
+                      "single_history_step", "single_history_batch_index",
+                      "greedy_index", "layout"):
             assert field in events[0], f"Missing event field: {field}"
+        assert "depth" in events[0]["layout"]
 
     def test_causal_edges_reference_valid_ids(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
@@ -265,6 +269,19 @@ class TestGetMultiwayCausal:
         )
         assert induced_red_edges == sorted(tuple(edge) for edge in greedy["causal_edges"])
         assert all(eid in ev_by_id for eid in data["default_path_event_ids"])
+
+    def test_rule3_red_layout_depths_match_greedy_batches(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal?max_steps=4").json()
+        ev_by_id = {ev["id"]: ev for ev in data["events"]}
+        red_events = [ev_by_id[eid] for eid in data["default_path_event_ids"]]
+        assert len(red_events) == 15
+        assert Counter(ev["layout"]["depth"] for ev in red_events) == Counter({
+            1: 1, 2: 2, 3: 4, 4: 8,
+        })
+        assert [ev["serial_depth"] for ev in red_events] == list(range(1, 16))
+        for ev in red_events:
+            assert all(idx >= 0 for idx in ev["branch_path"])
+            assert ev["layout"]["depth"] == ev["single_history_step"]
 
     def test_no_out_of_band_realized_red_namespace(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
