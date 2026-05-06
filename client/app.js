@@ -738,7 +738,7 @@ function updateCausalViewLabel(view) {
     label.textContent = 'Single-history: red = realized slice';
   } else if (view === 'multiway-causal') {
     label.style.display = '';
-    label.textContent = 'Multiway Causal: red = Single-History greedy path, green = other multiway occurrences';
+    label.textContent = 'Multiway Causal: red = Single-History greedy events, green = other multiway occurrences';
   } else {
     label.style.display = 'none';
     label.textContent = '';
@@ -2589,7 +2589,7 @@ function renderMultiwayCausal() {
   const lg = g.append('g').attr('transform', `translate(${width - 200}, 20)`);
   lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');
   lg.append('text').attr('x', 10).attr('y', 4).attr('fill', isDark ? '#aaa' : '#555')
-    .attr('font-size', 11).text('Red = Single-History greedy path');
+    .attr('font-size', 11).text('Red = Single-History greedy events');
   lg.append('circle').attr('cx', 0).attr('cy', 20).attr('r', 5).attr('fill', '#44dd88');
   lg.append('text').attr('x', 10).attr('y', 24).attr('fill', isDark ? '#aaa' : '#555')
     .attr('font-size', 11).text('Green = other multiway occurrences');

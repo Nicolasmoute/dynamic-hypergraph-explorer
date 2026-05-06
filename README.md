@@ -141,10 +141,10 @@ The **Multiway Causal** tab is live in the deployed app. It loads lazily when th
 is opened and fetches `/api/rules/{id}/multiway-causal` on demand, so the main page
 stays responsive until the view is actually requested.
 
-The red overlay is the Single-History greedy path embedded in the multiway
-occurrence DAG via `default_path_event_ids`; green nodes are the remaining
-multiway occurrences. The API does not return separate `realized_events` or
-`realized_causal_edges` arrays.
+The red overlay is the Single-History greedy parallel event set embedded in the
+multiway occurrence DAG via `default_path_event_ids`; green nodes are the
+remaining multiway occurrences. The API does not return separate
+`realized_events` or `realized_causal_edges` arrays.
 
 ---
 
@@ -182,7 +182,7 @@ at runtime (defaults to 8080 if unset).
 
 ### Persistent cache volume (required)
 
-The server caches computed results under `/data/cache/v6/`. Without a
+The server caches computed results under `/data/cache/v7/`. Without a
 persistent volume this directory is lost on every deploy restart. Configure it
 once in the Zeabur dashboard:
 

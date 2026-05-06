@@ -991,56 +991,59 @@ class TestMultiwayCausalGraph:
         for eid in r["default_path_event_ids"]:
             assert eid in valid_ids, f"default path id {eid} not in events"
 
-    def test_default_path_steps_are_sequential(self):
-        """Default path events must be at steps 1, 2, 3, … in order."""
+    def test_default_path_step_counts_match_single_history_greedy(self):
+        """Red event counts per step match Single-History greedy evolution."""
         p = self._parsed()
-        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        init = [[0, 1]]
+        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
+        greedy = engine.evolve(init, p["lhs"], p["rhs"], 4)
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
-        steps = [ev_by_id[eid]["step"] for eid in r["default_path_event_ids"]]
-        assert steps == list(range(1, len(steps) + 1)), (
-            f"Default path steps not sequential: {steps}"
-        )
+        red_steps = [ev_by_id[eid]["step"] for eid in r["default_path_event_ids"]]
+        assert [red_steps.count(step) for step in range(1, 5)] == [
+            len(step_events) for step_events in greedy["events"]
+        ]
 
-    def test_default_path_events_use_match_idx_zero(self):
-        """Greedy path must always use match_idx=0."""
+    def test_default_path_includes_parallel_nonzero_match_indices(self):
+        """Branching Single-History red is not a thin match_idx=0 strand."""
         p = self._parsed()
         r = engine.multiway_causal_graph(
-            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+            [[0, 1]], p["lhs"], p["rhs"], max_steps=3
         )
-        ev_by_id = {ev["id"]: ev for ev in r["events"]}
-        for eid in r["default_path_event_ids"]:
-            assert ev_by_id[eid]["match_idx"] == 0, (
-                f"Default path event {eid} has match_idx={ev_by_id[eid]['match_idx']}, expected 0"
-            )
-
-    def test_default_path_ids_are_single_history_greedy_prefixes(self):
-        """Red IDs are the embedded Single-History greedy branch prefixes."""
-        p = self._parsed()
-        r = engine.multiway_causal_graph(
-            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
-        )
-        ev_by_id = {ev["id"]: ev for ev in r["events"]}
-        branch_paths = [ev_by_id[eid]["branch_path"] for eid in r["default_path_event_ids"]]
-        expected = [[0] * depth for depth in range(1, len(branch_paths) + 1)]
-        assert branch_paths == expected
-
-    def test_default_path_matches_single_history_greedy_replay(self):
-        """Red event stream matches causal_graph_for_path([0, 0, ...])."""
-        p = self._parsed()
-        init = [[0, 1], [1, 2]]
-        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=3)
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
         red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
-        replay = engine.causal_graph_for_path(
-            init, p["lhs"], p["rhs"], [0] * len(red_events)
+        assert any(ev["match_idx"] != 0 for ev in red_events)
+        assert len([ev for ev in red_events if ev["step"] == 3]) == 4
+
+    def test_default_path_ids_are_single_history_greedy_event_set(self):
+        """Red IDs embed the full Single-History greedy event set."""
+        p = self._parsed()
+        init = [[0, 1]]
+        r = engine.multiway_causal_graph(
+            init, p["lhs"], p["rhs"], max_steps=4
+        )
+        greedy = engine.evolve(init, p["lhs"], p["rhs"], 4)
+        assert len(r["default_path_event_ids"]) == sum(
+            len(step_events) for step_events in greedy["events"]
         )
 
+    def test_default_path_matches_single_history_greedy_replay(self):
+        """Red event stream matches evolve() after local alpha-normalization."""
+        p = self._parsed()
+        init = [[0, 1]]
+        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
+        greedy_events = [
+            ev for step_events in engine.evolve(init, p["lhs"], p["rhs"], 4)["events"]
+            for ev in step_events
+        ]
+
         assert [
-            {"consumed": ev["consumed"], "produced": ev["produced"]}
+            engine._event_shape_signature(ev)
             for ev in red_events
         ] == [
-            {"consumed": ev["consumed"], "produced": ev["produced"]}
-            for ev in replay["events"]
+            engine._event_shape_signature(ev)
+            for ev in greedy_events
         ]
 
     # ── co-historical guarantee (Sofia) ───────────────────────────────

@@ -56,13 +56,13 @@ class TestClientServing:
         if r.status_code == 200:
             assert "javascript" in r.headers.get("content-type", "")
 
-    def test_multiway_causal_red_uses_single_history_greedy_path(self):
+    def test_multiway_causal_red_uses_single_history_greedy_events(self):
         app_js = Path(__file__).resolve().parents[1] / "client" / "app.js"
         text = app_js.read_text()
         assert "default_path_event_ids" in text
         assert "data.realized_events" not in text
         assert "data.realized_causal_edges" not in text
-        assert "Red = Single-History greedy path" in text
+        assert "Red = Single-History greedy events" in text
         assert "serial occurrence path" not in text
 
 

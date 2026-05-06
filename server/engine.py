@@ -22,7 +22,9 @@ from typing import Optional
 #   (`default_path_event_ids`) instead of emitting separate `r*` red records.
 # v5 → v6: clarify that embedded red is the Single-History greedy path in
 #   multiway occurrence-ID space.
-CACHE_VERSION = "v6"
+# v6 → v7: default_path_event_ids now embeds the full Single-History greedy
+#   parallel event set, not one serial child per depth.
+CACHE_VERSION = "v7"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1247,6 +1249,35 @@ def _causal_edges_from_event_stream(events: list[dict]) -> list[list[int]]:
     return causal_edges
 
 
+def _event_shape_signature(ev: dict) -> tuple:
+    """Return an alpha-normalized consumed/produced event signature.
+
+    Single-History greedy evolution and occurrence replay allocate fresh node
+    IDs in different contexts: parallel evolution allocates across every event
+    in the step, while each occurrence normalizes fresh IDs relative to its own
+    parent state.  For embedding the Single-History red set into occurrence
+    space, event identity is therefore compared up to a local node renaming
+    that preserves the consumed/produced incidence pattern and edge order.
+    """
+    mapping: dict[int, int] = {}
+    next_id = 0
+
+    def encode_edge(edge: list[int]) -> tuple[int, ...]:
+        nonlocal next_id
+        encoded: list[int] = []
+        for node in edge:
+            if node not in mapping:
+                mapping[node] = next_id
+                next_id += 1
+            encoded.append(mapping[node])
+        return tuple(encoded)
+
+    return (
+        tuple(encode_edge(edge) for edge in ev["consumed"]),
+        tuple(encode_edge(edge) for edge in ev["produced"]),
+    )
+
+
 # ── multiway causal graph (Phase B2) ─────────────────────────────────
 
 def multiway_causal_graph(
@@ -1278,13 +1309,14 @@ def multiway_causal_graph(
     from one branch will have ancestors produced by the other branch only if
     those ancestors appear literally in their ancestry chain.
 
-    **Embedded Single-History greedy path**
+    **Embedded Single-History greedy event set**
 
     ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
-    whose ``branch_path`` is a prefix of the deterministic Single-History
-    greedy replay: select ``match_idx=0`` at every serial occurrence step.
-    These occurrence IDs are the red embedded path in the client; all other
-    occurrence events remain green multiway alternatives.
+    whose normalized consumed/produced event shapes are fired by deterministic
+    Single-History greedy evolution (``evolve()``, via
+    ``apply_all_non_overlapping()``).  These occurrence IDs are the red embedded
+    event set in the client; all other occurrence events remain green multiway
+    alternatives.
 
     **Truncation**
 
@@ -1418,40 +1450,53 @@ def multiway_causal_graph(
                     seen_pairs.add(pair)
                     causal_edges.append(list(pair))
 
-    # ── 4. Embedded Single-History greedy path ───────────────────────
+    # ── 4. Embedded Single-History greedy event set ──────────────────
     #
-    # Red is not a separate realized namespace.  It is the Single-History
-    # greedy replay (match_idx=0 at every serial occurrence step) projected
-    # onto existing multiway occurrence IDs by branch_path.
-    greedy_prefixes: list[tuple[int, ...]] = []
-    state: Hypergraph = [e[:] for e in init_state]
-    reset(max((n for e in state for n in e), default=0))
-    for _step in range(max_steps):
-        result = apply_rule_once(state, lhs, rhs, 0)
-        if result is None:
-            break
-        parent_nodes: set[int] = set(n for e in state for n in e)
-        state, _norm_produced = _normalize_new_nodes(
-            parent_nodes, result["state"], result["event"]["produced"]
-        )
-        greedy_prefixes.append((0,) * (_step + 1))
+    # Red is not a separate realized namespace.  It is the full event set fired
+    # by Single-History greedy parallel evolution, projected onto existing
+    # multiway occurrence IDs.  We compare alpha-normalized event shapes because
+    # parallel evolution and occurrence replay allocate fresh node IDs in
+    # different, but locally isomorphic, contexts.
+    greedy = evolve(
+        init_state,
+        lhs,
+        rhs,
+        max_steps,
+        time_limit_ms=max_time_ms,
+    )
+    greedy_flat_event_count = sum(len(step_events) for step_events in greedy["events"])
+    events_by_step: dict[int, list[dict]] = defaultdict(list)
+    for ev in events:
+        events_by_step[ev["step"]].append(ev)
 
-    event_id_by_branch_path = {
-        tuple(ev["branch_path"]): ev["id"]
-        for ev in events
-    }
-    default_path_event_ids = [
-        event_id_by_branch_path[prefix]
-        for prefix in greedy_prefixes
-        if prefix in event_id_by_branch_path
-    ]
+    default_path_event_ids: list[int] = []
+    used_event_ids: set[int] = set()
+    for step, step_events in enumerate(greedy["events"], start=1):
+        candidates = events_by_step.get(step, [])
+        for greedy_event in step_events:
+            signature = _event_shape_signature(greedy_event)
+            match = next(
+                (
+                    ev for ev in candidates
+                    if ev["id"] not in used_event_ids
+                    and _event_shape_signature(ev) == signature
+                ),
+                None,
+            )
+            if match is None:
+                # The occurrence BFS may be truncated before all greedy events
+                # at this step have appeared.  Keep the embedded set honest:
+                # every returned red ID is an existing occurrence event.
+                continue
+            used_event_ids.add(match["id"])
+            default_path_event_ids.append(match["id"])
 
     embedded_red_count = len(default_path_event_ids)
     stats = {
         "event_count": len(events),
         "embedded_red_event_count": embedded_red_count,
         "green_event_count": max(0, len(events) - embedded_red_count),
-        "single_history_greedy_event_count": embedded_red_count,
+        "single_history_greedy_event_count": greedy_flat_event_count,
         "serial_default_path_event_count": embedded_red_count,
         "max_steps": max_steps,
         "max_occurrences": max_occurrences,
