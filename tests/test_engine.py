@@ -991,28 +991,29 @@ class TestMultiwayCausalGraph:
         for eid in r["default_path_event_ids"]:
             assert eid in valid_ids, f"default path id {eid} not in events"
 
-    def test_default_path_step_counts_match_single_history_greedy(self):
-        """Red event counts per step match Single-History greedy evolution."""
+    def test_default_path_branch_paths_are_serial_prefixes(self):
+        """Red events form one replay-stable serial occurrence path."""
         p = self._parsed()
         init = [[0, 1]]
-        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
-        greedy = engine.evolve(init, p["lhs"], p["rhs"], 4)
-        ev_by_id = {ev["id"]: ev for ev in r["events"]}
-        red_steps = [ev_by_id[eid]["step"] for eid in r["default_path_event_ids"]]
-        assert [red_steps.count(step) for step in range(1, 5)] == [
-            len(step_events) for step_events in greedy["events"]
-        ]
-
-    def test_default_path_includes_parallel_nonzero_match_indices(self):
-        """Branching Single-History red is not a thin match_idx=0 strand."""
-        p = self._parsed()
         r = engine.multiway_causal_graph(
-            [[0, 1]], p["lhs"], p["rhs"], max_steps=3
+            init, p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        red_paths = [ev_by_id[eid]["branch_path"] for eid in r["default_path_event_ids"]]
+        assert [len(path) for path in red_paths] == list(range(1, len(red_paths) + 1))
+        for prev, cur in zip(red_paths, red_paths[1:]):
+            assert cur[:len(prev)] == prev
+
+    def test_default_path_records_match_indices(self):
+        """Greedy serial occurrence paths expose replay match indices."""
+        p = engine.parse_notation("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}")
+        r = engine.multiway_causal_graph(
+            [[0, 1, 2]], p["lhs"], p["rhs"], max_steps=3
         )
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
         red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
-        assert any(ev["match_idx"] != 0 for ev in red_events)
-        assert len([ev for ev in red_events if ev["step"] == 3]) == 4
+        assert all(isinstance(ev["match_idx"], int) for ev in red_events)
 
     def test_default_path_ids_are_single_history_greedy_event_set(self):
         """Red IDs embed the full Single-History greedy event set."""
@@ -1030,7 +1031,10 @@ class TestMultiwayCausalGraph:
         """Red event stream matches evolve() after local alpha-normalization."""
         p = self._parsed()
         init = [[0, 1]]
-        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
+        r = engine.multiway_causal_graph(
+            init, p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
         red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
         greedy_events = [
@@ -1046,11 +1050,24 @@ class TestMultiwayCausalGraph:
             for ev in greedy_events
         ]
 
-    def test_default_path_induced_edges_match_single_history_causal_edges(self):
-        """Red MWC induced edges have the same topology as evolve()."""
-        p = self._parsed()
-        init = [[0, 1]]
-        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
+    @pytest.mark.parametrize("notation, init", [
+        ("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}", [[0, 0], [0, 0]]),
+        ("{{x,y}} -> {{x,y},{y,z}}", [[0, 1]]),
+        ("{{x,y,z}} -> {{x,u,w},{y,v,u},{z,w,v}}", [[0, 1, 2]]),
+        (
+            "{{x,y,z},{z,u,v}} -> {{y,z,u},{v,w,x},{w,y,v}}",
+            [[0,1,2],[2,3,4],[4,5,6],[6,7,8],[8,9,0],[1,3,5],[5,7,9],[9,1,3]],
+        ),
+    ])
+    def test_default_path_induced_edges_match_single_history_for_builtin_rules(
+        self, notation, init
+    ):
+        """Red induced edges match evolve() topology for built-in rule shapes."""
+        p = engine.parse_notation(notation)
+        r = engine.multiway_causal_graph(
+            init, p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
+        )
         red_index = {
             event_id: idx
             for idx, event_id in enumerate(r["default_path_event_ids"])
@@ -1062,31 +1079,18 @@ class TestMultiwayCausalGraph:
         )
         greedy_edges = sorted(
             tuple(edge)
-            for edge in engine.evolve(init, p["lhs"], p["rhs"], 4)["causal_edges"]
+            for edge in engine.evolve(
+                init, p["lhs"], p["rhs"], 4, time_limit_ms=1000
+            )["causal_edges"]
+        )
+        greedy_count = sum(
+            len(step_events)
+            for step_events in engine.evolve(
+                init, p["lhs"], p["rhs"], 4, time_limit_ms=1000
+            )["events"]
         )
 
-        assert induced_red_edges == greedy_edges
-
-    def test_rule1_default_path_induced_edges_match_single_history(self):
-        """Repeated same-shape multi-edge events keep evolve() topology."""
-        p = engine.parse_notation("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}")
-        init = [[0, 0], [0, 0]]
-        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=4)
-        red_index = {
-            event_id: idx
-            for idx, event_id in enumerate(r["default_path_event_ids"])
-        }
-        induced_red_edges = sorted(
-            (red_index[src], red_index[dst])
-            for src, dst in r["causal_edges"]
-            if src in red_index and dst in red_index
-        )
-        greedy_edges = sorted(
-            tuple(edge)
-            for edge in engine.evolve(init, p["lhs"], p["rhs"], 4)["causal_edges"]
-        )
-
-        assert len(r["default_path_event_ids"]) == 15
+        assert len(r["default_path_event_ids"]) == greedy_count
         assert induced_red_edges == greedy_edges
 
     # ── co-historical guarantee (Sofia) ───────────────────────────────
@@ -1099,7 +1103,8 @@ class TestMultiwayCausalGraph:
         """
         p = self._parsed()
         r = engine.multiway_causal_graph(
-            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=4
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
         )
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
         for src, dst in r["causal_edges"]:
@@ -1116,7 +1121,8 @@ class TestMultiwayCausalGraph:
         """
         p = self._parsed()
         r = engine.multiway_causal_graph(
-            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=4
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"],
+            max_steps=4, max_occurrences=500, max_time_ms=1000,
         )
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
 

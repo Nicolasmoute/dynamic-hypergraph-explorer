@@ -24,8 +24,8 @@ from typing import Optional
 #   multiway occurrence-ID space.
 # v6 → v7: default_path_event_ids now embeds the full Single-History greedy
 #   parallel event set, not one serial child per depth.
-# v7 → v8: embedded red IDs use an explicit Single-History occurrence trace so
-#   the induced red causal topology matches evolve() for duplicate-heavy rules.
+# v7 → v8: the greedy Single-History serial occurrence path is guaranteed to be
+#   present in the multiway occurrence set before event/causal-edge construction.
 CACHE_VERSION = "v8"
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -1280,23 +1280,23 @@ def _event_shape_signature(ev: dict) -> tuple:
     )
 
 
-def _single_history_occurrence_trace(
+def _single_history_greedy_occurrence_path(
     init_state: Hypergraph,
     lhs: list[list[str]],
     rhs: list[list[str]],
     max_steps: int,
-    start_occ_id: int,
     time_limit_ms: int = 5000,
+    max_path_events: Optional[int] = None,
 ) -> dict:
-    """Build red occurrence events from the exact Single-History evolution.
+    """Build the exact Single-History greedy path as occurrence records.
 
     The multiway occurrence BFS branches one serial rewrite at a time.  A
     Single-History step, however, fires all non-overlapping matches in parallel;
-    for duplicate-heavy multi-edge rules, selecting same-depth sibling
-    occurrences by local shape can leave stale duplicate instances in ancestry
-    and changes the induced red causal topology.  This helper embeds the actual
-    ``evolve()`` event stream as occurrence events in the same ``events`` array
-    and maps ``evolve()["causal_edges"]`` onto those occurrence IDs.
+    this path serializes those greedy events in the same deterministic order as
+    ``evolve()`` and records the replay-stable match index at each serial event.
+    Missing records from this path can then be merged into the ordinary
+    occurrence set before causal edges are built, so red IDs remain normal
+    occurrence IDs with normal branch paths.
     """
     greedy = evolve(
         init_state,
@@ -1306,42 +1306,87 @@ def _single_history_occurrence_trace(
         time_limit_ms=time_limit_ms,
     )
 
-    red_events: list[dict] = []
-    default_path_event_ids: list[int] = []
-    greedy_to_occ_id: dict[int, int] = {}
-    next_occ_id = start_occ_id
-    parent_occ_id: Optional[int] = None
-    branch_path: list[int] = [-1]
+    max_n = max((n for e in init_state for n in e), default=0)
+    reset(max_n)
+    state: Hypergraph = [e[:] for e in init_state]
+    path_records: list[dict] = []
+    branch_path: list[int] = []
+    parent_branch_path: tuple[int, ...] = ()
 
     for step, step_events in enumerate(greedy["events"], start=1):
-        for step_event_index, ev in enumerate(step_events):
-            occ_id = next_occ_id
-            next_occ_id += 1
-            greedy_to_occ_id[ev["id"]] = occ_id
-            default_path_event_ids.append(occ_id)
-            branch_path = branch_path + [step_event_index]
-            red_events.append({
-                "id": occ_id,
-                "step": step,
-                "occ_id": occ_id,
-                "parent_occ_id": parent_occ_id,
-                "match_idx": step_event_index,
-                "consumed": ev["consumed"],
-                "produced": ev["produced"],
-                "branch_path": branch_path[:],
-            })
-            parent_occ_id = occ_id
+        for greedy_event in step_events:
+            if max_path_events is not None and len(path_records) >= max_path_events:
+                return {
+                    "occurrences": path_records,
+                    "branch_paths": [tuple(rec["branch_path"]) for rec in path_records],
+                    "greedy_event_count": sum(
+                        len(step_events) for step_events in greedy["events"]
+                    ),
+                }
+            signature = _event_shape_signature(greedy_event)
+            selected_match: Optional[tuple[int, list[int], dict]] = None
+            shape_fallback: Optional[tuple[int, dict, Hypergraph]] = None
+            matches = find_matches(state, lhs)
 
-    red_causal_edges = [
-        [greedy_to_occ_id[src], greedy_to_occ_id[dst]]
-        for src, dst in greedy["causal_edges"]
-        if src in greedy_to_occ_id and dst in greedy_to_occ_id
-    ]
+            for match_idx, (mi, bind) in enumerate(matches):
+                if [state[i] for i in mi] == greedy_event["consumed"]:
+                    selected_match = (match_idx, mi, bind)
+                    break
+
+            if selected_match is not None:
+                match_idx, mi, bind = selected_match
+                result = _apply_match(state, lhs, rhs, mi, bind)
+                parent_nodes: set[int] = set(n for e in state for n in e)
+                norm_state, norm_produced = _normalize_new_nodes(
+                    parent_nodes, result["state"], result["event"]["produced"]
+                )
+                event = {
+                    "consumed": result["event"]["consumed"],
+                    "produced": norm_produced,
+                }
+                selected = (match_idx, event, norm_state)
+            else:
+                selected = None
+                for match_idx, (mi, bind) in enumerate(matches):
+                    result = _apply_match(state, lhs, rhs, mi, bind)
+                    parent_nodes = set(n for e in state for n in e)
+                    norm_state, norm_produced = _normalize_new_nodes(
+                        parent_nodes, result["state"], result["event"]["produced"]
+                    )
+                    event = {
+                        "consumed": result["event"]["consumed"],
+                        "produced": norm_produced,
+                    }
+                    if _event_shape_signature(event) == signature:
+                        shape_fallback = (match_idx, event, norm_state)
+                        break
+                selected = shape_fallback
+
+            if selected is None:
+                return {
+                    "occurrences": path_records,
+                    "branch_paths": [tuple(rec["branch_path"]) for rec in path_records],
+                    "greedy_event_count": sum(
+                        len(step_events) for step_events in greedy["events"]
+                    ),
+                }
+
+            match_idx, event, state = selected
+            branch_path = branch_path + [match_idx]
+            path_records.append({
+                "step": len(branch_path),
+                "canonical_hash": canonical_hash(state),
+                "_parent_branch_path": parent_branch_path,
+                "match_idx": match_idx,
+                "branch_path": branch_path[:],
+                "consumed": event["consumed"],
+                "produced": event["produced"],
+            })
+            parent_branch_path = tuple(branch_path)
 
     return {
-        "events": red_events,
-        "causal_edges": red_causal_edges,
-        "default_path_event_ids": default_path_event_ids,
+        "occurrences": path_records,
+        "branch_paths": [tuple(rec["branch_path"]) for rec in path_records],
         "greedy_event_count": sum(len(step_events) for step_events in greedy["events"]),
     }
 
@@ -1446,6 +1491,73 @@ def multiway_causal_graph(
         truncated = True
         truncation_reason = "max_depth"
 
+    greedy_path = _single_history_greedy_occurrence_path(
+        init_state,
+        lhs,
+        rhs,
+        max_steps,
+        time_limit_ms=max_time_ms,
+        max_path_events=max(0, max_occurrences - 1),
+    )
+    by_branch_path: dict[tuple[int, ...], dict] = {
+        tuple(occ["branch_path"]): occ for occ in occs
+    }
+    next_occ_id = max((occ["occ_id"] for occ in occs), default=0) + 1
+    default_path_branch_paths: list[tuple[int, ...]] = []
+
+    for record in greedy_path["occurrences"]:
+        branch_path_key = tuple(record["branch_path"])
+        existing = by_branch_path.get(branch_path_key)
+        if existing is not None:
+            default_path_branch_paths.append(branch_path_key)
+            continue
+
+        parent = by_branch_path.get(record["_parent_branch_path"])
+        if parent is None:
+            break
+
+        occ = {
+            "occ_id": next_occ_id,
+            "step": record["step"],
+            "canonical_hash": record["canonical_hash"],
+            "parent_occ_id": parent["occ_id"],
+            "match_idx": record["match_idx"],
+            "branch_path": record["branch_path"],
+            "consumed": record["consumed"],
+            "produced": record["produced"],
+        }
+        next_occ_id += 1
+        occs.append(occ)
+        by_branch_path[branch_path_key] = occ
+        default_path_branch_paths.append(branch_path_key)
+
+    if len(occs) > max_occurrences:
+        red_branch_path_set = set(default_path_branch_paths)
+        required = [
+            occ for occ in occs
+            if occ["occ_id"] == 0 or tuple(occ["branch_path"]) in red_branch_path_set
+        ]
+        green_budget = max(0, max_occurrences - len(required))
+        kept: list[dict] = []
+        kept_ids: set[int] = set()
+        for occ in occs:
+            is_required = (
+                occ["occ_id"] == 0
+                or tuple(occ["branch_path"]) in red_branch_path_set
+            )
+            if is_required or green_budget > 0:
+                kept.append(occ)
+                kept_ids.add(occ["occ_id"])
+                if not is_required:
+                    green_budget -= 1
+        occs = kept
+        by_branch_path = {tuple(occ["branch_path"]): occ for occ in occs}
+        default_path_branch_paths = [
+            bp for bp in default_path_branch_paths if bp in by_branch_path
+        ]
+        truncated = True
+        truncation_reason = truncation_reason or "max_occurrences"
+
     # ── 2. Index occurrences and build events list ────────────────────
     by_id: dict[int, dict] = {o["occ_id"]: o for o in occs}
 
@@ -1519,35 +1631,16 @@ def multiway_causal_graph(
 
     # ── 4. Embedded Single-History greedy event set ──────────────────
     #
-    # Red is not a separate realized namespace.  It is the full event set fired
-    # by Single-History greedy parallel evolution, embedded as occurrence events
-    # in the same events/causal_edges payload so the induced red topology is
-    # exactly the Single-History causal topology.
-    red_trace = _single_history_occurrence_trace(
-        init_state,
-        lhs,
-        rhs,
-        max_steps,
-        start_occ_id=(max((ev["id"] for ev in events), default=0) + 1),
-        time_limit_ms=max_time_ms,
-    )
-    events.extend(red_trace["events"])
-    causal_edges.extend(red_trace["causal_edges"])
-    default_path_event_ids: list[int] = red_trace["default_path_event_ids"]
-    greedy_flat_event_count = red_trace["greedy_event_count"]
-
-    if len(events) > max_occurrences and len(default_path_event_ids) < max_occurrences:
-        red_id_set = set(default_path_event_ids)
-        green_budget = max_occurrences - len(default_path_event_ids)
-        kept_green_events = [ev for ev in events if ev["id"] not in red_id_set][:green_budget]
-        events = kept_green_events + red_trace["events"]
-        kept_event_ids = {ev["id"] for ev in events}
-        causal_edges = [
-            [src, dst] for src, dst in causal_edges
-            if src in kept_event_ids and dst in kept_event_ids
-        ]
-        truncated = True
-        truncation_reason = truncation_reason or "max_occurrences"
+    # Red is the Single-History greedy serial occurrence path inside the same
+    # multiway occurrence event set.  No separate red event or edge namespace is
+    # emitted; the client derives red edges as the causal_edges induced by these
+    # existing occurrence IDs.
+    default_path_event_ids: list[int] = [
+        by_branch_path[bp]["occ_id"]
+        for bp in default_path_branch_paths
+        if bp in by_branch_path and by_branch_path[bp]["occ_id"] != 0
+    ]
+    greedy_flat_event_count = greedy_path["greedy_event_count"]
 
     embedded_red_count = len(default_path_event_ids)
     stats = {

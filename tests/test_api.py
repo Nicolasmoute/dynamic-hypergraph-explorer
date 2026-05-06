@@ -247,10 +247,24 @@ class TestGetMultiwayCausal:
     def test_default_path_ids_are_single_history_greedy_event_set(self, client):
         data = client.get("/api/rules/rule3/multiway-causal?max_steps=4").json()
         ev_by_id = {ev["id"]: ev for ev in data["events"]}
-        red_events = [ev_by_id[eid] for eid in data["default_path_event_ids"]]
-        red_steps = [ev["step"] for ev in red_events]
-        assert [red_steps.count(step) for step in range(1, 5)] == [1, 2, 4, 8]
-        assert any(ev["match_idx"] != 0 for ev in red_events)
+        red_index = {
+            event_id: idx
+            for idx, event_id in enumerate(data["default_path_event_ids"])
+        }
+        induced_red_edges = sorted(
+            (red_index[src], red_index[dst])
+            for src, dst in data["causal_edges"]
+            if src in red_index and dst in red_index
+        )
+        rule = next(r for r in main.RULES if r["id"] == "rule3")
+        parsed = main.engine.parse_notation(rule["notation"])
+        greedy = main.engine.evolve(rule["init"], parsed["lhs"], parsed["rhs"], 4)
+
+        assert len(data["default_path_event_ids"]) == sum(
+            len(step_events) for step_events in greedy["events"]
+        )
+        assert induced_red_edges == sorted(tuple(edge) for edge in greedy["causal_edges"])
+        assert all(eid in ev_by_id for eid in data["default_path_event_ids"])
 
     def test_no_out_of_band_realized_red_namespace(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
