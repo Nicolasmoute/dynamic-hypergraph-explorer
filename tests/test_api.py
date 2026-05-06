@@ -210,8 +210,7 @@ class TestGetMultiwayCausal:
     def test_response_has_required_keys(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
         for key in ("events", "causal_edges", "default_path_event_ids",
-                    "realized_events", "realized_causal_edges", "stats",
-                    "truncated", "truncation_reason", "meta"):
+                    "stats", "truncated", "truncation_reason", "meta"):
             assert key in data, f"Missing key: {key}"
 
     def test_meta_has_rule_fields(self, client):
@@ -245,22 +244,17 @@ class TestGetMultiwayCausal:
         for eid in data["default_path_event_ids"]:
             assert eid in event_ids, f"Default path event {eid} not in events"
 
-    def test_realized_edges_reference_valid_realized_ids(self, client):
+    def test_no_out_of_band_realized_red_namespace(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
-        event_ids = {ev["id"] for ev in data["realized_events"]}
-        assert event_ids
-        assert all(isinstance(eid, str) and eid.startswith("r") for eid in event_ids)
-        for src, dst in data["realized_causal_edges"]:
-            assert src in event_ids, f"Realized causal edge src {src} not valid"
-            assert dst in event_ids, f"Realized causal edge dst {dst} not valid"
+        assert "realized_events" not in data
+        assert "realized_causal_edges" not in data
 
-    def test_realized_stats_match_payload_lengths(self, client):
+    def test_embedded_red_stats_match_payload_lengths(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
         stats = data["stats"]
         assert stats["event_count"] == len(data["events"])
-        assert stats["off_default_event_count"] == len(data["events"])
-        assert stats["realized_event_count"] == len(data["realized_events"])
-        assert stats["realized_causal_edge_count"] == len(data["realized_causal_edges"])
+        assert stats["embedded_red_event_count"] == len(data["default_path_event_ids"])
+        assert stats["green_event_count"] == len(data["events"]) - len(data["default_path_event_ids"])
 
     def test_truncated_field_is_bool(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
@@ -347,8 +341,7 @@ class TestCustomMultiwayCausal:
     def test_response_has_required_keys(self):
         data = self._post().json()
         for key in ("events", "causal_edges", "default_path_event_ids",
-                    "realized_events", "realized_causal_edges", "stats",
-                    "truncated", "truncation_reason", "meta"):
+                    "stats", "truncated", "truncation_reason", "meta"):
             assert key in data, f"Missing key: {key}"
 
     def test_meta_has_notation_and_init(self):
@@ -368,22 +361,17 @@ class TestCustomMultiwayCausal:
             assert src in event_ids
             assert dst in event_ids
 
-    def test_realized_edges_reference_valid_realized_ids(self):
+    def test_no_out_of_band_realized_red_namespace(self):
         data = self._post().json()
-        event_ids = {ev["id"] for ev in data["realized_events"]}
-        assert event_ids
-        assert all(isinstance(eid, str) and eid.startswith("r") for eid in event_ids)
-        for src, dst in data["realized_causal_edges"]:
-            assert src in event_ids
-            assert dst in event_ids
+        assert "realized_events" not in data
+        assert "realized_causal_edges" not in data
 
-    def test_realized_stats_match_payload_lengths(self):
+    def test_embedded_red_stats_match_payload_lengths(self):
         data = self._post().json()
         stats = data["stats"]
         assert stats["event_count"] == len(data["events"])
-        assert stats["off_default_event_count"] == len(data["events"])
-        assert stats["realized_event_count"] == len(data["realized_events"])
-        assert stats["realized_causal_edge_count"] == len(data["realized_causal_edges"])
+        assert stats["embedded_red_event_count"] == len(data["default_path_event_ids"])
+        assert stats["green_event_count"] == len(data["events"]) - len(data["default_path_event_ids"])
 
     def test_truncated_field_is_bool(self):
         data = self._post().json()

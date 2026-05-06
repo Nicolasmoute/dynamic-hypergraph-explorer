@@ -738,7 +738,7 @@ function updateCausalViewLabel(view) {
     label.textContent = 'Single-history: red = realized slice';
   } else if (view === 'multiway-causal') {
     label.style.display = '';
-    label.textContent = 'Multiway Causal: red = realized greedy evolution, green = alternative structure';
+    label.textContent = 'Multiway Causal: red = serial occurrence path, green = alternative structure';
   } else {
     label.style.display = 'none';
     label.textContent = '';
@@ -2485,16 +2485,8 @@ function renderMultiwayCausal() {
 
   const eventInfo = {};
   const occurrenceEvents = data.events.map(ev => Object.assign({ mwcKind: 'occurrence' }, ev));
-  const realizedEvents = Array.isArray(data.realized_events)
-    ? data.realized_events
-        .map(ev => Object.assign(
-          {},
-          ev,
-          { mwcKind: 'realized', step: Math.max(0, (ev.step || 0) - 1) }
-        ))
-        .filter(ev => ev.step < currentStep)
-    : [];
-  const events = occurrenceEvents.concat(realizedEvents)
+  const defaultPathIds = new Set(data.default_path_event_ids || []);
+  const events = occurrenceEvents
     .sort((a, b) => (a.step - b.step) || String(a.id).localeCompare(String(b.id)));
   for (const ev of events) eventInfo[ev.id] = ev;
 
@@ -2508,10 +2500,6 @@ function renderMultiwayCausal() {
   const renderEdges = (data.causal_edges || [])
     .filter(([src, dst]) => renderIds.has(src) && renderIds.has(dst))
     .map(([src, dst]) => ({ source: src, target: dst, mwcKind: 'occurrence' }));
-  const renderRealizedEdges = (data.realized_causal_edges || [])
-    .filter(([src, dst]) => renderIds.has(src) && renderIds.has(dst))
-    .map(([src, dst]) => ({ source: src, target: dst, mwcKind: 'realized' }));
-  const allRenderEdges = renderEdges.concat(renderRealizedEdges);
 
   const g = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => g.attr('transform', e.transform)));
@@ -2544,8 +2532,8 @@ function renderMultiwayCausal() {
   const stats = data.stats || {};
   const statsHasSummary = stats && (
     stats.event_count != null ||
-    stats.default_path_event_count != null ||
-    stats.off_default_event_count != null ||
+    stats.embedded_red_event_count != null ||
+    stats.green_event_count != null ||
     stats.max_occurrences != null ||
     stats.max_steps != null ||
     stats.max_time_ms != null
@@ -2561,23 +2549,23 @@ function renderMultiwayCausal() {
     .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
     .append('path').attr('d', 'M0,-3L6,0L0,3').attr('fill', '#44dd88');
 
-  g.append('g').selectAll('line').data(allRenderEdges).join('line')
+  g.append('g').selectAll('line').data(renderEdges).join('line')
     .attr('x1', d => (posById.get(d.source) || {}).x || 0)
     .attr('y1', d => (posById.get(d.source) || {}).y || 0)
     .attr('x2', d => (posById.get(d.target) || {}).x || 0)
     .attr('y2', d => (posById.get(d.target) || {}).y || 0)
-    .attr('stroke', d => d.mwcKind === 'realized' ? '#ff444480' : '#44dd8880')
+    .attr('stroke', d => (defaultPathIds.has(d.source) && defaultPathIds.has(d.target)) ? '#ff444480' : '#44dd8880')
     .attr('stroke-width', 2)
-    .attr('marker-end', d => d.mwcKind === 'realized' ? 'url(#mwc-arrow-red)' : 'url(#mwc-arrow-green)');
+    .attr('marker-end', d => (defaultPathIds.has(d.source) && defaultPathIds.has(d.target)) ? 'url(#mwc-arrow-red)' : 'url(#mwc-arrow-green)');
 
   g.append('g').selectAll('circle').data(nodes).join('circle')
     .attr('cx', d => d.x)
     .attr('cy', d => d.y)
-    .attr('r', d => d.mwcKind === 'realized' ? nodeR * 1.35 : nodeR)
-    .attr('fill', d => d.mwcKind === 'realized' ? '#ff4444' : '#44dd88')
+    .attr('r', d => defaultPathIds.has(d.id) ? nodeR * 1.35 : nodeR)
+    .attr('fill', d => defaultPathIds.has(d.id) ? '#ff4444' : '#44dd88')
     .attr('fill-opacity', 1)
-    .attr('stroke', d => d.mwcKind === 'realized' ? '#ff444480' : '#44dd8880')
-    .attr('stroke-width', d => d.mwcKind === 'realized' ? 2 : 1.5)
+    .attr('stroke', d => defaultPathIds.has(d.id) ? '#ff444480' : '#44dd8880')
+    .attr('stroke-width', d => defaultPathIds.has(d.id) ? 2 : 1.5)
     .style('cursor', 'default')
     .on('mouseenter', (ev, d) => {
       const info = eventInfo[d.id];
@@ -2587,7 +2575,7 @@ function renderMultiwayCausal() {
       }
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
-      const branch = d.mwcKind === 'realized' ? 'realized greedy evolution' : 'alternative multiway occurrence';
+      const branch = defaultPathIds.has(d.id) ? 'serial occurrence path' : 'alternative multiway occurrence';
       showTooltip(ev,
         `Event #${d.id}  (step ${d.step})\n` +
         `${branch}\n` +
@@ -2601,15 +2589,15 @@ function renderMultiwayCausal() {
   const lg = g.append('g').attr('transform', `translate(${width - 200}, 20)`);
   lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');
   lg.append('text').attr('x', 10).attr('y', 4).attr('fill', isDark ? '#aaa' : '#555')
-    .attr('font-size', 11).text('Red = realized greedy evolution');
+    .attr('font-size', 11).text('Red = serial occurrence path');
   lg.append('circle').attr('cx', 0).attr('cy', 20).attr('r', 5).attr('fill', '#44dd88');
   lg.append('text').attr('x', 10).attr('y', 24).attr('fill', isDark ? '#aaa' : '#555')
     .attr('font-size', 11).text('Green = alternative multiway structure');
 
   if (statsHasSummary || truncated) {
     const eventCount = stats.event_count != null ? stats.event_count : occurrenceEvents.length;
-    const realizedCount = stats.realized_event_count != null ? stats.realized_event_count : realizedEvents.length;
-    const offDefaultCount = stats.off_default_event_count != null ? stats.off_default_event_count : eventCount;
+    const redCount = stats.embedded_red_event_count != null ? stats.embedded_red_event_count : defaultPathIds.size;
+    const greenCount = stats.green_event_count != null ? stats.green_event_count : Math.max(0, eventCount - redCount);
     const capLabel = truncated
       ? `capped by ${stats.truncation_reason || data.truncation_reason || 'display limit'}`
       : 'complete';
@@ -2622,9 +2610,9 @@ function renderMultiwayCausal() {
       : '';
     const bannerText = [
       capLabel,
-      `${eventCount.toLocaleString()} green events`,
-      `${realizedCount.toLocaleString()} red realized`,
-      `${offDefaultCount.toLocaleString()} alternative`
+      `${eventCount.toLocaleString()} events`,
+      `${redCount.toLocaleString()} red path`,
+      `${greenCount.toLocaleString()} green alternative`
     ].concat(capSummary ? [`limits ${capSummary}`] : []).join(' · ');
     svg.append('text')
       .attr('x', width / 2).attr('y', 14)

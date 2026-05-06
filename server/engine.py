@@ -18,7 +18,9 @@ from typing import Optional
 # v3 → v4: multiway_causal_graph() adds a realized greedy-parallel causal
 #   slice for red rendering while keeping occurrence-level events as green
 #   multiway alternatives.
-CACHE_VERSION = "v4"
+# v4 → v5: multiway_causal_graph() embeds red as the serial occurrence path
+#   (`default_path_event_ids`) instead of emitting separate `r*` red records.
+CACHE_VERSION = "v5"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1243,48 +1245,6 @@ def _causal_edges_from_event_stream(events: list[dict]) -> list[list[int]]:
     return causal_edges
 
 
-def _realized_greedy_slice(
-    init_state: Hypergraph,
-    lhs: list[list[str]],
-    rhs: list[list[str]],
-    max_steps: int,
-    max_time_ms: int,
-) -> dict:
-    """Return the greedy-parallel causal slice used for red MWC rendering."""
-    realized = evolve(
-        init_state,
-        lhs,
-        rhs,
-        steps=max_steps,
-        time_limit_ms=max_time_ms,
-    )
-
-    id_map: dict[int, str] = {}
-    realized_events: list[dict] = []
-    for step_idx, step_events in enumerate(realized["events"], start=1):
-        for ev in step_events:
-            rid = f"r{ev['id']}"
-            id_map[ev["id"]] = rid
-            realized_events.append({
-                "id": rid,
-                "step": step_idx,
-                "greedy_event_id": ev["id"],
-                "consumed": ev["consumed"],
-                "produced": ev["produced"],
-                "source": "greedy_parallel",
-            })
-
-    realized_causal_edges: list[list[str]] = []
-    for src, dst in realized["causal_edges"]:
-        if src in id_map and dst in id_map:
-            realized_causal_edges.append([id_map[src], id_map[dst]])
-
-    return {
-        "events": realized_events,
-        "causal_edges": realized_causal_edges,
-    }
-
-
 # ── multiway causal graph (Phase B2) ─────────────────────────────────
 
 def multiway_causal_graph(
@@ -1316,17 +1276,12 @@ def multiway_causal_graph(
     from one branch will have ancestors produced by the other branch only if
     those ancestors appear literally in their ancestry chain.
 
-    **Serial default path and realized greedy slice**
+    **Embedded serial default path**
 
     ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
     reached by always selecting ``match_idx=0`` at each step (the first
-    available match).  It is retained for compatibility and for inspecting one
-    serial branch through the occurrence tree.
-
-    ``realized_events`` and ``realized_causal_edges`` contain the separate
-    greedy-parallel evolution slice computed with ``evolve()``.  These events
-    are the red client-side structure; occurrence-level events remain green
-    multiway alternatives.
+    available match).  These occurrence IDs are the red embedded path in the
+    client; all other occurrence events remain green multiway alternatives.
 
     **Truncation**
 
@@ -1365,8 +1320,6 @@ def multiway_causal_graph(
           ],
           "causal_edges":            [[from_id, to_id], ...],
           "default_path_event_ids":  [int, ...],
-          "realized_events":         [{id, step, greedy_event_id, ...}, ...],
-          "realized_causal_edges":   [[from_id, to_id], ...],
           "stats":                   dict,
           "truncated":               bool,
           "truncation_reason":       str | None,
@@ -1479,21 +1432,12 @@ def multiway_causal_graph(
         default_path_event_ids.append(greedy_child["occ_id"])
         cur_occ = greedy_child
 
-    # ── 5. Realized greedy-parallel slice for red rendering ───────────
-    realized = _realized_greedy_slice(
-        init_state,
-        lhs,
-        rhs,
-        max_steps=max_steps,
-        max_time_ms=max_time_ms,
-    )
-
+    embedded_red_count = len(default_path_event_ids)
     stats = {
         "event_count": len(events),
-        "off_default_event_count": len(events),
-        "realized_event_count": len(realized["events"]),
-        "realized_causal_edge_count": len(realized["causal_edges"]),
-        "serial_default_path_event_count": len(default_path_event_ids),
+        "embedded_red_event_count": embedded_red_count,
+        "green_event_count": max(0, len(events) - embedded_red_count),
+        "serial_default_path_event_count": embedded_red_count,
         "max_steps": max_steps,
         "max_occurrences": max_occurrences,
         "max_time_ms": max_time_ms,
@@ -1504,8 +1448,6 @@ def multiway_causal_graph(
         "events": events,
         "causal_edges": causal_edges,
         "default_path_event_ids": default_path_event_ids,
-        "realized_events": realized["events"],
-        "realized_causal_edges": realized["causal_edges"],
         "stats": stats,
         "truncated": truncated,
         "truncation_reason": truncation_reason,

@@ -56,12 +56,13 @@ class TestClientServing:
         if r.status_code == 200:
             assert "javascript" in r.headers.get("content-type", "")
 
-    def test_multiway_causal_red_uses_realized_events(self):
+    def test_multiway_causal_red_uses_default_path_events(self):
         app_js = Path(__file__).resolve().parents[1] / "client" / "app.js"
         text = app_js.read_text()
-        assert "data.realized_events" in text
-        assert "data.realized_causal_edges" in text
-        assert "Red = realized greedy evolution" in text
+        assert "default_path_event_ids" in text
+        assert "data.realized_events" not in text
+        assert "data.realized_causal_edges" not in text
+        assert "Red = serial occurrence path" in text
 
 
 class TestAPISurface:
