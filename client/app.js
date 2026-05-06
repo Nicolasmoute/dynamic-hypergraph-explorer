@@ -2607,9 +2607,9 @@ function renderMultiwayCausal() {
     .attr('font-size', 11).text('Green = alternative multiway structure');
 
   if (statsHasSummary || truncated) {
-    const eventCount = totalVisible;
-    const realizedCount = realizedEvents.length;
-    const offDefaultCount = stats.off_default_event_count != null ? stats.off_default_event_count : occurrenceEvents.length;
+    const eventCount = stats.event_count != null ? stats.event_count : occurrenceEvents.length;
+    const realizedCount = stats.realized_event_count != null ? stats.realized_event_count : realizedEvents.length;
+    const offDefaultCount = stats.off_default_event_count != null ? stats.off_default_event_count : eventCount;
     const capLabel = truncated
       ? `capped by ${stats.truncation_reason || data.truncation_reason || 'display limit'}`
       : 'complete';
