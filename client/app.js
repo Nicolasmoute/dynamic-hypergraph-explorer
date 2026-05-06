@@ -2502,11 +2502,20 @@ function renderMultiwayCausal() {
     const key = ev.layout ? ev.layout.branch_key : ev.branch_path;
     return Array.isArray(key) ? JSON.stringify(key) : String(key == null ? '' : key);
   };
+  const layoutHash = ev => {
+    const text = layoutKey(ev);
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  };
   const events = occurrenceEvents
     .sort((a, b) =>
       (layoutDepth(a) - layoutDepth(b)) ||
+      (layoutHash(a) - layoutHash(b)) ||
       (layoutOrder(a) - layoutOrder(b)) ||
-      layoutKey(a).localeCompare(layoutKey(b)) ||
       String(a.id).localeCompare(String(b.id))
     );
   for (const ev of events) eventInfo[ev.id] = ev;
@@ -2539,22 +2548,13 @@ function renderMultiwayCausal() {
   const usableH = height - PAD_Y - 16;
   const posById = new Map();
 
-  const canonicalLayerOrder = (a, b) =>
-    (layoutOrder(a) - layoutOrder(b)) ||
-    layoutKey(a).localeCompare(layoutKey(b)) ||
-    String(a.id).localeCompare(String(b.id));
-
   for (const [step, group] of stepGroups.entries()) {
     const y = PAD_Y + step * usableH / maxStep;
-    const sorted = group.slice().sort(canonicalLayerOrder);
-    const reds = sorted.filter(ev => defaultPathIds.has(ev.id));
-    const greens = sorted.filter(ev => !defaultPathIds.has(ev.id));
-    const greenSplit = Math.ceil(greens.length / 2);
-    const ordered = reds.length > 0
-      ? greens.slice(0, greenSplit)
-          .concat(reds)
-          .concat(greens.slice(greenSplit))
-      : sorted;
+    const ordered = group.slice().sort((a, b) =>
+      (layoutHash(a) - layoutHash(b)) ||
+      (layoutOrder(a) - layoutOrder(b)) ||
+      String(a.id).localeCompare(String(b.id))
+    );
     ordered.forEach((ev, i) => {
       const x = group.length === 1
         ? width / 2
