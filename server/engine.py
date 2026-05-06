@@ -20,7 +20,9 @@ from typing import Optional
 #   multiway alternatives.
 # v4 → v5: multiway_causal_graph() embeds red as the serial occurrence path
 #   (`default_path_event_ids`) instead of emitting separate `r*` red records.
-CACHE_VERSION = "v5"
+# v5 → v6: clarify that embedded red is the Single-History greedy path in
+#   multiway occurrence-ID space.
+CACHE_VERSION = "v6"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -1276,12 +1278,13 @@ def multiway_causal_graph(
     from one branch will have ancestors produced by the other branch only if
     those ancestors appear literally in their ancestry chain.
 
-    **Embedded serial default path**
+    **Embedded Single-History greedy path**
 
     ``default_path_event_ids`` contains the ``occ_id``\\s of the occurrences
-    reached by always selecting ``match_idx=0`` at each step (the first
-    available match).  These occurrence IDs are the red embedded path in the
-    client; all other occurrence events remain green multiway alternatives.
+    whose ``branch_path`` is a prefix of the deterministic Single-History
+    greedy replay: select ``match_idx=0`` at every serial occurrence step.
+    These occurrence IDs are the red embedded path in the client; all other
+    occurrence events remain green multiway alternatives.
 
     **Truncation**
 
@@ -1415,28 +1418,40 @@ def multiway_causal_graph(
                     seen_pairs.add(pair)
                     causal_edges.append(list(pair))
 
-    # ── 4. Default (greedy) path: always match_idx=0 ─────────────────
-    children_by_parent: dict[int, list[dict]] = defaultdict(list)
-    for occ in occs:
-        if occ["parent_occ_id"] is not None:
-            children_by_parent[occ["parent_occ_id"]].append(occ)
-
-    default_path_event_ids: list[int] = []
-    cur_occ: dict = by_id[0]  # start at root
-    while True:
-        kids = children_by_parent.get(cur_occ["occ_id"], [])
-        if not kids:
+    # ── 4. Embedded Single-History greedy path ───────────────────────
+    #
+    # Red is not a separate realized namespace.  It is the Single-History
+    # greedy replay (match_idx=0 at every serial occurrence step) projected
+    # onto existing multiway occurrence IDs by branch_path.
+    greedy_prefixes: list[tuple[int, ...]] = []
+    state: Hypergraph = [e[:] for e in init_state]
+    reset(max((n for e in state for n in e), default=0))
+    for _step in range(max_steps):
+        result = apply_rule_once(state, lhs, rhs, 0)
+        if result is None:
             break
-        # Pick the child with the smallest match_idx (0 when BFS not truncated)
-        greedy_child = min(kids, key=lambda o: o["match_idx"])
-        default_path_event_ids.append(greedy_child["occ_id"])
-        cur_occ = greedy_child
+        parent_nodes: set[int] = set(n for e in state for n in e)
+        state, _norm_produced = _normalize_new_nodes(
+            parent_nodes, result["state"], result["event"]["produced"]
+        )
+        greedy_prefixes.append((0,) * (_step + 1))
+
+    event_id_by_branch_path = {
+        tuple(ev["branch_path"]): ev["id"]
+        for ev in events
+    }
+    default_path_event_ids = [
+        event_id_by_branch_path[prefix]
+        for prefix in greedy_prefixes
+        if prefix in event_id_by_branch_path
+    ]
 
     embedded_red_count = len(default_path_event_ids)
     stats = {
         "event_count": len(events),
         "embedded_red_event_count": embedded_red_count,
         "green_event_count": max(0, len(events) - embedded_red_count),
+        "single_history_greedy_event_count": embedded_red_count,
         "serial_default_path_event_count": embedded_red_count,
         "max_steps": max_steps,
         "max_occurrences": max_occurrences,

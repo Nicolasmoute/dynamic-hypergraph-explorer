@@ -1013,6 +1013,36 @@ class TestMultiwayCausalGraph:
                 f"Default path event {eid} has match_idx={ev_by_id[eid]['match_idx']}, expected 0"
             )
 
+    def test_default_path_ids_are_single_history_greedy_prefixes(self):
+        """Red IDs are the embedded Single-History greedy branch prefixes."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"], max_steps=3
+        )
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        branch_paths = [ev_by_id[eid]["branch_path"] for eid in r["default_path_event_ids"]]
+        expected = [[0] * depth for depth in range(1, len(branch_paths) + 1)]
+        assert branch_paths == expected
+
+    def test_default_path_matches_single_history_greedy_replay(self):
+        """Red event stream matches causal_graph_for_path([0, 0, ...])."""
+        p = self._parsed()
+        init = [[0, 1], [1, 2]]
+        r = engine.multiway_causal_graph(init, p["lhs"], p["rhs"], max_steps=3)
+        ev_by_id = {ev["id"]: ev for ev in r["events"]}
+        red_events = [ev_by_id[eid] for eid in r["default_path_event_ids"]]
+        replay = engine.causal_graph_for_path(
+            init, p["lhs"], p["rhs"], [0] * len(red_events)
+        )
+
+        assert [
+            {"consumed": ev["consumed"], "produced": ev["produced"]}
+            for ev in red_events
+        ] == [
+            {"consumed": ev["consumed"], "produced": ev["produced"]}
+            for ev in replay["events"]
+        ]
+
     # ── co-historical guarantee (Sofia) ───────────────────────────────
 
     def test_causal_edges_respect_ancestry(self):
@@ -1115,6 +1145,7 @@ class TestMultiwayCausalGraph:
         assert r["stats"]["event_count"] == len(r["events"])
         assert r["stats"]["embedded_red_event_count"] == len(r["default_path_event_ids"])
         assert r["stats"]["green_event_count"] == len(r["events"]) - len(r["default_path_event_ids"])
+        assert r["stats"]["single_history_greedy_event_count"] == len(r["default_path_event_ids"])
         assert r["stats"]["serial_default_path_event_count"] == len(r["default_path_event_ids"])
 
     # ── B2.1 regression: live edge provenance (Sofia BLOCKER) ─────────

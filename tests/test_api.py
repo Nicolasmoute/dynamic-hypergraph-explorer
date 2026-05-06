@@ -244,6 +244,16 @@ class TestGetMultiwayCausal:
         for eid in data["default_path_event_ids"]:
             assert eid in event_ids, f"Default path event {eid} not in events"
 
+    def test_default_path_ids_are_single_history_greedy_prefixes(self, client):
+        data = client.get("/api/rules/rule3/multiway-causal?max_steps=3").json()
+        ev_by_id = {ev["id"]: ev for ev in data["events"]}
+        branch_paths = [
+            ev_by_id[eid]["branch_path"]
+            for eid in data["default_path_event_ids"]
+        ]
+        expected = [[0] * depth for depth in range(1, len(branch_paths) + 1)]
+        assert branch_paths == expected
+
     def test_no_out_of_band_realized_red_namespace(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
         assert "realized_events" not in data
@@ -254,6 +264,7 @@ class TestGetMultiwayCausal:
         stats = data["stats"]
         assert stats["event_count"] == len(data["events"])
         assert stats["embedded_red_event_count"] == len(data["default_path_event_ids"])
+        assert stats["single_history_greedy_event_count"] == len(data["default_path_event_ids"])
         assert stats["green_event_count"] == len(data["events"]) - len(data["default_path_event_ids"])
 
     def test_truncated_field_is_bool(self, client):
@@ -371,6 +382,7 @@ class TestCustomMultiwayCausal:
         stats = data["stats"]
         assert stats["event_count"] == len(data["events"])
         assert stats["embedded_red_event_count"] == len(data["default_path_event_ids"])
+        assert stats["single_history_greedy_event_count"] == len(data["default_path_event_ids"])
         assert stats["green_event_count"] == len(data["events"]) - len(data["default_path_event_ids"])
 
     def test_truncated_field_is_bool(self):
