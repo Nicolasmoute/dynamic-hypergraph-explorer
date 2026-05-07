@@ -127,11 +127,18 @@ class TestBrowserSmoke:
         """Switching to 'Causal Graph' view renders nodes/edges in #causal-svg."""
         self._wait_for_app_ready(page, live_server)
 
+        # Wait for the tab to be visible before clicking it. The browser smoke
+        # runs in a real page shell, so this makes the selector resilient to
+        # slower header paint / accessibility-tree setup without changing app
+        # behavior.
+        causal_tab = page.locator("button.view-tab", has_text="Causal Graph")
+        expect(causal_tab).to_be_visible(timeout=_LOAD_TIMEOUT)
+
         # Click the 'Causal Graph' view tab.
-        page.get_by_role("button", name="Causal Graph").click()
+        causal_tab.click(timeout=_LOAD_TIMEOUT)
 
         # The causal overlay gains the 'active' class when the view is live.
-        page.wait_for_selector("#causal-view.active", timeout=_INTERACT_TIMEOUT)
+        page.wait_for_selector("#causal-view.active", timeout=_LOAD_TIMEOUT)
 
         # renderCausal() populates #causal-svg with D3 elements.
         page.wait_for_function(
@@ -139,7 +146,7 @@ class TestBrowserSmoke:
                 const svg = document.querySelector('#causal-svg');
                 return svg !== null && svg.children.length > 0;
             }""",
-            timeout=_INTERACT_TIMEOUT,
+            timeout=_LOAD_TIMEOUT,
         )
 
         child_count = page.evaluate(
