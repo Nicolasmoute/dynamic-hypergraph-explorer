@@ -273,3 +273,20 @@ class TestBrowserSmoke:
             assert red_id in comparison["withRed"], red_id
             assert comparison["withRed"][red_id]["red"] is True, red_id
             assert comparison["withoutRed"][red_id]["red"] is False, red_id
+
+        layers: dict[float, list[tuple[float, bool]]] = {}
+        for entry in comparison["withRed"].values():
+            layers.setdefault(entry["y"], []).append((entry["x"], entry["red"]))
+
+        for y, nodes in layers.items():
+            if not any(not is_red for _, is_red in nodes):
+                continue
+            red_slots = [
+                idx
+                for idx, (_, is_red) in enumerate(sorted(nodes, key=lambda item: item[0]))
+                if is_red
+            ]
+            if len(red_slots) >= 2:
+                assert red_slots != list(range(len(red_slots))), (
+                    f"Red nodes in layer y={y} occupy the leading x slots: {red_slots}"
+                )
