@@ -133,6 +133,36 @@ class TestBrowserSmoke:
             f"(before={before}, after={after})"
         )
 
+    def test_initial_rule_load_failure_shows_retry_and_recovers(
+        self, live_server: str, page: Page
+    ) -> None:
+        """A failed initial rule load must surface Retry and recover cleanly."""
+        def fail_rule1(route):
+            route.fulfill(
+                status=500,
+                content_type="application/json",
+                body='{"error":"forced failure for overlay regression test"}',
+            )
+
+        page.route("**/api/rules/rule1", fail_rule1)
+        page.goto(live_server, wait_until="commit")
+
+        page.wait_for_selector("#loading-overlay", state="hidden", timeout=_LOAD_TIMEOUT)
+        page.wait_for_selector("#compute-overlay.error", timeout=_LOAD_TIMEOUT)
+        page.wait_for_selector("#compute-overlay .co-retry", state="visible", timeout=_LOAD_TIMEOUT)
+
+        page.unroute("**/api/rules/rule1", fail_rule1)
+        page.locator("#compute-overlay .co-retry").click(timeout=_INTERACT_TIMEOUT)
+
+        page.wait_for_selector("#compute-overlay", state="hidden", timeout=_LOAD_TIMEOUT)
+        page.wait_for_function(
+            """() => {
+                const svg = document.querySelector('#main-svg');
+                return svg !== null && svg.children.length > 0;
+            }""",
+            timeout=_LOAD_TIMEOUT,
+        )
+
     def test_causal_view_switch_renders_causal_svg(
         self, live_server: str, page: Page
     ) -> None:
