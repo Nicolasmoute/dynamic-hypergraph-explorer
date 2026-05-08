@@ -15,6 +15,9 @@ CI: run in a separate job with ``--run-slow`` flag (see .github/workflows).
 """
 from __future__ import annotations
 
+import json
+import urllib.request
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -47,7 +50,7 @@ class TestBrowserSmoke:
         - At least one rule card is visible in the sidebar.
         - The main spatial SVG has been populated by D3.
         """
-        page.goto(base_url)
+        page.goto(base_url, wait_until="commit")
 
         # Loading overlay disappears once /api/rules responds.
         page.wait_for_selector(
@@ -131,7 +134,7 @@ class TestBrowserSmoke:
         # runs in a real page shell, so this makes the selector resilient to
         # slower header paint / accessibility-tree setup without changing app
         # behavior.
-        causal_tab = page.locator("button.view-tab", has_text="Causal Graph")
+        causal_tab = page.locator("button.view-tab", has_text="Single-History Causal")
         expect(causal_tab).to_be_visible(timeout=_LOAD_TIMEOUT)
 
         # Click the 'Causal Graph' view tab.
@@ -203,28 +206,21 @@ class TestBrowserSmoke:
         assert result["uniqueRedCount"] == 15
         assert result["yMultiplicity"] == [1, 2, 4, 8]
 
+    @pytest.mark.parametrize("rule_id", ["rule1", "rule3", "rule4", "rule5"])
     def test_multiway_causal_coordinates_ignore_red_membership(
-        self, live_server: str, page: Page
+        self, live_server: str, page: Page, rule_id: str
     ) -> None:
         """Contract §6: Lambda(event) is independent of default_path_event_ids."""
         self._wait_for_app_ready(page, live_server)
 
-        page.locator("#card-rule3").click()
-        page.wait_for_function(
-            "() => MWCAUSAL && MWCAUSAL.rule3 && MWCAUSAL.rule3.events",
-            timeout=_LOAD_TIMEOUT,
-        )
-        page.get_by_role("button", name="Multiway Causal").click()
-        page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
-        page.wait_for_function(
-            """() => document.querySelectorAll(
-                '#multiway-causal-svg circle[data-event-id]'
-            ).length > 0""",
-            timeout=_LOAD_TIMEOUT,
-        )
+        with urllib.request.urlopen(
+            f"{live_server}/api/rules/{rule_id}/multiway-causal?max_steps=4",
+            timeout=10,
+        ) as resp:
+            payload = json.load(resp)
 
         comparison = page.evaluate(
-            """() => {
+            """({ ruleId, payload }) => {
                 function coords() {
                     const out = {};
                     document.querySelectorAll('#multiway-causal-svg circle[data-event-id]')
@@ -238,38 +234,42 @@ class TestBrowserSmoke:
                     return out;
                 }
 
-                const original = MWCAUSAL.rule3;
-                const redIds = original.default_path_event_ids.map(String);
+                MWCAUSAL[ruleId] = payload;
+                activeRule = ruleId;
+                currentView = 'multiway-causal';
                 renderMultiwayCausal();
                 const withRed = coords();
 
-                MWCAUSAL.rule3 = {
-                    ...original,
+                MWCAUSAL[ruleId] = {
+                    ...payload,
                     default_path_event_ids: [],
-                    events: original.events.map(ev => {
-                        const copy = {...ev};
-                        if (redIds.includes(String(copy.id))) {
-                            copy.layout = undefined;
-                        }
-                        return copy;
-                    }),
                 };
                 renderMultiwayCausal();
                 const withoutRed = coords();
-                MWCAUSAL.rule3 = original;
+
+                MWCAUSAL[ruleId] = payload;
                 renderMultiwayCausal();
 
-                return redIds.map(id => ({
-                    id,
-                    before: withRed[id],
-                    after: withoutRed[id],
-                }));
-            }"""
+                return {
+                    withRed,
+                    withoutRed,
+                    redIds: payload.default_path_event_ids.map(String),
+                };
+            }""",
+            {"ruleId": rule_id, "payload": payload},
         )
 
-        assert comparison
-        for item in comparison:
-            assert item["before"] is not None, item
-            assert item["after"] is not None, item
-            assert item["before"]["x"] == item["after"]["x"], item
-            assert item["before"]["y"] == item["after"]["y"], item
+        assert comparison["redIds"]
+        with_xy = {
+            event_id: (entry["x"], entry["y"])
+            for event_id, entry in comparison["withRed"].items()
+        }
+        without_xy = {
+            event_id: (entry["x"], entry["y"])
+            for event_id, entry in comparison["withoutRed"].items()
+        }
+        assert with_xy == without_xy
+        for red_id in comparison["redIds"]:
+            assert red_id in comparison["withRed"], red_id
+            assert comparison["withRed"][red_id]["red"] is True, red_id
+            assert comparison["withoutRed"][red_id]["red"] is False, red_id
