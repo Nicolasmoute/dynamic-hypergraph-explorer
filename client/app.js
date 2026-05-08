@@ -1687,7 +1687,7 @@ function renderCausal() {
   const filteredEdges = allCausalEdges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
 
   // ── 8 K node cap — truncate, not blank ───────────────────────────────────
-  // Show a truncated graph (first 8 K events in causal order) rather than a
+  // Show a truncated graph (most recent 8 K events in causal order) rather than a
   // blank placeholder, so the view remains useful even at high step counts.
   // A fixed banner records that truncation occurred.
   const CAUSAL_NODE_CAP = 8000;
