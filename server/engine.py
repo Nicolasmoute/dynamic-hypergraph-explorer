@@ -30,7 +30,9 @@ from typing import Optional
 #   embeds red by private edge-instance identity instead of local shape fallback.
 # v9 → v10: compute_multiway() adds aggregatedEdges, a canonical-labeled
 #   event-role quotient with multiplicity over the existing concrete edges.
-CACHE_VERSION = "v10"
+# v10 → v11: multiway_causal_graph() adds canonical event-class metadata and
+#   multiplicity to every public occurrence event.
+CACHE_VERSION = "v11"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -913,6 +915,51 @@ def _aggregate_multiway_edges(mw_edges: list[dict], mw_states: dict) -> list[dic
 
     return [groups[key] for key in order]
 
+
+def _annotate_multiway_causal_event_classes(events: list[dict], occurrences: list[dict]) -> None:
+    """Attach canonical event-class metadata to public MWC occurrence events.
+
+    This uses the same source-tied canonical-labeled signature as
+    ``compute_multiway()`` aggregation, but it annotates occurrence events in
+    place instead of collapsing the multiway-causal graph.
+    """
+    occ_by_id: dict[int, dict] = {occ["occ_id"]: occ for occ in occurrences}
+    groups: dict[str, dict] = {}
+    event_signature: dict[int, str] = {}
+
+    for event in events:
+        occ = occ_by_id[event["occ_id"]]
+        parent = occ_by_id.get(occ["parent_occ_id"])
+        if parent is None:
+            continue
+
+        source_state = parent["_state"]
+        consumed_sig, produced_sig = _canonical_event_signature(source_state, event)
+        signature = repr((
+            parent["canonical_hash"],
+            occ["canonical_hash"],
+            consumed_sig,
+            produced_sig,
+        ))
+
+        if signature not in groups:
+            groups[signature] = {
+                "signature": signature,
+                "eventIds": [],
+                "canonicalConsumed": [list(edge) for edge in consumed_sig],
+                "canonicalProduced": [list(edge) for edge in produced_sig],
+            }
+        groups[signature]["eventIds"].append(event["id"])
+        event_signature[event["id"]] = signature
+
+    for event in events:
+        group = groups[event_signature[event["id"]]]
+        event["canonicalEventSignature"] = group["signature"]
+        event["canonicalConsumed"] = group["canonicalConsumed"]
+        event["canonicalProduced"] = group["canonicalProduced"]
+        event["multiplicity"] = len(group["eventIds"])
+        event["equivalentEventIds"] = group["eventIds"][:]
+
 # ── lineage maps ──────────────────────────────────────────────────────
 def build_lineage(states, events):
     """Build edge lineage and birth-step maps.
@@ -1142,6 +1189,7 @@ def compute_multiway_occurrences(
     max_steps: int = 4,
     max_occurrences: int = 5000,
     max_time_ms: int = 5000,
+    include_internal_states: bool = False,
 ) -> dict:
     """BFS over the multiway system tracking every history occurrence separately.
 
@@ -1195,6 +1243,9 @@ def compute_multiway_occurrences(
         max_steps:        Maximum BFS depth (rewrite steps from root).
         max_occurrences:  Total occurrence cap including the root.
         max_time_ms:      Wall-clock cap in milliseconds.
+        include_internal_states:
+                          Keep private ``_state`` entries for engine-internal
+                          callers that need source-state metadata.
 
     Returns::
 
@@ -1311,8 +1362,12 @@ def compute_multiway_occurrences(
             bool(find_matches(occ["_state"], lhs)) for occ in frontier
         )
 
-    # Strip internal _state field before returning (keep payload compact).
-    public_occs = [{k: v for k, v in occ.items() if k != "_state"} for occ in occurrences]
+    # Strip internal _state field before returning unless the engine caller needs
+    # it for further private metadata construction.
+    if include_internal_states:
+        public_occs = occurrences
+    else:
+        public_occs = [{k: v for k, v in occ.items() if k != "_state"} for occ in occurrences]
 
     return {
         "occurrences": public_occs,
@@ -1689,6 +1744,7 @@ def _single_history_greedy_occurrence_path(
             "branch_path": branch_path[:],
             "consumed": result["event"]["consumed"],
             "produced": norm_produced,
+            "_state": [edge[:] for edge in state],
         })
         parent_branch_path = tuple(branch_path)
 
@@ -1787,6 +1843,7 @@ def multiway_causal_graph(
         max_steps=max_steps,
         max_occurrences=max_occurrences,
         max_time_ms=max_time_ms,
+        include_internal_states=True,
     )
 
     occs: list[dict] = bfs["occurrences"]
@@ -1846,6 +1903,7 @@ def multiway_causal_graph(
             "layout": record["layout"],
             "consumed": record["consumed"],
             "produced": record["produced"],
+            "_state": [edge[:] for edge in record["_state"]],
         }
         next_occ_id += 1
         occs.append(occ)
@@ -1905,6 +1963,7 @@ def multiway_causal_graph(
         for occ in occs
         if occ["occ_id"] != 0  # root has no rewrite event
     ]
+    _annotate_multiway_causal_event_classes(events, occs)
 
     # ── 3. Cross-branch causal edges via per-occurrence replay ────────
     #

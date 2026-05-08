@@ -5,7 +5,7 @@ Run from the repo root:
     pytest
 """
 from __future__ import annotations
-from collections import Counter
+from collections import Counter, defaultdict
 import pytest
 from server import engine
 
@@ -987,9 +987,48 @@ class TestMultiwayCausalGraph:
             for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
                           "consumed", "produced", "branch_path", "serial_depth",
                           "single_history_step", "single_history_batch_index",
-                          "greedy_index", "layout"):
+                          "greedy_index", "layout", "canonicalEventSignature",
+                          "canonicalConsumed", "canonicalProduced",
+                          "multiplicity", "equivalentEventIds"):
                 assert field in ev, f"event missing field {field!r}: {ev}"
             assert "depth" in ev["layout"], f"event missing layout.depth: {ev}"
+
+    def test_canonical_event_class_metadata_is_self_consistent(self):
+        p = self._parsed()
+        r = engine.multiway_causal_graph(
+            [[0, 1]], p["lhs"], p["rhs"], max_steps=4,
+            max_occurrences=5000, max_time_ms=5000,
+        )
+        events = r["events"]
+        event_ids = {ev["id"] for ev in events}
+        by_signature: dict[str, list[dict]] = defaultdict(list)
+
+        for ev in events:
+            assert ev["multiplicity"] == len(ev["equivalentEventIds"])
+            assert ev["id"] in ev["equivalentEventIds"]
+            assert set(ev["equivalentEventIds"]) <= event_ids
+            assert ev["canonicalConsumed"] == sorted(ev["canonicalConsumed"])
+            assert ev["canonicalProduced"] == sorted(ev["canonicalProduced"])
+            by_signature[ev["canonicalEventSignature"]].append(ev)
+
+        representative_total = 0
+        has_nontrivial_class = False
+        for signature_events in by_signature.values():
+            first = signature_events[0]
+            representative_total += first["multiplicity"]
+            if first["multiplicity"] > 1:
+                has_nontrivial_class = True
+            for ev in signature_events:
+                assert ev["equivalentEventIds"] == first["equivalentEventIds"]
+                assert ev["multiplicity"] == first["multiplicity"]
+                assert ev["canonicalConsumed"] == first["canonicalConsumed"]
+                assert ev["canonicalProduced"] == first["canonicalProduced"]
+
+        assert representative_total == len(events)
+        assert has_nontrivial_class
+
+    def test_cache_version_bumped_for_multiway_causal_event_metadata(self):
+        assert engine.CACHE_VERSION == "v11"
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""

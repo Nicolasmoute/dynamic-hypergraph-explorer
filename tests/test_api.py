@@ -231,9 +231,20 @@ class TestGetMultiwayCausal:
         for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
                       "consumed", "produced", "branch_path", "serial_depth",
                       "single_history_step", "single_history_batch_index",
-                      "greedy_index", "layout"):
+                      "greedy_index", "layout", "canonicalEventSignature",
+                      "canonicalConsumed", "canonicalProduced", "multiplicity",
+                      "equivalentEventIds"):
             assert field in events[0], f"Missing event field: {field}"
         assert "depth" in events[0]["layout"]
+
+    def test_event_class_fields_are_self_consistent(self, client):
+        events = client.get("/api/rules/rule3/multiway-causal").json()["events"]
+        event_ids = {ev["id"] for ev in events}
+        assert any(ev["multiplicity"] > 1 for ev in events)
+        for ev in events:
+            assert ev["multiplicity"] == len(ev["equivalentEventIds"])
+            assert ev["id"] in ev["equivalentEventIds"]
+            assert set(ev["equivalentEventIds"]) <= event_ids
 
     def test_causal_edges_reference_valid_ids(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()
@@ -393,6 +404,13 @@ class TestCustomMultiwayCausal:
         data = self._post().json()
         assert isinstance(data["events"], list)
         assert len(data["events"]) > 0
+
+    def test_event_class_fields_present(self):
+        events = self._post().json()["events"]
+        for field in ("canonicalEventSignature", "canonicalConsumed",
+                      "canonicalProduced", "multiplicity", "equivalentEventIds"):
+            assert field in events[0], f"Missing event field: {field}"
+        assert events[0]["multiplicity"] == len(events[0]["equivalentEventIds"])
 
     def test_causal_edges_reference_valid_ids(self):
         data = self._post().json()
