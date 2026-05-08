@@ -192,7 +192,7 @@ class TestGetMultiway:
 
     def test_response_has_multiway_keys(self, client):
         data = client.get("/api/rules/rule3/multiway").json()
-        for key in ("states", "edges", "initHash"):
+        for key in ("states", "edges", "aggregatedEdges", "initHash"):
             assert key in data, f"Missing multiway key: {key}"
 
     def test_invalid_rule_returns_404(self, client):

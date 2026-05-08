@@ -548,6 +548,80 @@ class TestCausalIndexRec2:
         )
 
 
+# ── compute_multiway aggregatedEdges ─────────────────────────────────
+
+class TestComputeMultiwayAggregatedEdges:
+    """Canonical-labeled event aggregation over quotient multiway edges."""
+
+    def _rule3_multiway(self):
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        return engine.compute_multiway(
+            [[0, 1]],
+            parsed["lhs"],
+            parsed["rhs"],
+            max_steps=4,
+            max_states=300,
+            max_time_ms=3000,
+        )
+
+    @staticmethod
+    def _class_containing(aggregated_edges, event_id: int):
+        matches = [e for e in aggregated_edges if event_id in e["eventIds"]]
+        assert len(matches) == 1, f"event {event_id} appears in {len(matches)} aggregate classes"
+        return matches[0]
+
+    def test_rule3_concrete_edges_are_preserved(self):
+        result = self._rule3_multiway()
+        assert len(result["edges"]) == 42
+
+    def test_rule3_aggregates_to_twenty_event_classes(self):
+        result = self._rule3_multiway()
+        assert len(result["aggregatedEdges"]) == 20
+
+    def test_rule3_multiplicity_sum_matches_concrete_edges(self):
+        result = self._rule3_multiway()
+        assert sum(e["multiplicity"] for e in result["aggregatedEdges"]) == 42
+
+    def test_every_concrete_event_id_appears_once(self):
+        result = self._rule3_multiway()
+        concrete_ids = [e["event"]["id"] for e in result["edges"]]
+        aggregate_ids = [
+            event_id
+            for aggregate in result["aggregatedEdges"]
+            for event_id in aggregate["eventIds"]
+        ]
+        assert sorted(aggregate_ids) == sorted(concrete_ids)
+        assert len(aggregate_ids) == len(set(aggregate_ids))
+
+    def test_screenshot_family_events_collapse(self):
+        result = self._rule3_multiway()
+        aggregates = result["aggregatedEdges"]
+        assert self._class_containing(aggregates, 14) is self._class_containing(aggregates, 15)
+        assert self._class_containing(aggregates, 35) is self._class_containing(aggregates, 40)
+        assert self._class_containing(aggregates, 36) is self._class_containing(aggregates, 38)
+
+    def test_endpoint_pair_is_not_overcollapsed(self):
+        result = self._rule3_multiway()
+        concrete_by_id = {e["event"]["id"]: e for e in result["edges"]}
+        ids = {12, 14, 15, 16}
+        endpoint_pairs = {(concrete_by_id[i]["from"], concrete_by_id[i]["to"]) for i in ids}
+        assert len(endpoint_pairs) == 1, "fixture ids should share one endpoint pair"
+
+        aggregate_signatures = {
+            self._class_containing(result["aggregatedEdges"], i)["signature"]
+            for i in ids
+        }
+        assert len(aggregate_signatures) >= 2
+
+    def test_aggregate_fields_are_self_consistent(self):
+        result = self._rule3_multiway()
+        for aggregate in result["aggregatedEdges"]:
+            assert aggregate["multiplicity"] == len(aggregate["eventIds"])
+            assert aggregate["representativeEvent"]["id"] == aggregate["eventIds"][0]
+            assert aggregate["canonicalConsumed"] == sorted(aggregate["canonicalConsumed"])
+            assert aggregate["canonicalProduced"] == sorted(aggregate["canonicalProduced"])
+
+
 # ── compute_multiway_occurrences ──────────────────────────────────────
 
 class TestApplyMatch:

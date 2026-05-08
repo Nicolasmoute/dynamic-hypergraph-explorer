@@ -28,7 +28,9 @@ from typing import Optional
 #   present in the multiway occurrence set before event/causal-edge construction.
 # v8 → v9: multiway_causal_graph() adds explicit serial/layout metadata and
 #   embeds red by private edge-instance identity instead of local shape fallback.
-CACHE_VERSION = "v9"
+# v9 → v10: compute_multiway() adds aggregatedEdges, a canonical-labeled
+#   event-role quotient with multiplicity over the existing concrete edges.
+CACHE_VERSION = "v10"
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -736,6 +738,181 @@ def canonical_hash(hyp: Hypergraph) -> str:
     canonical = solve(color, {}, 0)
     return f"{N}:{E}:{canonical}"
 
+# ── canonical-labeled multiway event aggregation ─────────────────────
+
+def _canonical_label_maps(hyp: Hypergraph, max_perms: int = 5000) -> list[dict[int, int]]:
+    """Return deterministic canonical node label maps for a state.
+
+    For tractable states this enumerates all color-cell permutations that
+    achieve the same canonical edge string used by ``canonical_hash``.  Those
+    all-optimal maps let event aggregation minimize over automorphisms instead
+    of accidentally splitting symmetric rewrite events.  For larger ambiguous
+    states, fall back to one deterministic refined-color ordering; this keeps
+    MWC responsive while preserving stable output.
+    """
+    if not hyp:
+        return [{}]
+
+    node_set = set(n for e in hyp for n in e)
+    nodes = sorted(node_set)
+    edge_nodes: list[tuple[int, ...]] = [tuple(e) for e in hyp]
+    edge_lens: list[int] = [len(e) for e in hyp]
+
+    incident: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for edge_idx, edge in enumerate(edge_nodes):
+        counts: dict[int, int] = defaultdict(int)
+        for n in edge:
+            counts[n] += 1
+        for n, cnt in counts.items():
+            incident[n].append((edge_idx, cnt))
+
+    def refine(color0: dict) -> dict:
+        c = dict(color0)
+        for _ in range(10):
+            sigs = {}
+            for n in nodes:
+                es = []
+                for edge_idx, cnt in incident.get(n, []):
+                    e = edge_nodes[edge_idx]
+                    es.append(
+                        f"{cnt}/{edge_lens[edge_idx]}:{','.join(str(c[x]) for x in sorted(e, key=lambda x: c[x]))}"
+                    )
+                es.sort()
+                sigs[n] = f"{c[n]}|{';'.join(es)}"
+            uniq = sorted(set(sigs.values()))
+            idx = {v: i for i, v in enumerate(uniq)}
+            changed = False
+            for n in nodes:
+                nv = idx[sigs[n]]
+                if nv != c[n]:
+                    changed = True
+                c[n] = nv
+            if not changed:
+                break
+        return c
+
+    def edge_str(relabel: dict[int, int]) -> str:
+        edges = [sorted(relabel[n] for n in e) for e in hyp]
+        edges.sort()
+        return str(edges)
+
+    init_c = defaultdict(int)
+    for e in hyp:
+        for n in e:
+            init_c[n] += 1
+    color = refine(dict(init_c))
+
+    cells: dict[int, list[int]] = defaultdict(list)
+    for n in nodes:
+        cells[color[n]].append(n)
+    color_order = sorted(cells.keys())
+
+    total_perms = 1
+    for c in color_order:
+        f = 1
+        for i in range(2, len(cells[c]) + 1):
+            f *= i
+        total_perms *= f
+        if total_perms > max_perms:
+            break
+
+    if total_perms > max_perms:
+        return [{n: i for i, n in enumerate(sorted(nodes, key=lambda n: (color[n], n)))}]
+
+    best: str | None = None
+    best_maps: list[dict[int, int]] = []
+    cell_arrays = [cells[c] for c in color_order]
+
+    def try_cells(ci: int, relabel: dict[int, int], next_lbl: int) -> None:
+        nonlocal best, best_maps
+        if ci >= len(cell_arrays):
+            s = edge_str(relabel)
+            if best is None or s < best:
+                best = s
+                best_maps = [dict(relabel)]
+            elif s == best:
+                best_maps.append(dict(relabel))
+            return
+        for perm in itertools.permutations(cell_arrays[ci]):
+            r = dict(relabel)
+            lbl = next_lbl
+            for n in perm:
+                r[n] = lbl
+                lbl += 1
+            try_cells(ci + 1, r, lbl)
+
+    try_cells(0, {}, 0)
+    return best_maps or [{n: i for i, n in enumerate(nodes)}]
+
+
+def _canonical_labeled_edge_multiset(edges: list[list[int]], label_map: dict[int, int]) -> list[list[int]]:
+    """Convert edges to a sorted multiset under a canonical label map."""
+    labeled = [sorted(label_map[n] for n in e) for e in edges]
+    labeled.sort()
+    return labeled
+
+
+def _canonical_event_signature(source_state: Hypergraph, event: dict) -> tuple:
+    """Return canonical consumed/produced multisets for event-role grouping.
+
+    This uses the source-tied variant from the task spec: nodes already present
+    in the source state keep source canonical labels, while RHS-new nodes get
+    deterministic fresh labels after the source label range.  That avoids
+    depending on whichever representative state first occupied the target
+    canonical hash when several concrete events land in the same quotient node.
+    """
+    source_nodes = {n for e in source_state for n in e}
+    best: tuple | None = None
+
+    for label_map in _canonical_label_maps(source_state):
+        produced_new: dict[int, int] = {}
+        next_label = len(source_nodes)
+
+        def label(n: int) -> int:
+            nonlocal next_label
+            if n in label_map:
+                return label_map[n]
+            if n not in produced_new:
+                produced_new[n] = next_label
+                next_label += 1
+            return produced_new[n]
+
+        consumed = _canonical_labeled_edge_multiset(event["consumed"], label_map)
+        produced = [sorted(label(n) for n in e) for e in event["produced"]]
+        produced.sort()
+        candidate = (tuple(tuple(e) for e in consumed), tuple(tuple(e) for e in produced))
+        if best is None or candidate < best:
+            best = candidate
+
+    return best or ((), ())
+
+
+def _aggregate_multiway_edges(mw_edges: list[dict], mw_states: dict) -> list[dict]:
+    """Group concrete multiway edges by canonical-labeled event role."""
+    groups: dict[tuple, dict] = {}
+    order: list[tuple] = []
+
+    for edge in mw_edges:
+        source_state = edge.get("_sourceState", mw_states[edge["from"]]["state"])
+        consumed_sig, produced_sig = _canonical_event_signature(source_state, edge["event"])
+        key = (edge["from"], edge["to"], consumed_sig, produced_sig)
+        if key not in groups:
+            groups[key] = {
+                "from": edge["from"],
+                "to": edge["to"],
+                "signature": repr(key),
+                "multiplicity": 0,
+                "eventIds": [],
+                "representativeEvent": edge["event"],
+                "canonicalConsumed": [list(e) for e in consumed_sig],
+                "canonicalProduced": [list(e) for e in produced_sig],
+            }
+            order.append(key)
+        groups[key]["multiplicity"] += 1
+        groups[key]["eventIds"].append(edge["event"]["id"])
+
+    return [groups[key] for key in order]
+
 # ── lineage maps ──────────────────────────────────────────────────────
 def build_lineage(states, events):
     """Build edge lineage and birth-step maps.
@@ -865,7 +1042,12 @@ def compute_multiway(init_state: Hypergraph, lhs, rhs, max_steps=4, max_states=3
                 new_branches[child_hash] = result["state"]
                 ev = {"id": event_id, "consumed": result["event"]["consumed"], "produced": result["event"]["produced"]}
                 event_id += 1
-                mw_edges.append({"from": parent_hash, "to": child_hash, "event": ev})
+                mw_edges.append({
+                    "from": parent_hash,
+                    "to": child_hash,
+                    "event": ev,
+                    "_sourceState": [e[:] for e in parent_state],
+                })
 
             if too_many:
                 break
@@ -885,9 +1067,15 @@ def compute_multiway(init_state: Hypergraph, lhs, rhs, max_steps=4, max_states=3
         default_path_event_ids.add(child["event"]["id"])
         current_hash = child["to"]
 
+    public_edges = [
+        {k: v for k, v in edge.items() if not k.startswith("_")}
+        for edge in mw_edges
+    ]
+
     return {
         "states": {h: {"state": info["state"], "step": info["step"]} for h, info in mw_states.items()},
-        "edges": mw_edges,
+        "edges": public_edges,
+        "aggregatedEdges": _aggregate_multiway_edges(mw_edges, mw_states),
         "initHash": init_hash,
         "defaultPathEventIds": list(default_path_event_ids),
         "defaultPathHashes": list(default_path_hashes),
