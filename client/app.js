@@ -2603,7 +2603,6 @@ function renderMultiwayCausal() {
 
   const nodes = renderEvents.map(ev => Object.assign({ id: ev.id, mwcKind: ev.mwcKind }, posById.get(ev.id)));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
-  const multiplicityById = new Map(renderEvents.map(ev => [ev.id, Number(ev.multiplicity) > 1 ? Number(ev.multiplicity) : 1]));
   const stats = data.stats || {};
   const statsHasSummary = stats && (
     stats.event_count != null ||
@@ -2653,16 +2652,10 @@ function renderMultiwayCausal() {
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
       const branch = defaultPathIds.has(d.id) ? 'Single-History greedy event' : 'other multiway occurrence';
-      const multiplicity = multiplicityById.get(d.id) || 1;
-      const aggregates = multiplicity > 1 && Array.isArray(info.equivalentEventIds) && info.equivalentEventIds.length > 0
-        ? `\nAggregates events: ${info.equivalentEventIds.join(', ')}`
-        : '';
       showTooltip(ev,
         `Event #${d.id}  (step ${d.step})\n` +
         `${branch}\n` +
         `Match: ${info.match_idx != null ? info.match_idx : '--'}\n` +
-        (multiplicity > 1 ? `Multiplicity: ×${multiplicity}\n` : '') +
-        aggregates +
         `Consumed: ${consumed || 'none'}\n` +
         `Produced: ${produced || 'none'}`
       );

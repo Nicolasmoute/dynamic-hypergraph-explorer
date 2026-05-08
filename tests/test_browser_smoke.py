@@ -378,10 +378,10 @@ class TestBrowserSmoke:
                 f"Red nodes in layer y={y} occupy the leading x slots: {red_slots}"
             )
 
-    def test_multiway_causal_multiplicity_badges_use_multiway_aggregates(
+    def test_multiway_causal_does_not_render_multiplicity_badges(
         self, live_server: str, page: Page
     ) -> None:
-        """The MWC view must source multiplicity badges from /multiway-causal events."""
+        """MWC keeps multiplicity metadata in the payload but does not show badges."""
         self._wait_for_app_ready(page, live_server)
 
         with urllib.request.urlopen(
@@ -398,6 +398,18 @@ class TestBrowserSmoke:
                 ev["multiplicity"] = 2
                 ev["equivalentEventIds"] = [1, 2]
 
+        multi_events = [
+            ev
+            for ev in multiway_causal_payload["events"]
+            if int(ev.get("multiplicity", 1)) > 1
+        ]
+        assert multi_events
+        assert any(
+            isinstance(ev.get("equivalentEventIds"), list)
+            and len(ev["equivalentEventIds"]) > 1
+            for ev in multi_events
+        )
+
         def fulfill_multiway_causal(route):
             route.fulfill(
                 status=200,
@@ -411,30 +423,17 @@ class TestBrowserSmoke:
             page.get_by_role("button", name="Multiway Causal").click()
             page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
 
-            page.wait_for_selector(
-                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="1"]',
-                timeout=_LOAD_TIMEOUT,
+            expect(page.locator("#multiway-causal-svg .mwc-multiplicity-badge")).to_have_count(
+                0, timeout=_INTERACT_TIMEOUT
             )
 
-            badge_1 = page.locator(
-                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="1"] text'
-            )
-            expect(badge_1).to_have_text("×2", timeout=_INTERACT_TIMEOUT)
-
-            page.wait_for_selector(
-                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="2"]',
-                timeout=_LOAD_TIMEOUT,
-            )
-
-            badge_2 = page.locator(
-                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="2"] text'
-            )
-            expect(badge_2).to_have_text("×2", timeout=_INTERACT_TIMEOUT)
-
-            page.locator('#multiway-causal-svg circle[data-event-id="1"]').hover(timeout=_INTERACT_TIMEOUT)
-            expect(page.locator("#tooltip")).to_contain_text(
-                "Aggregates events: 1, 2",
-                timeout=_INTERACT_TIMEOUT,
-            )
+            first_multi = multi_events[0]
+            page.locator(
+                f'#multiway-causal-svg circle[data-event-id="{first_multi["id"]}"]'
+            ).hover(timeout=_INTERACT_TIMEOUT)
+            tooltip_text = page.locator("#tooltip").inner_text(timeout=_INTERACT_TIMEOUT)
+            assert "Multiplicity:" not in tooltip_text
+            assert "Aggregates events:" not in tooltip_text
+            assert f"×{first_multi['multiplicity']}" not in tooltip_text
         finally:
             page.unroute("**/api/rules/rule3/multiway-causal", fulfill_multiway_causal)
