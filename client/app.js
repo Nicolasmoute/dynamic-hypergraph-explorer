@@ -38,6 +38,38 @@ const _computeState = {};   // ruleId → 'running' | 'stale' | 'cached' | 'erro
 let   _computeTimer  = null;
 // Stale detection: server-derived for custom jobs (pollJobUntilDone);
 // built-in rules rely on the 30s AbortController timeout in apiFetch.
+const _RULE_LOAD_STALL_MS = 15000;
+const _ruleLoadTokens = {};       // ruleId → monotonically increasing request token
+const _ruleLoadWatchdogs = {};    // ruleId → timeout id
+
+function _clearRuleLoadWatchdog(ruleId) {
+  const timer = _ruleLoadWatchdogs[ruleId];
+  if (timer) clearTimeout(timer);
+  delete _ruleLoadWatchdogs[ruleId];
+}
+
+function _bumpRuleLoadToken(ruleId) {
+  const next = (_ruleLoadTokens[ruleId] || 0) + 1;
+  _ruleLoadTokens[ruleId] = next;
+  return next;
+}
+
+function _isCurrentRuleLoad(ruleId, token) {
+  return activeRule === ruleId && _ruleLoadTokens[ruleId] === token;
+}
+
+function _armRuleLoadWatchdog(ruleId, token) {
+  _clearRuleLoadWatchdog(ruleId);
+  _ruleLoadWatchdogs[ruleId] = setTimeout(() => {
+    if (!_isCurrentRuleLoad(ruleId, token)) return;
+    // Force the initial load into a visible error state rather than leaving the
+    // canvas pane masked forever if the promise chain stalls or never settles.
+    _ruleLoadTokens[ruleId] = (_ruleLoadTokens[ruleId] || token) + 1;
+    stopComputeTimer();
+    _computeState[ruleId] = 'error';
+    showComputeOverlay('error', 'Initial rule load stalled — click Retry');
+  }, _RULE_LOAD_STALL_MS);
+}
 
 function showComputeOverlay(state, msg) {
   const el = document.getElementById('compute-overlay');
@@ -454,7 +486,7 @@ async function init() {
 const _loading = {};
 const _mwCausalLoading = {};
 
-async function loadRuleData(ruleId) {
+async function loadRuleData(ruleId, loadToken = 0) {
   if (DATA[ruleId]) return DATA[ruleId];
   if (_loading[ruleId]) return _loading[ruleId];
 
@@ -476,7 +508,8 @@ async function loadRuleData(ruleId) {
         _cacheKey: ruleData.key || ruleId,
       };
       _computeState[ruleId] = 'cached';
-      if (activeRule === ruleId) {
+      const isCurrentLoad = _isCurrentRuleLoad(ruleId, loadToken);
+      if (isCurrentLoad) {
         stopComputeTimer();
         hideComputeOverlay();
         // Mirror the sidebar setup that selectRule skipped on early-return:
@@ -500,7 +533,7 @@ async function loadRuleData(ruleId) {
       console.warn('Failed to load rule', ruleId, e);
       DATA[ruleId] = { _error: true, _errorMsg: e.message };
       _computeState[ruleId] = 'error';
-      if (activeRule === ruleId) {
+      if (_isCurrentRuleLoad(ruleId, loadToken)) {
         stopComputeTimer();
         showComputeOverlay('error',
           'Failed to load: ' + (e.message || 'server error') + ' — click Retry');
@@ -508,6 +541,7 @@ async function loadRuleData(ruleId) {
       return null;
     } finally {
       delete _loading[ruleId];
+      _clearRuleLoadWatchdog(ruleId);
     }
   })();
   return _loading[ruleId];
@@ -678,14 +712,17 @@ function selectRule(ruleId) {
   if (!data) {
     // Data not loaded yet — show overlay and clear any stale graph from prior rule
     updateExtendRow(); // hide extend button while loading
+    const loadToken = _bumpRuleLoadToken(ruleId);
     showComputeOverlay('running', 'Server is computing…');
     startComputeTimer(ruleId);
-    loadRuleData(ruleId);
+    _armRuleLoadWatchdog(ruleId, loadToken);
+    loadRuleData(ruleId, loadToken);
     renderCurrentView(); // clears old SVG content so it doesn't bleed through overlay
     return;
   }
 
   // Cached data available — hide overlay
+  _clearRuleLoadWatchdog(ruleId);
   stopComputeTimer();
   hideComputeOverlay();
 
