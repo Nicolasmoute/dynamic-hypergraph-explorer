@@ -552,7 +552,10 @@ async function loadMultiway(ruleId) {
   if (MULTIWAY[ruleId]) return;
   try {
     MULTIWAY[ruleId] = await apiFetch('/api/rules/' + ruleId + '/multiway');
-    if (activeRule === ruleId && currentView === 'multiway') renderMultiway();
+    if (activeRule === ruleId) {
+      if (currentView === 'multiway') renderMultiway();
+      if (currentView === 'multiway-causal') renderMultiwayCausal();
+    }
   } catch (e) {
     console.warn('Failed to load multiway for', ruleId, e);
   }
@@ -2558,34 +2561,19 @@ function renderMultiwayCausal() {
     );
   for (const ev of events) eventInfo[ev.id] = ev;
 
-  function getMultiplicity(ev) {
-    const direct = ev && (
-      ev.multiplicity ??
-      ev.count ??
-      ev.event_count ??
-      ev.aggregated_count ??
-      ev.agg_count
-    );
-    if (direct != null) {
-      const parsed = Number(direct);
-      if (Number.isFinite(parsed) && parsed > 1) return Math.floor(parsed);
-    }
+  if (!MULTIWAY[activeRule] && !activeRule.startsWith('custom_')) {
+    loadMultiway(activeRule);
+  }
 
-    const byIdMaps = [
-      data.multiplicity_by_id,
-      data.event_multiplicities,
-      data.multiplicities,
-      data.counts,
-    ];
-    for (const map of byIdMaps) {
-      if (!map) continue;
-      const raw = map[ev.id] ?? map[String(ev.id)];
-      if (raw == null) continue;
-      const parsed = Number(raw);
-      if (Number.isFinite(parsed) && parsed > 1) return Math.floor(parsed);
+  const multiplicityByEventId = new Map();
+  const multiway = MULTIWAY[activeRule];
+  for (const aggregate of (multiway && Array.isArray(multiway.aggregatedEdges) ? multiway.aggregatedEdges : [])) {
+    const multiplicity = Number(aggregate.multiplicity || 1);
+    if (!Number.isFinite(multiplicity) || multiplicity <= 1) continue;
+    for (const eventId of (aggregate.eventIds || [])) {
+      const current = multiplicityByEventId.get(eventId) || 1;
+      if (multiplicity > current) multiplicityByEventId.set(eventId, multiplicity);
     }
-
-    return 1;
   }
 
   const CAUSAL_NODE_CAP = 8000;
@@ -2633,7 +2621,7 @@ function renderMultiwayCausal() {
 
   const nodes = renderEvents.map(ev => Object.assign({ id: ev.id, mwcKind: ev.mwcKind }, posById.get(ev.id)));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
-  const multiplicityById = new Map(renderEvents.map(ev => [ev.id, getMultiplicity(ev)]));
+  const multiplicityById = new Map(renderEvents.map(ev => [ev.id, multiplicityByEventId.get(ev.id) || 1]));
   const stats = data.stats || {};
   const statsHasSummary = stats && (
     stats.event_count != null ||
@@ -2705,6 +2693,9 @@ function renderMultiwayCausal() {
     const badgeText = isDark ? '#f5f7fb' : '#1d2030';
     const badgeG = g.append('g').attr('pointer-events', 'none');
     badgeG.selectAll('g').data(badgeNodes).join('g')
+      .attr('class', 'mwc-multiplicity-badge')
+      .attr('data-event-id', d => d.id)
+      .attr('data-multiplicity', d => d.multiplicity)
       .attr('transform', d => `translate(${d.x + nodeR * 0.72}, ${d.y - nodeR * 0.72})`)
       .each(function(d) {
         const sel = d3.select(this);

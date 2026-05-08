@@ -330,3 +330,57 @@ class TestBrowserSmoke:
             assert red_slots != list(range(len(red_slots))), (
                 f"Red nodes in layer y={y} occupy the leading x slots: {red_slots}"
             )
+
+    def test_multiway_causal_multiplicity_badges_use_multiway_aggregates(
+        self, live_server: str, page: Page
+    ) -> None:
+        """The MWC view must source multiplicity badges from /multiway aggregates."""
+        self._wait_for_app_ready(page, live_server)
+
+        with urllib.request.urlopen(
+            f"{live_server}/api/rules/rule3/multiway",
+            timeout=10,
+        ) as resp:
+            multiway_payload = json.load(resp)
+
+        multiway_payload["aggregatedEdges"] = [
+            {
+                **multiway_payload["aggregatedEdges"][0],
+                "multiplicity": 2,
+                "eventIds": [1, 2],
+            }
+        ]
+
+        def fulfill_multiway(route):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(multiway_payload),
+            )
+
+        page.route("**/api/rules/rule3/multiway", fulfill_multiway)
+        try:
+            page.locator("#card-rule3").click()
+            page.get_by_role("button", name="Multiway Causal").click()
+            page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
+
+            page.wait_for_selector(
+                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="1"]',
+                timeout=_LOAD_TIMEOUT,
+            )
+            page.wait_for_selector(
+                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="2"]',
+                timeout=_LOAD_TIMEOUT,
+            )
+
+            badge_1 = page.locator(
+                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="1"] text'
+            )
+            badge_2 = page.locator(
+                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="2"] text'
+            )
+
+            expect(badge_1).to_have_text("×2", timeout=_INTERACT_TIMEOUT)
+            expect(badge_2).to_have_text("×2", timeout=_INTERACT_TIMEOUT)
+        finally:
+            page.unroute("**/api/rules/rule3/multiway", fulfill_multiway)
