@@ -65,6 +65,7 @@ function _armRuleLoadWatchdog(ruleId, token) {
     // Force the initial load into a visible error state rather than leaving the
     // canvas pane masked forever if the promise chain stalls or never settles.
     _ruleLoadTokens[ruleId] = (_ruleLoadTokens[ruleId] || token) + 1;
+    delete _loading[ruleId];
     stopComputeTimer();
     _computeState[ruleId] = 'error';
     showComputeOverlay('error', 'Initial rule load stalled — click Retry');
