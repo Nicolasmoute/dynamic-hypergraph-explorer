@@ -2,6 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Zeabur exposes the deployment commit SHA during build. Bake it into the
+# image so /health can report the live revision even when git metadata is not
+# present at runtime.
+ARG ZEABUR_GIT_COMMIT_SHA
+ENV DH_GIT_SHA=${ZEABUR_GIT_COMMIT_SHA}
+
 COPY server/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 

@@ -39,7 +39,15 @@ def _git_sha() -> str:
     except Exception:
         return "dev"
 
-_VERSION: str = _git_sha()
+def _version() -> str:
+    """Return the deployed git SHA, preferring an injected deploy marker."""
+    for value in (
+        os.environ.get("DH_GIT_SHA"),
+        os.environ.get("ZEABUR_GIT_COMMIT_SHA"),
+    ):
+        if value:
+            return value.strip()[:7]
+    return _git_sha()
 
 # ── Persistent cache configuration ───────────────────────────────────
 # Cache root: $DH_CACHE_DIR/<CACHE_VERSION>/ (default /data/cache/v9/ in
@@ -543,7 +551,7 @@ def health():
     return {
         "status": "ok",
         "uptime_s": int(_time.time() - _START_TIME),
-        "version": _VERSION,
+        "version": _version(),
         "cache_version": engine.CACHE_VERSION,
         "active_jobs": active,
     }

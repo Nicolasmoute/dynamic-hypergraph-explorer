@@ -35,6 +35,10 @@ class TestLiveness:
         v = client.get("/health").json()["version"]
         assert isinstance(v, str) and len(v) > 0
 
+    def test_health_prefers_injected_git_sha(self, client, monkeypatch):
+        monkeypatch.setenv("DH_GIT_SHA", "abcdef1")
+        assert client.get("/health").json()["version"] == "abcdef1"
+
 
 class TestClientServing:
     """Verify static client files are served with correct MIME types.
