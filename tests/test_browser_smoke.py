@@ -284,6 +284,12 @@ class TestBrowserSmoke:
 
         rendered_nodes = page.locator("#multiway-causal-svg circle[data-canonical-event-signature]")
         expect(rendered_nodes).to_have_count(len(canonical_signatures), timeout=_INTERACT_TIMEOUT)
+        rendered_signatures = page.evaluate(
+            """() => [...document.querySelectorAll(
+                '#multiway-causal-svg circle[data-canonical-event-signature]'
+            )].map(n => n.getAttribute('data-canonical-event-signature'))"""
+        )
+        assert len(rendered_signatures) == len(set(rendered_signatures))
         assert page.locator("#multiway-causal-svg .mwc-multiplicity-badge").count() == 0
 
         first_multi = multi_events[0]
@@ -294,6 +300,7 @@ class TestBrowserSmoke:
         assert "Multiplicity:" not in tooltip_text
         assert "Aggregates events:" not in tooltip_text
         assert f"×{first_multi['multiplicity']}" not in tooltip_text
+        assert f"Represents {len(first_multi['equivalentEventIds'])} events:" in tooltip_text
 
     @pytest.mark.parametrize("rule_id", ["rule1", "rule3", "rule4", "rule5"])
     def test_multiway_causal_coordinates_ignore_red_membership(

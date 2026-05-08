@@ -2561,18 +2561,22 @@ function renderMultiwayCausal() {
   const canonicalClassesBySignature = new Map();
   for (const ev of events) {
     const signature = ev.canonicalEventSignature || String(ev.id);
-    const group = canonicalClassesBySignature.get(signature);
+    const groupKey = `${ev.step}::${signature}`;
+    const group = canonicalClassesBySignature.get(groupKey);
     if (group) group.push(ev);
-    else canonicalClassesBySignature.set(signature, [ev]);
+    else canonicalClassesBySignature.set(groupKey, [ev]);
   }
 
-  const canonicalClasses = Array.from(canonicalClassesBySignature.entries()).map(([signature, members]) => {
-    const representative = members[0];
+  const canonicalClasses = Array.from(canonicalClassesBySignature.entries()).map(([groupKey, members]) => {
+    const sortedMembers = members.slice().sort((a, b) =>
+      (Number(a.id) - Number(b.id)) || String(a.id).localeCompare(String(b.id))
+    );
+    const representative = sortedMembers[0];
     return {
       id: representative.id,
-      signature,
+      signature: groupKey,
       representative,
-      members,
+      members: sortedMembers,
       multiplicity: members.length,
       red: members.some(ev => defaultPathIds.has(ev.id)),
     };
@@ -2701,12 +2705,16 @@ function renderMultiwayCausal() {
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
       const branch = classRedIds.has(d.id) ? 'Single-History greedy event' : 'other multiway occurrence';
+      const equivalentLine = d.multiplicity > 1
+        ? `\nRepresents ${d.multiplicity} events: ${d.equivalentEventIds.join(', ')}`
+        : '';
       showTooltip(ev,
         `Event #${d.id}  (step ${d.step})\n` +
         `${branch}\n` +
         `Match: ${info.match_idx != null ? info.match_idx : '--'}\n` +
         `Consumed: ${consumed || 'none'}\n` +
-        `Produced: ${produced || 'none'}`
+        `Produced: ${produced || 'none'}` +
+        equivalentLine
       );
     })
     .on('mouseleave', hideTooltip);
