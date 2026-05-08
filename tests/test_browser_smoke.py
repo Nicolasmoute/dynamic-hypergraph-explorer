@@ -71,6 +71,14 @@ class TestBrowserSmoke:
             timeout=_RENDER_TIMEOUT,
         )
 
+        # The initial rule load must also clear the compute overlay; otherwise
+        # the visualization pane stays dimmed even though the graph is ready.
+        page.wait_for_selector(
+            "#compute-overlay",
+            state="hidden",
+            timeout=_RENDER_TIMEOUT,
+        )
+
     # ------------------------------------------------------------------
     # Tests
     # ------------------------------------------------------------------
@@ -83,6 +91,7 @@ class TestBrowserSmoke:
 
         svg = page.locator("#main-svg")
         expect(svg).to_be_visible()
+        page.wait_for_selector("#compute-overlay", state="hidden", timeout=_RENDER_TIMEOUT)
 
         child_count = page.evaluate(
             "() => document.querySelector('#main-svg').children.length"
