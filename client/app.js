@@ -552,9 +552,7 @@ async function loadMultiway(ruleId) {
   if (MULTIWAY[ruleId]) return;
   try {
     MULTIWAY[ruleId] = await apiFetch('/api/rules/' + ruleId + '/multiway');
-    if (activeRule === ruleId) {
-      if (currentView === 'multiway') renderMultiway();
-    }
+    if (activeRule === ruleId && currentView === 'multiway') renderMultiway();
   } catch (e) {
     console.warn('Failed to load multiway for', ruleId, e);
   }
@@ -2670,38 +2668,6 @@ function renderMultiwayCausal() {
       );
     })
     .on('mouseleave', hideTooltip);
-
-  const badgeNodes = nodes
-    .map(d => Object.assign({ multiplicity: multiplicityById.get(d.id) || 1 }, d))
-    .filter(d => d.multiplicity > 1);
-  if (badgeNodes.length > 0) {
-    const badgeR = Math.max(6, Math.min(11, nodeR * 1.05));
-    const badgeFill = isDark ? '#11131a' : '#f5f7fb';
-    const badgeStroke = isDark ? '#4a4e66' : '#9aa0b3';
-    const badgeText = isDark ? '#f5f7fb' : '#1d2030';
-    const badgeG = g.append('g').attr('pointer-events', 'none');
-    badgeG.selectAll('g').data(badgeNodes).join('g')
-      .attr('class', 'mwc-multiplicity-badge')
-      .attr('data-event-id', d => d.id)
-      .attr('data-multiplicity', d => d.multiplicity)
-      .attr('transform', d => `translate(${d.x + nodeR * 0.72}, ${d.y - nodeR * 0.72})`)
-      .each(function(d) {
-        const sel = d3.select(this);
-        sel.append('circle')
-          .attr('r', badgeR)
-          .attr('fill', badgeFill)
-          .attr('stroke', badgeStroke)
-          .attr('stroke-width', 1.2);
-        sel.append('text')
-          .attr('text-anchor', 'middle')
-          .attr('dominant-baseline', 'middle')
-          .attr('fill', badgeText)
-          .attr('font-family', "'JetBrains Mono', monospace")
-          .attr('font-size', Math.max(8, badgeR * 0.95))
-          .attr('font-weight', 700)
-          .text('×' + d.multiplicity);
-      });
-  }
 
   const lg = g.append('g').attr('transform', `translate(${width - 200}, 20)`);
   lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');

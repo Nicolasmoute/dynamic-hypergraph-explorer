@@ -245,6 +245,53 @@ class TestBrowserSmoke:
         assert result["uniqueRedCount"] == 15
         assert result["yMultiplicity"] == [1, 2, 4, 8]
 
+    def test_multiway_causal_does_not_render_multiplicity_badges(
+        self, live_server: str, page: Page
+    ) -> None:
+        """MWC keeps multiplicity metadata in the payload but does not show badges."""
+        self._wait_for_app_ready(page, live_server)
+
+        with urllib.request.urlopen(
+            f"{live_server}/api/rules/rule3/multiway-causal",
+            timeout=10,
+        ) as resp:
+            payload = json.load(resp)
+
+        multi_events = [
+            ev
+            for ev in payload["events"]
+            if int(ev.get("multiplicity", 1)) > 1
+        ]
+        assert multi_events
+        assert any(
+            isinstance(ev.get("equivalentEventIds"), list)
+            and len(ev["equivalentEventIds"]) > 1
+            for ev in multi_events
+        )
+
+        page.locator("#card-rule3").click()
+        page.get_by_role("button", name="Multiway Causal").click()
+        page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
+        page.wait_for_function(
+            """() => {
+                const svg = document.querySelector('#multiway-causal-svg');
+                return svg && svg.querySelectorAll('circle[data-event-id]').length > 0;
+            }""",
+            timeout=_LOAD_TIMEOUT,
+        )
+
+        assert page.locator("#multiway-causal-svg .mwc-multiplicity-badge").count() == 0
+
+        first_multi = multi_events[0]
+        multiplicity = int(first_multi["multiplicity"])
+        page.locator(
+            f'#multiway-causal-svg circle[data-event-id="{first_multi["id"]}"]'
+        ).hover(timeout=_INTERACT_TIMEOUT)
+        expect(page.locator("#tooltip")).to_contain_text(
+            f"Multiplicity: ×{multiplicity}",
+            timeout=_INTERACT_TIMEOUT,
+        )
+
     @pytest.mark.parametrize("rule_id", ["rule1", "rule3", "rule4", "rule5"])
     def test_multiway_causal_coordinates_ignore_red_membership(
         self, live_server: str, page: Page, rule_id: str
