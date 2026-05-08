@@ -2558,6 +2558,36 @@ function renderMultiwayCausal() {
     );
   for (const ev of events) eventInfo[ev.id] = ev;
 
+  function getMultiplicity(ev) {
+    const direct = ev && (
+      ev.multiplicity ??
+      ev.count ??
+      ev.event_count ??
+      ev.aggregated_count ??
+      ev.agg_count
+    );
+    if (direct != null) {
+      const parsed = Number(direct);
+      if (Number.isFinite(parsed) && parsed > 1) return Math.floor(parsed);
+    }
+
+    const byIdMaps = [
+      data.multiplicity_by_id,
+      data.event_multiplicities,
+      data.multiplicities,
+      data.counts,
+    ];
+    for (const map of byIdMaps) {
+      if (!map) continue;
+      const raw = map[ev.id] ?? map[String(ev.id)];
+      if (raw == null) continue;
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed > 1) return Math.floor(parsed);
+    }
+
+    return 1;
+  }
+
   const CAUSAL_NODE_CAP = 8000;
   const totalVisible = events.length;
   const serverTruncated = !!data.truncated;
@@ -2603,6 +2633,7 @@ function renderMultiwayCausal() {
 
   const nodes = renderEvents.map(ev => Object.assign({ id: ev.id, mwcKind: ev.mwcKind }, posById.get(ev.id)));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
+  const multiplicityById = new Map(renderEvents.map(ev => [ev.id, getMultiplicity(ev)]));
   const stats = data.stats || {};
   const statsHasSummary = stats && (
     stats.event_count != null ||
@@ -2652,15 +2683,46 @@ function renderMultiwayCausal() {
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
       const branch = defaultPathIds.has(d.id) ? 'Single-History greedy event' : 'other multiway occurrence';
+      const multiplicity = multiplicityById.get(d.id) || 1;
       showTooltip(ev,
         `Event #${d.id}  (step ${d.step})\n` +
         `${branch}\n` +
         `Match: ${info.match_idx != null ? info.match_idx : '--'}\n` +
+        (multiplicity > 1 ? `Multiplicity: ×${multiplicity}\n` : '') +
         `Consumed: ${consumed || 'none'}\n` +
         `Produced: ${produced || 'none'}`
       );
     })
     .on('mouseleave', hideTooltip);
+
+  const badgeNodes = nodes
+    .map(d => Object.assign({ multiplicity: multiplicityById.get(d.id) || 1 }, d))
+    .filter(d => d.multiplicity > 1);
+  if (badgeNodes.length > 0) {
+    const badgeR = Math.max(6, Math.min(11, nodeR * 1.05));
+    const badgeFill = isDark ? '#11131a' : '#f5f7fb';
+    const badgeStroke = isDark ? '#4a4e66' : '#9aa0b3';
+    const badgeText = isDark ? '#f5f7fb' : '#1d2030';
+    const badgeG = g.append('g').attr('pointer-events', 'none');
+    badgeG.selectAll('g').data(badgeNodes).join('g')
+      .attr('transform', d => `translate(${d.x + nodeR * 0.72}, ${d.y - nodeR * 0.72})`)
+      .each(function(d) {
+        const sel = d3.select(this);
+        sel.append('circle')
+          .attr('r', badgeR)
+          .attr('fill', badgeFill)
+          .attr('stroke', badgeStroke)
+          .attr('stroke-width', 1.2);
+        sel.append('text')
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'middle')
+          .attr('fill', badgeText)
+          .attr('font-family', "'JetBrains Mono', monospace")
+          .attr('font-size', Math.max(8, badgeR * 0.95))
+          .attr('font-weight', 700)
+          .text('×' + d.multiplicity);
+      });
+  }
 
   const lg = g.append('g').attr('transform', `translate(${width - 200}, 20)`);
   lg.append('circle').attr('cx', 0).attr('cy', 0).attr('r', 5).attr('fill', '#ff4444');
