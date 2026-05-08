@@ -347,7 +347,9 @@ class TestBrowserSmoke:
             if ev["id"] == 1:
                 ev["multiplicity"] = 2
                 ev["equivalentEventIds"] = [1, 2]
-                break
+            if ev["id"] == 2:
+                ev["multiplicity"] = 2
+                ev["equivalentEventIds"] = [1, 2]
 
         def fulfill_multiway_causal(route):
             route.fulfill(
@@ -371,6 +373,16 @@ class TestBrowserSmoke:
                 '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="1"] text'
             )
             expect(badge_1).to_have_text("×2", timeout=_INTERACT_TIMEOUT)
+
+            page.wait_for_selector(
+                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="2"]',
+                timeout=_LOAD_TIMEOUT,
+            )
+
+            badge_2 = page.locator(
+                '#multiway-causal-svg .mwc-multiplicity-badge[data-event-id="2"] text'
+            )
+            expect(badge_2).to_have_text("×2", timeout=_INTERACT_TIMEOUT)
 
             page.locator('#multiway-causal-svg circle[data-event-id="1"]').hover(timeout=_INTERACT_TIMEOUT)
             expect(page.locator("#tooltip")).to_contain_text(

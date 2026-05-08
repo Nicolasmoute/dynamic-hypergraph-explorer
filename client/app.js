@@ -554,7 +554,6 @@ async function loadMultiway(ruleId) {
     MULTIWAY[ruleId] = await apiFetch('/api/rules/' + ruleId + '/multiway');
     if (activeRule === ruleId) {
       if (currentView === 'multiway') renderMultiway();
-      if (currentView === 'multiway-causal') renderMultiwayCausal();
     }
   } catch (e) {
     console.warn('Failed to load multiway for', ruleId, e);
