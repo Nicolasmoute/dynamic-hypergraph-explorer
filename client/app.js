@@ -2489,6 +2489,7 @@ function renderMultiwayCausal() {
   const events = occurrenceEvents
     .sort((a, b) => (a.step - b.step) || String(a.id).localeCompare(String(b.id)));
   for (const ev of events) eventInfo[ev.id] = ev;
+  const getLayoutDepth = ev => (ev.layout && ev.layout.depth != null) ? ev.layout.depth : (ev.step || 0);
 
   const CAUSAL_NODE_CAP = 8000;
   const totalVisible = events.length;
@@ -2506,24 +2507,25 @@ function renderMultiwayCausal() {
 
   const stepGroups = new Map();
   for (const ev of renderEvents) {
-    if (!stepGroups.has(ev.step)) stepGroups.set(ev.step, []);
-    stepGroups.get(ev.step).push(ev);
+    const depth = getLayoutDepth(ev);
+    if (!stepGroups.has(depth)) stepGroups.set(depth, []);
+    stepGroups.get(depth).push(ev);
   }
 
-  const maxStep = Math.max(1, ...renderEvents.map(ev => ev.step || 0));
+  const maxStep = Math.max(1, ...renderEvents.map(ev => getLayoutDepth(ev)));
   const PAD_X = 40;
   const PAD_Y = truncated ? 28 : 50;
   const usableW = width - 2 * PAD_X;
   const usableH = height - PAD_Y - 16;
   const posById = new Map();
 
-  for (const [step, group] of stepGroups.entries()) {
-    const y = PAD_Y + step * usableH / maxStep;
+  for (const [depth, group] of stepGroups.entries()) {
+    const y = PAD_Y + depth * usableH / maxStep;
     group.forEach((ev, i) => {
       const x = group.length === 1
         ? width / 2
         : PAD_X + usableW * i / (group.length - 1);
-      posById.set(ev.id, { x, y, step });
+      posById.set(ev.id, { x, y, step: depth });
     });
   }
 
@@ -2566,6 +2568,8 @@ function renderMultiwayCausal() {
     .attr('fill-opacity', 1)
     .attr('stroke', d => defaultPathIds.has(d.id) ? '#ff444480' : '#44dd8880')
     .attr('stroke-width', d => defaultPathIds.has(d.id) ? 2 : 1.5)
+    .attr('data-event-id', d => d.id)
+    .attr('data-red', d => defaultPathIds.has(d.id) ? 'true' : 'false')
     .style('cursor', 'default')
     .on('mouseenter', (ev, d) => {
       const info = eventInfo[d.id];

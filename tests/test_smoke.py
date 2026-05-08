@@ -64,6 +64,9 @@ class TestClientServing:
         assert "data.realized_causal_edges" not in text
         assert "Red = Single-History greedy events" in text
         assert "serial occurrence path" not in text
+        assert "layout.depth" in text
+        assert "data-event-id" in text
+        assert "data-red" in text
 
 
 class TestAPISurface:
