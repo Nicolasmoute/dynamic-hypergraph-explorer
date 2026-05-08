@@ -2558,28 +2558,68 @@ function renderMultiwayCausal() {
     );
   for (const ev of events) eventInfo[ev.id] = ev;
 
+  const canonicalClassesBySignature = new Map();
+  for (const ev of events) {
+    const signature = ev.canonicalEventSignature || String(ev.id);
+    const group = canonicalClassesBySignature.get(signature);
+    if (group) group.push(ev);
+    else canonicalClassesBySignature.set(signature, [ev]);
+  }
+
+  const canonicalClasses = Array.from(canonicalClassesBySignature.entries()).map(([signature, members]) => {
+    const representative = members[0];
+    return {
+      id: representative.id,
+      signature,
+      representative,
+      members,
+      multiplicity: members.length,
+      red: members.some(ev => defaultPathIds.has(ev.id)),
+    };
+  }).sort((a, b) =>
+    (layoutDepth(a.representative) - layoutDepth(b.representative)) ||
+    (layoutHash(a.representative) - layoutHash(b.representative)) ||
+    (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
+    String(a.id).localeCompare(String(b.id))
+  );
+
+  const classIdByEventId = new Map();
+  for (const cls of canonicalClasses) {
+    for (const ev of cls.members) classIdByEventId.set(ev.id, cls.id);
+  }
+  const classRedIds = new Set(canonicalClasses.filter(cls => cls.red).map(cls => cls.id));
+
   const CAUSAL_NODE_CAP = 8000;
-  const totalVisible = events.length;
+  const totalVisible = canonicalClasses.length;
   const serverTruncated = !!data.truncated;
   const clientTruncated = totalVisible > CAUSAL_NODE_CAP;
   const truncated = serverTruncated || clientTruncated;
-  const renderEvents = clientTruncated ? events.slice(-CAUSAL_NODE_CAP) : events;
-  const renderIds = new Set(renderEvents.map(ev => ev.id));
-  const renderEdges = (data.causal_edges || [])
-    .filter(([src, dst]) => renderIds.has(src) && renderIds.has(dst))
-    .map(([src, dst]) => ({ source: src, target: dst, mwcKind: 'occurrence' }));
+  const renderClasses = clientTruncated ? canonicalClasses.slice(-CAUSAL_NODE_CAP) : canonicalClasses;
+  const renderIds = new Set(renderClasses.map(cls => cls.id));
+  const renderEdges = [];
+  const seenEdgeKeys = new Set();
+  for (const [src, dst] of (data.causal_edges || [])) {
+    const source = classIdByEventId.get(src);
+    const target = classIdByEventId.get(dst);
+    if (source == null || target == null || source === target) continue;
+    if (!renderIds.has(source) || !renderIds.has(target)) continue;
+    const key = `${source}->${target}`;
+    if (seenEdgeKeys.has(key)) continue;
+    seenEdgeKeys.add(key);
+    renderEdges.push({ source, target, mwcKind: 'occurrence' });
+  }
 
   const g = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => g.attr('transform', e.transform)));
 
   const stepGroups = new Map();
-  for (const ev of renderEvents) {
-    const depth = layoutDepth(ev);
+  for (const cls of renderClasses) {
+    const depth = layoutDepth(cls.representative);
     if (!stepGroups.has(depth)) stepGroups.set(depth, []);
-    stepGroups.get(depth).push(ev);
+    stepGroups.get(depth).push(cls);
   }
 
-  const maxStep = Math.max(1, ...renderEvents.map(layoutDepth));
+  const maxStep = Math.max(1, ...renderClasses.map(cls => layoutDepth(cls.representative)));
   const PAD_X = 40;
   const PAD_Y = truncated ? 28 : 50;
   const usableW = width - 2 * PAD_X;
@@ -2589,19 +2629,25 @@ function renderMultiwayCausal() {
   for (const [step, group] of stepGroups.entries()) {
     const y = PAD_Y + step * usableH / maxStep;
     const ordered = group.slice().sort((a, b) =>
-      (layoutHash(a) - layoutHash(b)) ||
-      (layoutOrder(a) - layoutOrder(b)) ||
+      (layoutHash(a.representative) - layoutHash(b.representative)) ||
+      (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
       String(a.id).localeCompare(String(b.id))
     );
-    ordered.forEach((ev, i) => {
+    ordered.forEach((cls, i) => {
       const x = group.length === 1
         ? width / 2
         : PAD_X + usableW * i / (group.length - 1);
-      posById.set(ev.id, { x, y, step });
+      posById.set(cls.id, { x, y, step });
     });
   }
 
-  const nodes = renderEvents.map(ev => Object.assign({ id: ev.id, mwcKind: ev.mwcKind }, posById.get(ev.id)));
+  const nodes = renderClasses.map(cls => Object.assign({
+    id: cls.id,
+    mwcKind: 'occurrence',
+    canonicalEventSignature: cls.signature,
+    equivalentEventIds: cls.members.map(ev => ev.id),
+    multiplicity: cls.multiplicity,
+  }, posById.get(cls.id)));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
   const stats = data.stats || {};
   const statsHasSummary = stats && (
@@ -2628,20 +2674,23 @@ function renderMultiwayCausal() {
     .attr('y1', d => (posById.get(d.source) || {}).y || 0)
     .attr('x2', d => (posById.get(d.target) || {}).x || 0)
     .attr('y2', d => (posById.get(d.target) || {}).y || 0)
-    .attr('stroke', d => (defaultPathIds.has(d.source) && defaultPathIds.has(d.target)) ? '#ff444480' : '#44dd8880')
+    .attr('stroke', d => (classRedIds.has(d.source) && classRedIds.has(d.target)) ? '#ff444480' : '#44dd8880')
     .attr('stroke-width', 2)
-    .attr('marker-end', d => (defaultPathIds.has(d.source) && defaultPathIds.has(d.target)) ? 'url(#mwc-arrow-red)' : 'url(#mwc-arrow-green)');
+    .attr('marker-end', d => (classRedIds.has(d.source) && classRedIds.has(d.target)) ? 'url(#mwc-arrow-red)' : 'url(#mwc-arrow-green)');
 
   g.append('g').selectAll('circle').data(nodes).join('circle')
     .attr('data-event-id', d => d.id)
-    .attr('data-red', d => defaultPathIds.has(d.id) ? 'true' : 'false')
+    .attr('data-canonical-event-signature', d => d.canonicalEventSignature)
+    .attr('data-equivalent-event-ids', d => JSON.stringify(d.equivalentEventIds))
+    .attr('data-multiplicity', d => d.multiplicity)
+    .attr('data-red', d => classRedIds.has(d.id) ? 'true' : 'false')
     .attr('cx', d => d.x)
     .attr('cy', d => d.y)
-    .attr('r', d => defaultPathIds.has(d.id) ? nodeR * 1.35 : nodeR)
-    .attr('fill', d => defaultPathIds.has(d.id) ? '#ff4444' : '#44dd88')
+    .attr('r', d => classRedIds.has(d.id) ? nodeR * 1.35 : nodeR)
+    .attr('fill', d => classRedIds.has(d.id) ? '#ff4444' : '#44dd88')
     .attr('fill-opacity', 1)
-    .attr('stroke', d => defaultPathIds.has(d.id) ? '#ff444480' : '#44dd8880')
-    .attr('stroke-width', d => defaultPathIds.has(d.id) ? 2 : 1.5)
+    .attr('stroke', d => classRedIds.has(d.id) ? '#ff444480' : '#44dd8880')
+    .attr('stroke-width', d => classRedIds.has(d.id) ? 2 : 1.5)
     .style('cursor', 'default')
     .on('mouseenter', (ev, d) => {
       const info = eventInfo[d.id];
@@ -2651,7 +2700,7 @@ function renderMultiwayCausal() {
       }
       const consumed = (info.consumed || []).map(e => '{' + e.join(',') + '}').join(' ');
       const produced = (info.produced || []).map(e => '{' + e.join(',') + '}').join(' ');
-      const branch = defaultPathIds.has(d.id) ? 'Single-History greedy event' : 'other multiway occurrence';
+      const branch = classRedIds.has(d.id) ? 'Single-History greedy event' : 'other multiway occurrence';
       showTooltip(ev,
         `Event #${d.id}  (step ${d.step})\n` +
         `${branch}\n` +

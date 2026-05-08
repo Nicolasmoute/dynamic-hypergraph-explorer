@@ -245,10 +245,10 @@ class TestBrowserSmoke:
         assert result["uniqueRedCount"] == 15
         assert result["yMultiplicity"] == [1, 2, 4, 8]
 
-    def test_multiway_causal_does_not_render_multiplicity_badges(
+    def test_multiway_causal_collapses_equivalent_events_into_canonical_nodes(
         self, live_server: str, page: Page
     ) -> None:
-        """MWC keeps multiplicity metadata in the payload but does not show badges."""
+        """MWC renders one node per canonical class and hides badge-era text."""
         self._wait_for_app_ready(page, live_server)
 
         with urllib.request.urlopen(
@@ -262,7 +262,9 @@ class TestBrowserSmoke:
             for ev in payload["events"]
             if int(ev.get("multiplicity", 1)) > 1
         ]
+        canonical_signatures = {ev["canonicalEventSignature"] for ev in payload["events"]}
         assert multi_events
+        assert len(canonical_signatures) < len(payload["events"])
         assert any(
             isinstance(ev.get("equivalentEventIds"), list)
             and len(ev["equivalentEventIds"]) > 1
@@ -280,17 +282,18 @@ class TestBrowserSmoke:
             timeout=_LOAD_TIMEOUT,
         )
 
+        rendered_nodes = page.locator("#multiway-causal-svg circle[data-canonical-event-signature]")
+        expect(rendered_nodes).to_have_count(len(canonical_signatures), timeout=_INTERACT_TIMEOUT)
         assert page.locator("#multiway-causal-svg .mwc-multiplicity-badge").count() == 0
 
         first_multi = multi_events[0]
-        multiplicity = int(first_multi["multiplicity"])
         page.locator(
             f'#multiway-causal-svg circle[data-event-id="{first_multi["id"]}"]'
         ).hover(timeout=_INTERACT_TIMEOUT)
-        expect(page.locator("#tooltip")).to_contain_text(
-            f"Multiplicity: ×{multiplicity}",
-            timeout=_INTERACT_TIMEOUT,
-        )
+        tooltip_text = page.locator("#tooltip").inner_text(timeout=_INTERACT_TIMEOUT)
+        assert "Multiplicity:" not in tooltip_text
+        assert "Aggregates events:" not in tooltip_text
+        assert f"×{first_multi['multiplicity']}" not in tooltip_text
 
     @pytest.mark.parametrize("rule_id", ["rule1", "rule3", "rule4", "rule5"])
     def test_multiway_causal_coordinates_ignore_red_membership(
@@ -309,9 +312,9 @@ class TestBrowserSmoke:
             """({ ruleId, payload }) => {
                 function coords() {
                     const out = {};
-                    document.querySelectorAll('#multiway-causal-svg circle[data-event-id]')
+                    document.querySelectorAll('#multiway-causal-svg circle[data-canonical-event-signature]')
                         .forEach(n => {
-                            out[n.getAttribute('data-event-id')] = {
+                            out[n.getAttribute('data-canonical-event-signature')] = {
                                 x: Number(n.getAttribute('cx')),
                                 y: Number(n.getAttribute('cy')),
                                 red: n.getAttribute('data-red') === 'true',
@@ -324,6 +327,9 @@ class TestBrowserSmoke:
                 activeRule = ruleId;
                 currentView = 'multiway-causal';
                 renderMultiwayCausal();
+                const sigById = Object.fromEntries(
+                    payload.events.map(ev => [String(ev.id), ev.canonicalEventSignature])
+                );
                 const withRed = coords();
 
                 MWCAUSAL[ruleId] = {
@@ -339,13 +345,15 @@ class TestBrowserSmoke:
                 return {
                     withRed,
                     withoutRed,
-                    redIds: payload.default_path_event_ids.map(String),
+                    redSignatures: payload.default_path_event_ids.map(
+                        id => sigById[String(id)]
+                    ),
                 };
             }""",
             {"ruleId": rule_id, "payload": payload},
         )
 
-        assert comparison["redIds"]
+        assert comparison["redSignatures"]
         with_xy = {
             event_id: (entry["x"], entry["y"])
             for event_id, entry in comparison["withRed"].items()
@@ -355,10 +363,10 @@ class TestBrowserSmoke:
             for event_id, entry in comparison["withoutRed"].items()
         }
         assert with_xy == without_xy
-        for red_id in comparison["redIds"]:
-            assert red_id in comparison["withRed"], red_id
-            assert comparison["withRed"][red_id]["red"] is True, red_id
-            assert comparison["withoutRed"][red_id]["red"] is False, red_id
+        for red_signature in comparison["redSignatures"]:
+            assert red_signature in comparison["withRed"], red_signature
+            assert comparison["withRed"][red_signature]["red"] is True, red_signature
+            assert comparison["withoutRed"][red_signature]["red"] is False, red_signature
 
         layers: dict[float, list[tuple[float, bool]]] = {}
         for entry in comparison["withRed"].values():
@@ -377,63 +385,3 @@ class TestBrowserSmoke:
             assert red_slots != list(range(len(red_slots))), (
                 f"Red nodes in layer y={y} occupy the leading x slots: {red_slots}"
             )
-
-    def test_multiway_causal_does_not_render_multiplicity_badges(
-        self, live_server: str, page: Page
-    ) -> None:
-        """MWC keeps multiplicity metadata in the payload but does not show badges."""
-        self._wait_for_app_ready(page, live_server)
-
-        with urllib.request.urlopen(
-            f"{live_server}/api/rules/rule3/multiway-causal",
-            timeout=10,
-        ) as resp:
-            multiway_causal_payload = json.load(resp)
-
-        for ev in multiway_causal_payload["events"]:
-            if ev["id"] == 1:
-                ev["multiplicity"] = 2
-                ev["equivalentEventIds"] = [1, 2]
-            if ev["id"] == 2:
-                ev["multiplicity"] = 2
-                ev["equivalentEventIds"] = [1, 2]
-
-        multi_events = [
-            ev
-            for ev in multiway_causal_payload["events"]
-            if int(ev.get("multiplicity", 1)) > 1
-        ]
-        assert multi_events
-        assert any(
-            isinstance(ev.get("equivalentEventIds"), list)
-            and len(ev["equivalentEventIds"]) > 1
-            for ev in multi_events
-        )
-
-        def fulfill_multiway_causal(route):
-            route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps(multiway_causal_payload),
-            )
-
-        page.route("**/api/rules/rule3/multiway-causal", fulfill_multiway_causal)
-        try:
-            page.locator("#card-rule3").click()
-            page.get_by_role("button", name="Multiway Causal").click()
-            page.wait_for_selector("#multiway-causal-view.active", timeout=_INTERACT_TIMEOUT)
-
-            expect(page.locator("#multiway-causal-svg .mwc-multiplicity-badge")).to_have_count(
-                0, timeout=_INTERACT_TIMEOUT
-            )
-
-            first_multi = multi_events[0]
-            page.locator(
-                f'#multiway-causal-svg circle[data-event-id="{first_multi["id"]}"]'
-            ).hover(timeout=_INTERACT_TIMEOUT)
-            tooltip_text = page.locator("#tooltip").inner_text(timeout=_INTERACT_TIMEOUT)
-            assert "Multiplicity:" not in tooltip_text
-            assert "Aggregates events:" not in tooltip_text
-            assert f"×{first_multi['multiplicity']}" not in tooltip_text
-        finally:
-            page.unroute("**/api/rules/rule3/multiway-causal", fulfill_multiway_causal)
