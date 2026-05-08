@@ -286,6 +286,8 @@ class TestBrowserSmoke:
                 for idx, (_, is_red) in enumerate(sorted(nodes, key=lambda item: item[0]))
                 if is_red
             ]
+            if not red_slots:
+                continue
             assert red_slots != list(range(len(red_slots))), (
                 f"Red nodes in layer y={y} occupy the leading x slots: {red_slots}"
             )
