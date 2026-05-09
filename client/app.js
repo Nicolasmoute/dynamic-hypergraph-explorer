@@ -2566,7 +2566,7 @@ function renderMultiwayCausal() {
 
     for (const ev of events) {
       const canonicalSignature = ev.canonicalEventSignature || String(ev.id);
-      const classKey = `${ev.step}::${canonicalSignature}`;
+      const classKey = canonicalSignature;
       let cls = classByKey.get(classKey);
       if (!cls) {
         cls = {
@@ -2626,17 +2626,13 @@ function renderMultiwayCausal() {
       const source = classIdByKey.get(sourceKey);
       const target = classIdByKey.get(targetKey);
       if (source == null || target == null || source === target) continue;
-      const sourceMultiplicity = classMultiplicityByKey.get(sourceKey) || 0;
-      const targetMultiplicity = classMultiplicityByKey.get(targetKey) || 0;
-      if (sourceMultiplicity <= 2 && targetMultiplicity <= 2) {
-        let seenTargets = seenTargetsBySource.get(source);
-        if (!seenTargets) {
-          seenTargets = new Set();
-          seenTargetsBySource.set(source, seenTargets);
-        }
-        if (seenTargets.has(target)) continue;
-        seenTargets.add(target);
+      let seenTargets = seenTargetsBySource.get(source);
+      if (!seenTargets) {
+        seenTargets = new Set();
+        seenTargetsBySource.set(source, seenTargets);
       }
+      if (seenTargets.has(target)) continue;
+      seenTargets.add(target);
       renderEdgesAll.push({ source, target, mwcKind: 'occurrence' });
     }
 
