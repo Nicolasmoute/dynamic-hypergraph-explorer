@@ -2521,8 +2521,6 @@ function renderMultiwayCausal() {
     return;
   }
 
-  const eventInfo = {};
-  const occurrenceEvents = data.events.map(ev => Object.assign({ mwcKind: 'occurrence' }, ev));
   const defaultPathIds = new Set(data.default_path_event_ids || []);
   // Contract §6: compute one unified coordinate per ordinary event before
   // styling red/green; never lay out a separate red-only node set.
@@ -2549,18 +2547,21 @@ function renderMultiwayCausal() {
     }
     return h >>> 0;
   };
-  const events = occurrenceEvents
-    .sort((a, b) =>
+
+  // Cache layer 1: canonical model + sorted events + eventInfo (keyed on data object lifetime).
+  const canonicalModelCache = renderMultiwayCausal._canonicalModelCache || (renderMultiwayCausal._canonicalModelCache = new WeakMap());
+  let canonicalModel = data._canonicalModel || canonicalModelCache.get(data);
+  if (!canonicalModel) {
+    const occurrenceEvents = data.events.map(ev => Object.assign({ mwcKind: 'occurrence' }, ev));
+    const events = occurrenceEvents.sort((a, b) =>
       (layoutDepth(a) - layoutDepth(b)) ||
       (layoutHash(a) - layoutHash(b)) ||
       (layoutOrder(a) - layoutOrder(b)) ||
       String(a.id).localeCompare(String(b.id))
     );
-  for (const ev of events) eventInfo[ev.id] = ev;
+    const eventInfoMap = new Map();
+    for (const ev of events) eventInfoMap.set(ev.id, ev);
 
-  const canonicalModelCache = renderMultiwayCausal._canonicalModelCache || (renderMultiwayCausal._canonicalModelCache = new WeakMap());
-  let canonicalModel = data._canonicalModel || canonicalModelCache.get(data);
-  if (!canonicalModel) {
     const classByKey = new Map();
     const classKeyByEventId = new Map();
 
@@ -2593,7 +2594,7 @@ function renderMultiwayCausal() {
       );
       let representative = null;
       for (const memberId of memberIds) {
-        representative = eventInfo[memberId];
+        representative = eventInfoMap.get(memberId);
         if (representative) break;
       }
       if (!representative) representative = cls.representative || events[0];
@@ -2636,13 +2637,14 @@ function renderMultiwayCausal() {
       renderEdgesAll.push({ source, target, mwcKind: 'occurrence' });
     }
 
-    canonicalModel = { canonicalClasses, classRedIds, renderEdgesAll };
+    canonicalModel = { canonicalClasses, classRedIds, renderEdgesAll, sortedEvents: events, eventInfoMap };
     data._canonicalModel = canonicalModel;
     canonicalModelCache.set(data, canonicalModel);
   }
 
   const canonicalClasses = canonicalModel.canonicalClasses;
   const classRedIds = canonicalModel.classRedIds;
+  const eventInfoMap = canonicalModel.eventInfoMap;
 
   const CAUSAL_NODE_CAP = 8000;
   const totalVisible = canonicalClasses.length;
@@ -2655,46 +2657,54 @@ function renderMultiwayCausal() {
     ? canonicalModel.renderEdgesAll.filter(d => renderIds.has(d.source) && renderIds.has(d.target))
     : canonicalModel.renderEdgesAll;
 
+  // Cache layer 2: layout positions + nodes array (keyed on data × canvas size).
+  // Invalidated automatically when data reference changes (WeakMap) or dimensions change.
+  const layoutCache = renderMultiwayCausal._layoutCache || (renderMultiwayCausal._layoutCache = new WeakMap());
+  const sizeKey = `${width}x${height}`;
+  let layoutEntry = layoutCache.has(data) ? layoutCache.get(data).get(sizeKey) : undefined;
+  if (!layoutEntry && width > 0 && height > 0) {
+    const PAD_X = 40;
+    const PAD_Y = truncated ? 28 : 50;
+    const usableW = width - 2 * PAD_X;
+    const usableH = height - PAD_Y - 16;
+    const maxStep = Math.max(1, ...renderClasses.map(cls => layoutDepth(cls.representative)));
+    const stepGroups = new Map();
+    for (const cls of renderClasses) {
+      const depth = layoutDepth(cls.representative);
+      if (!stepGroups.has(depth)) stepGroups.set(depth, []);
+      stepGroups.get(depth).push(cls);
+    }
+    const posById = new Map();
+    for (const [step, group] of stepGroups.entries()) {
+      const y = PAD_Y + step * usableH / maxStep;
+      const ordered = group.slice().sort((a, b) =>
+        (layoutHash(a.representative) - layoutHash(b.representative)) ||
+        (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
+        String(a.id).localeCompare(String(b.id))
+      );
+      ordered.forEach((cls, i) => {
+        const x = group.length === 1
+          ? width / 2
+          : PAD_X + usableW * i / (group.length - 1);
+        posById.set(cls.id, { x, y, step });
+      });
+    }
+    const nodes = renderClasses.map(cls => Object.assign({
+      id: cls.id,
+      mwcKind: 'occurrence',
+      canonicalEventSignature: cls.signature,
+      equivalentEventIds: cls.members.slice(),
+      multiplicity: cls.multiplicity,
+    }, posById.get(cls.id)));
+    const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
+    layoutEntry = { posById, nodes, nodeR };
+    if (!layoutCache.has(data)) layoutCache.set(data, new Map());
+    layoutCache.get(data).set(sizeKey, layoutEntry);
+  }
+  const { posById, nodes, nodeR } = layoutEntry || { posById: new Map(), nodes: [], nodeR: 1.5 };
+
   const g = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => g.attr('transform', e.transform)));
-
-  const stepGroups = new Map();
-  for (const cls of renderClasses) {
-    const depth = layoutDepth(cls.representative);
-    if (!stepGroups.has(depth)) stepGroups.set(depth, []);
-    stepGroups.get(depth).push(cls);
-  }
-
-  const maxStep = Math.max(1, ...renderClasses.map(cls => layoutDepth(cls.representative)));
-  const PAD_X = 40;
-  const PAD_Y = truncated ? 28 : 50;
-  const usableW = width - 2 * PAD_X;
-  const usableH = height - PAD_Y - 16;
-  const posById = new Map();
-
-  for (const [step, group] of stepGroups.entries()) {
-    const y = PAD_Y + step * usableH / maxStep;
-    const ordered = group.slice().sort((a, b) =>
-      (layoutHash(a.representative) - layoutHash(b.representative)) ||
-      (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
-      String(a.id).localeCompare(String(b.id))
-    );
-    ordered.forEach((cls, i) => {
-      const x = group.length === 1
-        ? width / 2
-        : PAD_X + usableW * i / (group.length - 1);
-      posById.set(cls.id, { x, y, step });
-    });
-  }
-
-  const nodes = renderClasses.map(cls => Object.assign({
-    id: cls.id,
-    mwcKind: 'occurrence',
-    canonicalEventSignature: cls.signature,
-    equivalentEventIds: cls.members.slice(),
-    multiplicity: cls.multiplicity,
-  }, posById.get(cls.id)));
-  const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
   const stats = data.stats || {};
   const statsHasSummary = stats && (
     stats.event_count != null ||
@@ -2739,7 +2749,7 @@ function renderMultiwayCausal() {
     .attr('stroke-width', d => classRedIds.has(d.id) ? 2 : 1.5)
     .style('cursor', 'default')
     .on('mouseenter', (ev, d) => {
-      const info = eventInfo[d.id];
+      const info = eventInfoMap.get(d.id);
       if (!info) {
         showTooltip(ev, `Event ${d.id} (step ${d.step})`);
         return;
