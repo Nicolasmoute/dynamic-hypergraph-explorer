@@ -2387,12 +2387,15 @@ function _drawAppHighlightOverlay(ctx, nodes, nodeById, links, currentState, tra
   function highlightEdges(edgeList, color) {
     if (!edgeList.length) return;
     ctx.save();
-    if (transform) {
-      ctx.translate(transform.x, transform.y);
-      ctx.scale(transform.k, transform.k);
-    }
+    // IMPORTANT: CanvasRenderer.drawFrame() leaves the canvas context with the full
+    // DPR + translate + zoom-scale transform already applied. Drawing sNode.x/y directly
+    // here places marks in graph-coordinate space — exactly where the renderer drew them.
+    // Do NOT re-apply transform here; doing so causes double-transformation (the bug where
+    // the amber highlight "floats off" to a wrong position).
     ctx.strokeStyle = color;
-    ctx.lineWidth   = 4;
+    // lineWidth in the already-transformed space: divide by zoom-scale so the visual
+    // stroke stays ~3 screen-pixels regardless of zoom level.
+    ctx.lineWidth   = 3 / ((transform && transform.k) || 1);
     ctx.globalAlpha = 0.85;
     ctx.setLineDash([]);
 
