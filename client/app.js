@@ -2224,6 +2224,35 @@ function stepAtomicFrameForward() {
   startSubFrameAnimation(_appPlaybackFrames[atomicFrameCursor]);
 }
 
+// Seed RHS-only new nodes at the LHS centroid in _prevNodePositions.
+// Called just before the Phase 2 render so newly produced nodes warm-start
+// near where the consumed (LHS) match was, instead of flickering at (0,0).
+function _seedRhsNodesAtLhsCentroid(consumedEdges, producedEdges) {
+  // Compute centroid of all LHS (consumed) nodes using their current known positions.
+  let sumX = 0, sumY = 0, count = 0;
+  const lhsNodeIds = new Set(consumedEdges.flat());
+  for (const nid of lhsNodeIds) {
+    const pos = _prevNodePositions.get(nid);
+    if (pos) { sumX += pos.x; sumY += pos.y; count++; }
+  }
+  if (count === 0) return; // LHS positions not yet known (e.g. first tick) — no-op
+  const cx = sumX / count;
+  const cy = sumY / count;
+
+  // Seed each RHS-only new node at the centroid with a tiny random jitter
+  // so the force simulation can separate overlapping new nodes.
+  const JITTER = 6;
+  const rhsNodeIds = new Set(producedEdges.flat());
+  for (const nid of rhsNodeIds) {
+    if (!lhsNodeIds.has(nid) && !_prevNodePositions.has(nid)) {
+      _prevNodePositions.set(nid, {
+        x: cx + (Math.random() - 0.5) * JITTER,
+        y: cy + (Math.random() - 0.5) * JITTER,
+      });
+    }
+  }
+}
+
 // Three-phase sub-frame animation per contract §8.3
 // All durations scale by 1/playbackSpeedMult; Phase 1 clamped to ≥80ms.
 function startSubFrameAnimation(frame) {
@@ -2239,7 +2268,10 @@ function startSubFrameAnimation(frame) {
   renderCurrentViewApplication(beforeState);
 
   _appSubFrameTimer = setTimeout(() => {
-    // Phase 2: show AFTER state with produced edges highlighted (violet)
+    // Phase 2: show AFTER state with produced edges highlighted (violet).
+    // Seed RHS-only new nodes at LHS centroid before render so they don't
+    // flicker at (0,0) while the force layout settles them.
+    _seedRhsNodesAtLhsCentroid(frame.consumed, frame.produced);
     _appHighlight = { consumed: [], produced: frame.produced, phase: 'transition' };
     renderCurrentViewApplication(frame.state);
 
