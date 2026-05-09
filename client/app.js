@@ -2549,13 +2549,12 @@ function renderMultiwayCausal() {
     }
     return h >>> 0;
   };
+  // Schwartzian transform: pre-compute layout keys once per event so layoutHash()
+  // is called exactly n times instead of O(n log n) times during the sort.
   const events = occurrenceEvents
-    .sort((a, b) =>
-      (layoutDepth(a) - layoutDepth(b)) ||
-      (layoutHash(a) - layoutHash(b)) ||
-      (layoutOrder(a) - layoutOrder(b)) ||
-      String(a.id).localeCompare(String(b.id))
-    );
+    .map(ev => [layoutDepth(ev), layoutHash(ev), layoutOrder(ev), String(ev.id), ev])
+    .sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]) || (a[2] - b[2]) || a[3].localeCompare(b[3]))
+    .map(t => t[4]);
   for (const ev of events) eventInfo[ev.id] = ev;
 
   const canonicalModelCache = renderMultiwayCausal._canonicalModelCache || (renderMultiwayCausal._canonicalModelCache = new WeakMap());
@@ -2607,12 +2606,10 @@ function renderMultiwayCausal() {
         multiplicity,
         red: memberIds.some(id => defaultPathIds.has(id)),
       };
-    }).sort((a, b) =>
-      (layoutDepth(a.representative) - layoutDepth(b.representative)) ||
-      (layoutHash(a.representative) - layoutHash(b.representative)) ||
-      (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
-      String(a.id).localeCompare(String(b.id))
-    );
+    // Schwartzian transform: pre-compute representative layout keys once per class.
+    }).map(cls => [layoutDepth(cls.representative), layoutHash(cls.representative), layoutOrder(cls.representative), String(cls.id), cls])
+      .sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]) || (a[2] - b[2]) || a[3].localeCompare(b[3]))
+      .map(t => t[4]);
 
     const classIdByKey = new Map(canonicalClasses.map(cls => [cls.signature, cls.id]));
     const classMultiplicityByKey = new Map(canonicalClasses.map(cls => [cls.signature, cls.multiplicity]));
@@ -2674,11 +2671,11 @@ function renderMultiwayCausal() {
 
   for (const [step, group] of stepGroups.entries()) {
     const y = PAD_Y + step * usableH / maxStep;
-    const ordered = group.slice().sort((a, b) =>
-      (layoutHash(a.representative) - layoutHash(b.representative)) ||
-      (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
-      String(a.id).localeCompare(String(b.id))
-    );
+    // Schwartzian transform: pre-compute hash + order per class for the per-step sort.
+    const ordered = group
+      .map(cls => [layoutHash(cls.representative), layoutOrder(cls.representative), String(cls.id), cls])
+      .sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]) || a[2].localeCompare(b[2]))
+      .map(t => t[3]);
     ordered.forEach((cls, i) => {
       const x = group.length === 1
         ? width / 2
