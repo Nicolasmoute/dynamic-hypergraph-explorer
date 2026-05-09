@@ -2433,7 +2433,9 @@ function _drawAppHighlightOverlay(ctx, nodes, nodeById, links, currentState, tra
 
 function stepPlus1() {
   if (playbackMode === 'application') {
-    setAtomicFrame(atomicFrameCursor + 1);
+    // Route through the animation pipeline (LHS→RHS sub-frame visual) instead
+    // of jumping directly, so manual "+" matches the auto-play experience.
+    stepAtomicFrameForward();
     return;
   }
   const data = DATA[activeRule];
@@ -2480,8 +2482,8 @@ document.addEventListener('keydown', e => {
   if (!data) return;
   // Application mode: arrows navigate atomic frames (regardless of play state)
   if (playbackMode === 'application') {
-    if (e.key === 'ArrowLeft')  { e.preventDefault(); setAtomicFrame(atomicFrameCursor - 1); return; }
-    if (e.key === 'ArrowRight') { e.preventDefault(); setAtomicFrame(atomicFrameCursor + 1); return; }
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); setAtomicFrame(atomicFrameCursor - 1); return; }  // instant back-jump
+    if (e.key === 'ArrowRight') { e.preventDefault(); stepAtomicFrameForward(); return; }  // animated forward
     if (e.key === ' ') { e.preventDefault(); togglePlay(); return; }
     if (e.key === 'Escape') clearLineage();
     return;
