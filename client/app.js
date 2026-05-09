@@ -710,8 +710,16 @@ function removeCustomRule(ruleId) {
 function selectRule(ruleId) {
   // Stop playback before switching rules so the play button stays consistent
   if (playing) togglePlay();
-  // Reset application-mode playback state on rule change (contract §6.3)
+  // Reset application-mode playback state on rule change (contract §6.3).
+  // Flip mode to 'step' first so the UI (step slider, mode buttons) is consistent
+  // before the new rule's render runs. _resetAppPlayback() clears frame state;
+  // the explicit mode assignment + UI update below ensures the slider stays enabled.
   _resetAppPlayback();
+  if (playbackMode === 'application') {
+    playbackMode = 'step';
+    _updatePlaybackModeUI();
+    _updateStepSliderDisabled();
+  }
   activeRule = ruleId;
   clearLineage();
   document.querySelectorAll('.rule-card').forEach(c => c.classList.remove('active'));
@@ -2384,6 +2392,10 @@ function _drawAppHighlightOverlay(ctx, nodes, nodeById, links, currentState, tra
 // =========================================================================
 
 function stepPlus1() {
+  if (playbackMode === 'application') {
+    setAtomicFrame(atomicFrameCursor + 1);
+    return;
+  }
   const data = DATA[activeRule];
   const max = (data.states || []).length - 1;
   if (currentStep < max) setStep(currentStep + 1);
