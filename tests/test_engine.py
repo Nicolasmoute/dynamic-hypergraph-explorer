@@ -5,6 +5,7 @@ Run from the repo root:
     pytest
 """
 from __future__ import annotations
+import hashlib
 import pytest
 from server import engine
 
@@ -160,6 +161,52 @@ class TestEvolve:
         result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=3)
         for edge in result["causal_edges"]:
             assert len(edge) == 2
+
+
+class TestCacheVersion:
+    def test_cache_version_bumped_for_application_playback(self):
+        assert engine.CACHE_VERSION == "v9"
+
+
+# ── application playback ─────────────────────────────────────────────
+
+class TestApplicationPlayback:
+    def test_application_playback_frames_deterministic_on_rule3(self):
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        digests = []
+        for _ in range(5):
+            trace = engine.build_application_playback_trace([[0, 1]], parsed["lhs"], parsed["rhs"], steps=4)
+            tuples = [(frame["frame_id"], frame["event_index"], frame["match_idx"]) for frame in trace["frames"]]
+            digests.append(hashlib.sha256(repr(tuples).encode()).hexdigest())
+        assert len(set(digests)) == 1
+
+    def test_application_playback_final_state_matches_step_mode(self):
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        step_result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=4)
+        trace = engine.build_application_playback_trace([[0, 1]], parsed["lhs"], parsed["rhs"], steps=4)
+
+        last_frame_by_step = {}
+        for frame in trace["frames"]:
+            last_frame_by_step[frame["step"]] = frame
+
+        for step_idx in range(4):
+            assert last_frame_by_step[step_idx]["state"] == step_result["states"][step_idx + 1]
+
+    def test_application_playback_truncation_max_frames(self):
+        parsed = engine.parse_notation("{{x,y}} -> {{x,y},{y,z}}")
+        trace = engine.build_application_playback_trace(
+            [[0, 1]],
+            parsed["lhs"],
+            parsed["rhs"],
+            steps=4,
+            max_frames=10,
+        )
+        assert trace["truncated"] is True
+        assert trace["truncation_reason"] == "max_frames"
+        assert len(trace["frames"]) == 10
+
+    def test_application_playback_truncation_max_time_ms(self):
+        pytest.skip("TODO: replace with operation-budget timing once Sofia's fix lands")
 
 
 # ── build_lineage ─────────────────────────────────────────────────────

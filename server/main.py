@@ -42,8 +42,8 @@ def _git_sha() -> str:
 _VERSION: str = _git_sha()
 
 # ── Persistent cache configuration ───────────────────────────────────
-# Cache root: $DH_CACHE_DIR/v<CACHE_VERSION>/ (default /data/cache/v8/ in
-# Docker via Dockerfile ENV; ./data/cache/v8/ in bare-Python local dev).
+# Cache root: $DH_CACHE_DIR/v<CACHE_VERSION>/ (default /data/cache/v9/ in
+# Docker via Dockerfile ENV; ./data/cache/v9/ in bare-Python local dev).
 # Bump engine.CACHE_VERSION when engine output semantics change; the new
 # directory is created automatically; old data stays under the old path.
 _CACHE_ROOT: Path = Path(os.environ.get("DH_CACHE_DIR", "./data/cache"))
@@ -60,6 +60,16 @@ _MWCAUSAL_MAX_STEPS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_STEPS", "4
 _MWCAUSAL_MAX_OCCURRENCES: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_OCCURRENCES", "5000"))
 _MWCAUSAL_MAX_TIME_MS: int = int(os.environ.get("DH_MULTIWAY_CAUSAL_MAX_TIME_MS", "5000"))
 _PRECOMPUTE_MULTIWAY_CAUSAL: bool = os.environ.get("DH_PRECOMPUTE_MULTIWAY_CAUSAL", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# ── Incremental playback (§5.2) ───────────────────────────────────────
+# When this flag is off in production, requesting application mode degrades
+# cleanly to step mode rather than producing a 400 or blank payload.
+_INCREMENTAL_PLAYBACK_ENABLED: bool = os.environ.get("DH_INCREMENTAL_PLAYBACK_ENABLED", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -180,6 +190,33 @@ def _custom_cache_key(notation: str, init: list, steps: int, time_limit_ms: int)
 def _strip_meta(payload: dict) -> dict:
     """Return payload without the internal _meta key."""
     return {k: v for k, v in payload.items() if k != "_meta"}
+
+
+def _rule_playback_cache_key(rule_id: str) -> str:
+    return f"{rule_id}__playback_application"
+
+
+def _custom_playback_cache_key(key: str) -> str:
+    return f"{key}__playback_application"
+
+
+def _effective_playback_mode(requested: Optional[str]) -> str:
+    if requested == "application" and _INCREMENTAL_PLAYBACK_ENABLED:
+        return "application"
+    return "step"
+
+
+def _with_application_playback(base_response: dict, init_state: list[list[int]], lhs, rhs, step_result: dict) -> dict:
+    response = dict(base_response)
+    response["playback"] = engine._build_application_playback_trace_from_result(
+        init_state,
+        lhs,
+        rhs,
+        step_result,
+        max_frames=engine.PLAYBACK_MAX_FRAMES,
+        max_time_ms=engine.PLAYBACK_MAX_TIME_MS,
+    )
+    return response
 
 
 # ── Job tracker ───────────────────────────────────────────────────────
@@ -321,6 +358,44 @@ def get_rule_data(rule_id: str) -> dict:
         CACHE[rule_id] = data
         logger.info("computed rule_id=%s states=%d", rule_id, len(data["states"]))
         return data
+
+
+def _get_rule_playback_data(rule_id: str) -> dict:
+    cache_key = _rule_playback_cache_key(rule_id)
+    if cache_key in CACHE:
+        logger.debug("cache hit (memory) key=%s", cache_key)
+        return CACHE[cache_key]
+
+    lock = _get_lock(cache_key)
+    with lock:
+        if cache_key in CACHE:
+            return CACHE[cache_key]
+
+        cached = _disk_read(cache_key)
+        if cached is not None:
+            CACHE[cache_key] = cached
+            return cached
+
+        base = get_rule_data(rule_id)
+        rule = next((r for r in RULES if r["id"] == rule_id), None)
+        if not rule:
+            raise HTTPException(404, f"Rule {rule_id} not found")
+        parsed = engine.parse_notation(rule["notation"])
+        if not parsed:
+            raise HTTPException(400, f"Cannot parse notation for {rule_id}")
+
+        response = {
+            "states": base["states"],
+            "events": base["events"],
+            "causalEdges": base["causal_edges"],
+            "stats": base["stats"],
+            "lineage": base["lineage"],
+            "birthSteps": base["birthSteps"],
+        }
+        payload = _with_application_playback(response, rule["init"], parsed["lhs"], parsed["rhs"], base)
+        _disk_write(cache_key, payload)
+        CACHE[cache_key] = payload
+        return payload
 
 
 def get_multiway(rule_id: str) -> dict:
@@ -535,7 +610,7 @@ def health():
     - status        : always "ok" while the server is alive.
     - uptime_s      : integer seconds since the uvicorn process started.
     - version       : short git SHA of the deployed commit, or "dev".
-    - cache_version : engine.CACHE_VERSION, e.g. "v8".
+    - cache_version : engine.CACHE_VERSION, e.g. "v9".
     - active_jobs   : number of custom rules currently being computed.
     """
     with _jobs_lock:
@@ -562,10 +637,10 @@ def list_rules():
 
 
 @app.get("/api/rules/{rule_id}")
-def get_rule(rule_id: str):
+def get_rule(rule_id: str, playback: Optional[str] = None):
     """Get full evolution data for a rule."""
     data = get_rule_data(rule_id)
-    return {
+    response = {
         "states": data["states"],
         "events": data["events"],
         "causalEdges": data["causal_edges"],
@@ -573,6 +648,9 @@ def get_rule(rule_id: str):
         "lineage": data["lineage"],
         "birthSteps": data["birthSteps"],
     }
+    if _effective_playback_mode(playback) == "application":
+        return _get_rule_playback_data(rule_id)
+    return response
 
 
 @app.get("/api/rules/{rule_id}/multiway")
@@ -644,6 +722,7 @@ class CustomRuleRequest(BaseModel):
     notation: str
     init: list[list[int]]
     steps: int = 8
+    playback: Optional[str] = None
 
 
 @app.post("/api/custom")
@@ -676,19 +755,16 @@ def run_custom_rule(req: CustomRuleRequest):
 
     time_limit_ms = min(15_000, _HARD_MAX_TIME_MS)
     key = _custom_cache_key(req.notation, req.init, req.steps, time_limit_ms)
+    playback_mode = _effective_playback_mode(req.playback)
 
     # Cached — return immediately with full payload
     if key in CACHE:
         logger.debug("cache hit (memory) key=%s", key)
-        return {"job_id": key, "status": "done", "key": key,
-                "step": req.steps, "total_steps": req.steps, "elapsed_s": 0.0,
-                **_strip_meta(CACHE[key])}
+        return _custom_done_response(key, CACHE[key], req.steps, playback_mode)
     disk = _disk_read(key)
     if disk is not None:
         CACHE[key] = disk
-        return {"job_id": key, "status": "done", "key": key,
-                "step": req.steps, "total_steps": req.steps, "elapsed_s": 0.0,
-                **_strip_meta(disk)}
+        return _custom_done_response(key, disk, req.steps, playback_mode)
 
     # Already computing — return current job status (deduplicates concurrent requests)
     with _jobs_lock:
@@ -939,6 +1015,50 @@ def _merge_evolution(old: dict, ext: dict, old_steps: int, extra_steps: int) -> 
     }
 
 
+def _custom_playback_response(key: str, payload: dict) -> dict:
+    meta = payload.get("_meta", {})
+    parsed = engine.parse_notation(meta.get("notation", ""))
+    if not parsed:
+        raise HTTPException(400, "Cannot reconstruct playback for cached custom result")
+
+    base = _strip_meta(payload)
+    response = {
+        "key": key,
+        **base,
+        "playback": engine._build_application_playback_trace_from_result(
+            meta.get("init", []),
+            parsed["lhs"],
+            parsed["rhs"],
+            base,
+            max_frames=engine.PLAYBACK_MAX_FRAMES,
+            max_time_ms=engine.PLAYBACK_MAX_TIME_MS,
+        ),
+    }
+    return response
+
+
+def _custom_done_response(key: str, payload: dict, steps: int, playback_mode: str) -> dict:
+    base = {
+        "job_id": key,
+        "status": "done",
+        "key": key,
+        "step": steps,
+        "total_steps": steps,
+        "elapsed_s": 0.0,
+        **_strip_meta(payload),
+    }
+    if playback_mode == "application":
+        return _custom_playback_response(key, payload) | {
+            "job_id": key,
+            "status": "done",
+            "key": key,
+            "step": steps,
+            "total_steps": steps,
+            "elapsed_s": 0.0,
+        }
+    return base
+
+
 @app.post("/api/extend")
 def extend_cached_evolution(req: ExtendRequest):
     """Extend a cached custom-rule evolution by additional steps.
@@ -1112,17 +1232,39 @@ def extend_cached_evolution(req: ExtendRequest):
 
 
 @app.get("/api/custom/{key}")
-def recall_custom_rule(key: str):
+def recall_custom_rule(key: str, playback: Optional[str] = None):
     """Return previously computed custom rule data by cache key.
 
     Does not recompute; 404 if the key is not in the cache.
     """
+    playback_mode = _effective_playback_mode(playback)
+    if playback_mode == "application":
+        playback_key = _custom_playback_cache_key(key)
+        if playback_key in CACHE:
+            logger.debug("cache hit (memory) key=%s", playback_key)
+            return CACHE[playback_key]
+        disk = _disk_read(playback_key)
+        if disk is not None:
+            CACHE[playback_key] = disk
+            return disk
+
     if key in CACHE:
         logger.debug("cache hit (memory) key=%s", key)
-        return {"key": key, **_strip_meta(CACHE[key])}
+        payload = CACHE[key]
+        if playback_mode == "application":
+            response = _custom_playback_response(key, payload)
+            CACHE[_custom_playback_cache_key(key)] = response
+            _disk_write(_custom_playback_cache_key(key), response)
+            return response
+        return {"key": key, **_strip_meta(payload)}
     disk = _disk_read(key)
     if disk is not None:
         CACHE[key] = disk
+        if playback_mode == "application":
+            response = _custom_playback_response(key, disk)
+            CACHE[_custom_playback_cache_key(key)] = response
+            _disk_write(_custom_playback_cache_key(key), response)
+            return response
         return {"key": key, **_strip_meta(disk)}
     raise HTTPException(404, f"Cache key '{key}' not found")
 
@@ -1140,6 +1282,8 @@ def list_custom_cache():
     result = []
     for p in sorted(CACHE_DIR.glob("custom-*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
         key = p.stem
+        if key.endswith("__playback_application"):
+            continue
         try:
             data = json.loads(p.read_text())
             meta = data.get("_meta", {})

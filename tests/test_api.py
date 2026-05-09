@@ -10,6 +10,8 @@ Run from the repo root:
     pytest
 """
 from __future__ import annotations
+from contextlib import contextmanager
+import os
 import time
 import importlib
 import pytest
@@ -33,6 +35,22 @@ def _wait_done(client: TestClient, job_id: str, timeout: float = 15.0, interval:
             return data
         time.sleep(interval)
     raise TimeoutError(f"Job {job_id} did not complete within {timeout}s")
+
+
+@contextmanager
+def _playback_enabled_client():
+    original = os.environ.get("DH_INCREMENTAL_PLAYBACK_ENABLED")
+    os.environ["DH_INCREMENTAL_PLAYBACK_ENABLED"] = "1"
+    reloaded = importlib.reload(main)
+    try:
+        with TestClient(reloaded.app) as c:
+            yield c
+    finally:
+        if original is None:
+            os.environ.pop("DH_INCREMENTAL_PLAYBACK_ENABLED", None)
+        else:
+            os.environ["DH_INCREMENTAL_PLAYBACK_ENABLED"] = original
+        importlib.reload(main)
 
 
 @pytest.fixture(scope="module")
@@ -170,13 +188,19 @@ class TestGetRule:
 
     def test_valid_rule_has_expected_keys(self, client):
         data = client.get("/api/rules/rule3").json()
-        for key in ("states", "events", "causalEdges", "stats",
-                    "lineage", "birthSteps"):
-            assert key in data, f"Missing key: {key}"
+        assert set(data) == {"states", "events", "causalEdges", "stats", "lineage", "birthSteps"}
 
     def test_stats_are_non_empty(self, client):
         stats = client.get("/api/rules/rule3").json()["stats"]
         assert isinstance(stats, list) and len(stats) > 0
+
+    def test_step_mode_response_unchanged_default(self, client):
+        data = client.get("/api/rules/rule3").json()
+        assert set(data) == {"states", "events", "causalEdges", "stats", "lineage", "birthSteps"}
+
+    def test_feature_flag_off_returns_step_mode(self, client):
+        data = client.get("/api/rules/rule3?playback=application").json()
+        assert "playback" not in data
 
     def test_invalid_rule_returns_404(self, client):
         assert client.get("/api/rules/doesnotexist").status_code == 404
@@ -543,6 +567,59 @@ class TestCustomRule:
             "steps": 2,
         })
         assert r.status_code == 200
+
+
+class TestApplicationPlaybackAPI:
+    def test_application_mode_response_includes_playback_object(self):
+        with _playback_enabled_client() as client:
+            r = client.get("/api/rules/rule3?playback=application")
+            assert r.status_code == 200
+            data = r.json()
+            assert "playback" in data
+            playback = data["playback"]
+            for key in ("mode", "frames", "truncated", "truncation_reason", "max_frames", "max_time_ms"):
+                assert key in playback
+            assert playback["mode"] == "application"
+            assert isinstance(playback["frames"], list)
+            assert len(playback["frames"]) > 0
+
+    def test_application_mode_works_for_custom_rules(self):
+        payload = {
+            "notation": "{{x,y}} -> {{x,y},{y,z}}",
+            "init": [[0, 1]],
+            "steps": 2,
+        }
+        with _playback_enabled_client() as client:
+            first = client.post("/api/custom", json=payload)
+            first_data = first.json()
+            if first_data["status"] != "done":
+                first_data = _wait_done(client, first_data["job_id"])
+            assert first_data["status"] == "done"
+
+            second = client.post("/api/custom", json={**payload, "playback": "application"})
+            second_data = second.json()
+            if second_data["status"] != "done":
+                second_data = _wait_done(client, second_data["job_id"])
+            assert second_data["status"] == "done"
+            assert "playback" in second_data
+            assert second_data["playback"]["mode"] == "application"
+
+    def test_custom_recall_supports_application_query(self):
+        payload = {
+            "notation": "{{x,y}} -> {{x,y},{y,z}}",
+            "init": [[0, 1]],
+            "steps": 2,
+        }
+        with _playback_enabled_client() as client:
+            r = client.post("/api/custom", json=payload)
+            data = r.json()
+            if data["status"] != "done":
+                data = _wait_done(client, data["job_id"])
+            recall = client.get(f"/api/custom/{data['key']}?playback=application")
+            assert recall.status_code == 200
+            recall_data = recall.json()
+            assert "playback" in recall_data
+            assert recall_data["playback"]["mode"] == "application"
 
 
 # ── /api/jobs/{job_id} ───────────────────────────────────────────────
