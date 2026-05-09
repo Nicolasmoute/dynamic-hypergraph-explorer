@@ -50,8 +50,8 @@ def _version() -> str:
     return _git_sha()
 
 # ── Persistent cache configuration ───────────────────────────────────
-# Cache root: $DH_CACHE_DIR/<CACHE_VERSION>/ (default /data/cache/v9/ in
-# Docker via Dockerfile ENV; ./data/cache/v9/ in bare-Python local dev).
+# Cache root: $DH_CACHE_DIR/<CACHE_VERSION>/ (default /data/cache/v12/ in
+# Docker via Dockerfile ENV; ./data/cache/v12/ in bare-Python local dev).
 # Bump engine.CACHE_VERSION when engine output semantics change; the new
 # directory is created automatically; old data stays under the old path.
 _CACHE_ROOT: Path = Path(os.environ.get("DH_CACHE_DIR", "./data/cache"))
@@ -73,6 +73,16 @@ _PRECOMPUTE_MULTIWAY_CAUSAL: bool = os.environ.get("DH_PRECOMPUTE_MULTIWAY_CAUSA
     "yes",
     "on",
 )
+
+# ── Incremental playback (Phase A) ────────────────────────────────────
+_INCREMENTAL_PLAYBACK_ENABLED: bool = os.environ.get("DH_INCREMENTAL_PLAYBACK_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_PLAYBACK_MAX_FRAMES: int = int(os.environ.get("DH_PLAYBACK_MAX_FRAMES", str(engine.PLAYBACK_MAX_FRAMES)))
+_PLAYBACK_MAX_TIME_MS: int = int(os.environ.get("DH_PLAYBACK_MAX_TIME_MS", str(engine.PLAYBACK_MAX_TIME_MS)))
 
 # ── CORS (§5.5) ───────────────────────────────────────────────────────
 # Production recommendation: set DH_CORS_ORIGINS to your Zeabur domain,
@@ -188,6 +198,50 @@ def _custom_cache_key(notation: str, init: list, steps: int, time_limit_ms: int)
 def _strip_meta(payload: dict) -> dict:
     """Return payload without the internal _meta key."""
     return {k: v for k, v in payload.items() if k != "_meta"}
+
+
+def _effective_playback_mode(requested: Optional[str]) -> str:
+    """Return the effective playback mode after feature-flag gating."""
+    if requested == "application" and _INCREMENTAL_PLAYBACK_ENABLED:
+        return "application"
+    return "step"
+
+
+def _rule_playback_cache_key(rule_id: str) -> str:
+    return f"{rule_id}__playback_application"
+
+
+def _custom_playback_cache_key(key: str) -> str:
+    return f"{key}__playback_application"
+
+
+def _build_application_playback_response(init_state, lhs, rhs, step_result: dict) -> dict:
+    return engine._build_application_playback_trace_from_result(
+        init_state,
+        lhs,
+        rhs,
+        step_result,
+        max_frames=_PLAYBACK_MAX_FRAMES,
+        max_time_ms=_PLAYBACK_MAX_TIME_MS,
+    )
+
+
+def _custom_done_response(key: str, payload: dict, steps: int) -> dict:
+    return {
+        "job_id": key,
+        "status": "done",
+        "key": key,
+        "step": steps,
+        "total_steps": steps,
+        "elapsed_s": 0.0,
+        **_strip_meta(payload),
+    }
+
+
+def _with_application_playback(base_response: dict, init_state, lhs, rhs, step_result: dict) -> dict:
+    response = dict(base_response)
+    response["playback"] = _build_application_playback_response(init_state, lhs, rhs, step_result)
+    return response
 
 
 # ── Job tracker ───────────────────────────────────────────────────────
@@ -543,7 +597,7 @@ def health():
     - status        : always "ok" while the server is alive.
     - uptime_s      : integer seconds since the uvicorn process started.
     - version       : short git SHA of the deployed commit, or "dev".
-    - cache_version : engine.CACHE_VERSION, e.g. "v9".
+    - cache_version : engine.CACHE_VERSION, e.g. "v12".
     - active_jobs   : number of custom rules currently being computed.
     """
     with _jobs_lock:
@@ -570,10 +624,27 @@ def list_rules():
 
 
 @app.get("/api/rules/{rule_id}")
-def get_rule(rule_id: str):
-    """Get full evolution data for a rule."""
+def get_rule(rule_id: str, playback: Optional[str] = None):
+    """Get full evolution data for a rule.
+
+    When playback=application is requested and the feature flag is enabled,
+    the response includes an additional `playback` object. If the feature flag
+    is off in production, requesting application mode degrades cleanly to step
+    mode.
+    """
+    effective_mode = _effective_playback_mode(playback)
+    if effective_mode == "application":
+        cache_key = _rule_playback_cache_key(rule_id)
+        cached = CACHE.get(cache_key)
+        if cached is None:
+            cached = _disk_read(cache_key)
+            if cached is not None:
+                CACHE[cache_key] = cached
+        if cached is not None:
+            return cached
+
     data = get_rule_data(rule_id)
-    return {
+    response = {
         "states": data["states"],
         "events": data["events"],
         "causalEdges": data["causal_edges"],
@@ -581,6 +652,23 @@ def get_rule(rule_id: str):
         "lineage": data["lineage"],
         "birthSteps": data["birthSteps"],
     }
+    if effective_mode == "application":
+        rule = next((r for r in RULES if r["id"] == rule_id), None)
+        if not rule:
+            raise HTTPException(404, f"Rule {rule_id} not found")
+        parsed = engine.parse_notation(rule["notation"])
+        if not parsed:
+            raise HTTPException(400, f"Cannot parse notation for {rule_id}")
+        response = _with_application_playback(
+            response,
+            rule["init"],
+            parsed["lhs"],
+            parsed["rhs"],
+            {"states": data["states"], "events": data["events"]},
+        )
+        CACHE[_rule_playback_cache_key(rule_id)] = response
+        _disk_write(_rule_playback_cache_key(rule_id), response)
+    return response
 
 
 @app.get("/api/rules/{rule_id}/multiway")
@@ -652,6 +740,7 @@ class CustomRuleRequest(BaseModel):
     notation: str
     init: list[list[int]]
     steps: int = 8
+    playback: Optional[str] = None
 
 
 @app.post("/api/custom")
@@ -664,6 +753,11 @@ def run_custom_rule(req: CustomRuleRequest):
 
     The job_id is the same as the persistent cache key, so
     GET /api/custom/{key} also works once status is "done".
+
+    When playback=application is requested and the feature flag is enabled,
+    the done payload includes an additional `playback` object. If the feature
+    flag is off in production, requesting application mode degrades cleanly to
+    step mode.
 
     Response shape:
     - Always: {job_id, status, step, total_steps, elapsed_s}
@@ -682,21 +776,56 @@ def run_custom_rule(req: CustomRuleRequest):
     if not req.init:
         raise HTTPException(400, "Initial state must be non-empty")
 
+    notation = req.notation
+    init = req.init
+    steps = req.steps
+    parsed_lhs = parsed["lhs"]
+    parsed_rhs = parsed["rhs"]
+
     time_limit_ms = min(15_000, _HARD_MAX_TIME_MS)
-    key = _custom_cache_key(req.notation, req.init, req.steps, time_limit_ms)
+    key = _custom_cache_key(notation, init, steps, time_limit_ms)
+    effective_mode = _effective_playback_mode(req.playback)
+    playback_key = _custom_playback_cache_key(key)
 
     # Cached — return immediately with full payload
+    if effective_mode == "application":
+        cached_playback = CACHE.get(playback_key)
+        if cached_playback is None:
+            cached_playback = _disk_read(playback_key)
+            if cached_playback is not None:
+                CACHE[playback_key] = cached_playback
+        if cached_playback is not None:
+            return cached_playback
     if key in CACHE:
         logger.debug("cache hit (memory) key=%s", key)
-        return {"job_id": key, "status": "done", "key": key,
-                "step": req.steps, "total_steps": req.steps, "elapsed_s": 0.0,
-                **_strip_meta(CACHE[key])}
+        payload = CACHE[key]
+        if effective_mode == "application":
+            app_response = _with_application_playback(
+                _custom_done_response(key, payload, req.steps),
+                req.init,
+                parsed_lhs,
+                parsed_rhs,
+                {"states": payload["states"], "events": payload["events"]},
+            )
+            CACHE[playback_key] = app_response
+            _disk_write(playback_key, app_response)
+            return app_response
+        return _custom_done_response(key, payload, req.steps)
     disk = _disk_read(key)
     if disk is not None:
         CACHE[key] = disk
-        return {"job_id": key, "status": "done", "key": key,
-                "step": req.steps, "total_steps": req.steps, "elapsed_s": 0.0,
-                **_strip_meta(disk)}
+        if effective_mode == "application":
+            app_response = _with_application_playback(
+                _custom_done_response(key, disk, req.steps),
+                req.init,
+                parsed_lhs,
+                parsed_rhs,
+                {"states": disk["states"], "events": disk["events"]},
+            )
+            CACHE[playback_key] = app_response
+            _disk_write(playback_key, app_response)
+            return app_response
+        return _custom_done_response(key, disk, req.steps)
 
     # Already computing — return current job status (deduplicates concurrent requests)
     with _jobs_lock:
@@ -717,13 +846,8 @@ def run_custom_rule(req: CustomRuleRequest):
             "heartbeat_at": now,
             "key": key,
             "cancel_event": cancel_event,
+            "playback_mode": effective_mode,
         }
-
-    notation = req.notation
-    init = req.init
-    steps = req.steps
-    parsed_lhs = parsed["lhs"]
-    parsed_rhs = parsed["rhs"]
 
     def _run():
         def progress_cb(completed: int, total: int) -> None:
@@ -766,8 +890,19 @@ def run_custom_rule(req: CustomRuleRequest):
             }
             _disk_write(key, payload)
             CACHE[key] = payload
+            final_payload = _custom_done_response(key, payload, steps)
+            if effective_mode == "application":
+                final_payload = _with_application_playback(
+                    final_payload,
+                    init,
+                    parsed_lhs,
+                    parsed_rhs,
+                    result,
+                )
+                CACHE[playback_key] = final_payload
+                _disk_write(playback_key, final_payload)
             _update_job(key, status="done", step=steps, heartbeat_at=_time.time(),
-                        result=payload)
+                        result=final_payload)
             logger.info("job done key=%s states=%d", key, len(payload["states"]))
         except Exception as e:
             logger.error("job failed key=%s error=%s", key, e, exc_info=True)
@@ -1120,17 +1255,54 @@ def extend_cached_evolution(req: ExtendRequest):
 
 
 @app.get("/api/custom/{key}")
-def recall_custom_rule(key: str):
+def recall_custom_rule(key: str, playback: Optional[str] = None):
     """Return previously computed custom rule data by cache key.
 
     Does not recompute; 404 if the key is not in the cache.
     """
+    def _build_playback_from_payload(payload: dict) -> dict:
+        meta = payload.get("_meta", {})
+        notation = meta.get("notation")
+        if not notation:
+            raise HTTPException(422, "Cached payload has no _meta.notation — cannot build application playback")
+        parsed = engine.parse_notation(notation)
+        if not parsed:
+            raise HTTPException(400, "Cannot re-parse notation from cached _meta")
+        return _with_application_playback(
+            _custom_done_response(key, payload, int(meta.get("steps", 0) or 0)),
+            meta.get("init", []),
+            parsed["lhs"],
+            parsed["rhs"],
+            {"states": payload["states"], "events": payload["events"]},
+        )
+
+    effective_mode = _effective_playback_mode(playback)
+    playback_key = _custom_playback_cache_key(key)
+    if effective_mode == "application":
+        cached_playback = CACHE.get(playback_key)
+        if cached_playback is None:
+            cached_playback = _disk_read(playback_key)
+            if cached_playback is not None:
+                CACHE[playback_key] = cached_playback
+        if cached_playback is not None:
+            return {"key": key, **_strip_meta(cached_playback)}
     if key in CACHE:
         logger.debug("cache hit (memory) key=%s", key)
-        return {"key": key, **_strip_meta(CACHE[key])}
+        payload = CACHE[key]
+        if effective_mode == "application":
+            playback_response = _build_playback_from_payload(payload)
+            CACHE[playback_key] = playback_response
+            _disk_write(playback_key, playback_response)
+            return {"key": key, **_strip_meta(playback_response)}
+        return {"key": key, **_strip_meta(payload)}
     disk = _disk_read(key)
     if disk is not None:
         CACHE[key] = disk
+        if effective_mode == "application":
+            playback_response = _build_playback_from_payload(disk)
+            CACHE[playback_key] = playback_response
+            _disk_write(playback_key, playback_response)
+            return {"key": key, **_strip_meta(playback_response)}
         return {"key": key, **_strip_meta(disk)}
     raise HTTPException(404, f"Cache key '{key}' not found")
 
@@ -1148,6 +1320,8 @@ def list_custom_cache():
     result = []
     for p in sorted(CACHE_DIR.glob("custom-*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
         key = p.stem
+        if key.endswith("__playback_application"):
+            continue
         try:
             data = json.loads(p.read_text())
             meta = data.get("_meta", {})

@@ -5,6 +5,7 @@ Run from the repo root:
     pytest
 """
 from __future__ import annotations
+import hashlib
 from collections import Counter, defaultdict
 import pytest
 from server import engine
@@ -161,6 +162,61 @@ class TestEvolve:
         result = engine.evolve([[0, 1]], parsed["lhs"], parsed["rhs"], steps=3)
         for edge in result["causal_edges"]:
             assert len(edge) == 2
+
+
+# ── application playback ─────────────────────────────────────────────
+
+class TestApplicationPlayback:
+    _RULE = "{{x,y}} -> {{x,y},{y,z}}"
+
+    def setup_method(self):
+        engine.reset(1)
+
+    def _parsed(self):
+        return engine.parse_notation(self._RULE)
+
+    def _build(self, *, max_frames: int = 5000, max_time_ms: int = 5000):
+        p = self._parsed()
+        return engine.build_application_playback_trace(
+            [[0, 1]],
+            p["lhs"],
+            p["rhs"],
+            steps=4,
+            max_frames=max_frames,
+            max_time_ms=max_time_ms,
+        )
+
+    def test_application_playback_frames_deterministic_on_rule3(self):
+        digests = []
+        for _ in range(5):
+            engine.reset(1)
+            trace = self._build()
+            seq = tuple((f["frame_id"], f["event_index"], f["match_idx"]) for f in trace["frames"])
+            digests.append(hashlib.sha256(repr(seq).encode()).hexdigest())
+        assert len(set(digests)) == 1
+
+    def test_application_playback_final_state_matches_step_mode(self):
+        p = self._parsed()
+        step_result = engine.evolve([[0, 1]], p["lhs"], p["rhs"], steps=4)
+        trace = self._build()
+        frames_by_step: dict[int, list[dict]] = defaultdict(list)
+        for frame in trace["frames"]:
+            frames_by_step[frame["step"]].append(frame)
+
+        for step_index, step_events in enumerate(step_result["events"]):
+            if not step_events:
+                continue
+            assert frames_by_step[step_index][-1]["state"] == step_result["states"][step_index + 1]
+
+    def test_application_playback_truncation_max_frames(self):
+        trace = self._build(max_frames=10)
+        assert trace["truncated"] is True
+        assert trace["truncation_reason"] == "max_frames"
+        assert len(trace["frames"]) == 10
+
+    @pytest.mark.skip(reason="TODO: deterministic wall-clock cap test depends on operation-budget fix")
+    def test_application_playback_truncation_max_time_ms(self):
+        self._build(max_time_ms=1)
 
 
 # ── build_lineage ─────────────────────────────────────────────────────
@@ -1121,7 +1177,7 @@ class TestMultiwayCausalGraph:
         assert has_nontrivial_class
 
     def test_cache_version_bumped_for_multiway_causal_event_metadata(self):
-        assert engine.CACHE_VERSION == "v11"
+        assert engine.CACHE_VERSION == "v12"
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""

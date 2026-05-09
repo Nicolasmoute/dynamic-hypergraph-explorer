@@ -2,6 +2,7 @@
 from __future__ import annotations
 import itertools
 import math
+import os
 import threading
 from collections import Counter, defaultdict
 from typing import Optional
@@ -32,7 +33,11 @@ from typing import Optional
 #   event-role quotient with multiplicity over the existing concrete edges.
 # v10 → v11: multiway_causal_graph() adds canonical event-class metadata and
 #   multiplicity to every public occurrence event.
-CACHE_VERSION = "v11"
+# v11 → v12: application playback trace payloads add an opt-in playback object.
+CACHE_VERSION = "v12"
+
+PLAYBACK_MAX_FRAMES = int(os.environ.get("DH_PLAYBACK_MAX_FRAMES", "5000"))
+PLAYBACK_MAX_TIME_MS = int(os.environ.get("DH_PLAYBACK_MAX_TIME_MS", "5000"))
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -496,6 +501,133 @@ def evolve(
         stats.append({"step": i, "num_nodes": len(ns), "num_edges": len(st), "estimated_dimension": dim})
 
     return {"states": states, "events": all_events, "causal_edges": causal_edges, "stats": stats}
+
+
+def _match_application_event(
+    current_state: Hypergraph,
+    lhs,
+    rhs,
+    expected_event: dict,
+) -> tuple[int, dict]:
+    """Return the deterministic match_idx and resulting state for one atomic event.
+
+    The replay walks the same candidate order as find_matches() and selects the
+    first candidate whose consumed/produced edges exactly match the emitted
+    evolve() event. This preserves the engine's deterministic application order
+    without changing evolve() itself.
+    """
+    max_node = max((n for edge in current_state for n in edge), default=0)
+    matches = find_matches(current_state, lhs)
+    for match_idx, (mi, binding) in enumerate(matches):
+        reset(max_node)
+        applied = _apply_match(current_state, lhs, rhs, mi, binding)
+        if applied["event"]["consumed"] == expected_event["consumed"] and applied["event"]["produced"] == expected_event["produced"]:
+            return match_idx, applied
+    raise RuntimeError(
+        "application playback could not re-match emitted event "
+        f"consumed={expected_event['consumed']} produced={expected_event['produced']}"
+    )
+
+
+def _build_application_playback_trace_from_result(
+    init_hyp: Hypergraph,
+    lhs,
+    rhs,
+    result: dict,
+    max_frames: int = PLAYBACK_MAX_FRAMES,
+    max_time_ms: int = PLAYBACK_MAX_TIME_MS,
+) -> dict:
+    """Build the atomic playback trace from a canonical evolve() result."""
+    t0 = time.time()
+    frames: list[dict] = []
+    truncated = False
+    truncation_reason: Optional[str] = None
+    current_state = [edge[:] for edge in init_hyp]
+    frame_id = 0
+    event_index = 0
+
+    if max_frames <= 0:
+        return {"mode": "application", "frames": [], "truncated": True, "truncation_reason": "max_frames"}
+    if max_time_ms <= 0:
+        return {"mode": "application", "frames": [], "truncated": True, "truncation_reason": "max_time_ms"}
+
+    for step_index, step_events in enumerate(result["events"]):
+        for batch_index, expected_event in enumerate(step_events):
+            if frame_id >= max_frames:
+                truncated = True
+                truncation_reason = "max_frames"
+                break
+            if max_time_ms and (time.time() - t0) * 1000 > max_time_ms:
+                truncated = True
+                truncation_reason = "max_time_ms"
+                break
+
+            match_idx, applied = _match_application_event(current_state, lhs, rhs, expected_event)
+            current_state = [edge[:] for edge in applied["state"]]
+            frames.append({
+                "frame_id": frame_id,
+                "step": step_index,
+                "batch_index": batch_index,
+                "event_index": event_index,
+                "match_idx": match_idx,
+                "consumed": [edge[:] for edge in expected_event["consumed"]],
+                "produced": [edge[:] for edge in expected_event["produced"]],
+                "state": [edge[:] for edge in current_state],
+            })
+            frame_id += 1
+            event_index += 1
+
+        if truncated:
+            break
+
+        expected_state = result["states"][step_index + 1]
+        if current_state != expected_state:
+            raise RuntimeError(
+                f"application playback replay drift at step {step_index}: "
+                f"replayed state does not match evolve() output"
+            )
+
+    return {
+        "mode": "application",
+        "frames": frames,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+    }
+
+
+def build_application_playback_trace(
+    init_hyp: Hypergraph,
+    lhs,
+    rhs,
+    steps: int,
+    time_limit_ms: int = 30000,
+    progress_cb=None,
+    cancel_event=None,
+    initial_ev_id: int = 0,
+    initial_flat_events: Optional[list] = None,
+    max_frames: int = PLAYBACK_MAX_FRAMES,
+    max_time_ms: int = PLAYBACK_MAX_TIME_MS,
+):
+    """Run evolve() and derive the atomic application playback trace."""
+    result = evolve(
+        init_hyp,
+        lhs,
+        rhs,
+        steps,
+        time_limit_ms=time_limit_ms,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        initial_ev_id=initial_ev_id,
+        initial_flat_events=initial_flat_events,
+    )
+    return _build_application_playback_trace_from_result(
+        init_hyp,
+        lhs,
+        rhs,
+        result,
+        max_frames=max_frames,
+        max_time_ms=max_time_ms,
+    )
 
 # ── dimension estimate ────────────────────────────────────────────────
 

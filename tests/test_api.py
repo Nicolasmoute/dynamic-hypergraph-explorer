@@ -11,6 +11,8 @@ Run from the repo root:
 """
 from __future__ import annotations
 from collections import Counter
+from contextlib import contextmanager
+import os
 import time
 import importlib
 import pytest
@@ -34,6 +36,22 @@ def _wait_done(client: TestClient, job_id: str, timeout: float = 15.0, interval:
             return data
         time.sleep(interval)
     raise TimeoutError(f"Job {job_id} did not complete within {timeout}s")
+
+
+@contextmanager
+def _playback_enabled_client():
+    old = os.environ.get("DH_INCREMENTAL_PLAYBACK_ENABLED")
+    os.environ["DH_INCREMENTAL_PLAYBACK_ENABLED"] = "1"
+    reloaded = importlib.reload(main)
+    try:
+        with TestClient(reloaded.app) as c:
+            yield c
+    finally:
+        if old is None:
+            os.environ.pop("DH_INCREMENTAL_PLAYBACK_ENABLED", None)
+        else:
+            os.environ["DH_INCREMENTAL_PLAYBACK_ENABLED"] = old
+        importlib.reload(main)
 
 
 @pytest.fixture(scope="module")
@@ -174,6 +192,16 @@ class TestGetRule:
         for key in ("states", "events", "causalEdges", "stats",
                     "lineage", "birthSteps"):
             assert key in data, f"Missing key: {key}"
+        assert "playback" not in data
+
+    def test_step_mode_response_unchanged_default(self, client):
+        data = client.get("/api/rules/rule3").json()
+        assert set(data) == {"states", "events", "causalEdges", "stats", "lineage", "birthSteps"}
+
+    def test_feature_flag_off_returns_step_mode(self, client):
+        data = client.get("/api/rules/rule3?playback=application").json()
+        assert set(data) == {"states", "events", "causalEdges", "stats", "lineage", "birthSteps"}
+        assert "playback" not in data
 
     def test_stats_are_non_empty(self, client):
         stats = client.get("/api/rules/rule3").json()["stats"]
@@ -181,6 +209,57 @@ class TestGetRule:
 
     def test_invalid_rule_returns_404(self, client):
         assert client.get("/api/rules/doesnotexist").status_code == 404
+
+
+class TestApplicationPlaybackAPI:
+    def test_application_mode_response_includes_playback_object(self):
+        with _playback_enabled_client() as c:
+            data = c.get("/api/rules/rule3?playback=application").json()
+            assert "playback" in data
+            playback = data["playback"]
+            assert playback["mode"] == "application"
+            assert isinstance(playback["frames"], list)
+            assert len(playback["frames"]) > 0
+            frame = playback["frames"][0]
+            for field in ("frame_id", "step", "batch_index", "event_index", "match_idx", "consumed", "produced", "state"):
+                assert field in frame
+
+    def test_application_mode_works_for_custom_rules(self):
+        with _playback_enabled_client() as c:
+            body = {
+                "notation": "{{x,y}} -> {{x,y},{y,z}}",
+                "init": [[0, 1]],
+                "steps": 4,
+            }
+            initial = c.post("/api/custom", json=body)
+            assert initial.status_code == 200
+            initial_data = initial.json()
+            if initial_data["status"] == "running":
+                _wait_done(c, initial_data["job_id"])
+            playback_data = c.post("/api/custom", json={**body, "playback": "application"}).json()
+            assert "playback" in playback_data
+            assert playback_data["playback"]["mode"] == "application"
+            assert len(playback_data["playback"]["frames"]) > 0
+
+    def test_custom_recall_supports_application_query(self):
+        with _playback_enabled_client() as c:
+            body = {
+                "notation": "{{x,y}} -> {{x,y},{y,z}}",
+                "init": [[0, 1]],
+                "steps": 4,
+            }
+            initial = c.post("/api/custom", json=body)
+            assert initial.status_code == 200
+            initial_data = initial.json()
+            if initial_data["status"] == "running":
+                final_data = _wait_done(c, initial_data["job_id"])
+            else:
+                final_data = initial_data
+            key = final_data["key"]
+            recalled = c.get(f"/api/custom/{key}?playback=application").json()
+            assert "playback" in recalled
+            assert recalled["playback"]["mode"] == "application"
+            assert len(recalled["playback"]["frames"]) > 0
 
 
 # ── /api/rules/{rule_id}/multiway ────────────────────────────────────
