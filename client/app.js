@@ -2558,40 +2558,81 @@ function renderMultiwayCausal() {
     );
   for (const ev of events) eventInfo[ev.id] = ev;
 
-  const canonicalClassesBySignature = new Map();
-  for (const ev of events) {
-    const signature = ev.canonicalEventSignature || String(ev.id);
-    const groupKey = `${ev.step}::${signature}`;
-    const group = canonicalClassesBySignature.get(groupKey);
-    if (group) group.push(ev);
-    else canonicalClassesBySignature.set(groupKey, [ev]);
-  }
+  const canonicalModelCache = renderMultiwayCausal._canonicalModelCache || (renderMultiwayCausal._canonicalModelCache = new WeakMap());
+  let canonicalModel = canonicalModelCache.get(data);
+  if (!canonicalModel) {
+    const classByKey = new Map();
+    const classKeyByEventId = new Map();
 
-  const canonicalClasses = Array.from(canonicalClassesBySignature.entries()).map(([groupKey, members]) => {
-    const sortedMembers = members.slice().sort((a, b) =>
-      (Number(a.id) - Number(b.id)) || String(a.id).localeCompare(String(b.id))
+    for (const ev of events) {
+      const canonicalSignature = ev.canonicalEventSignature || String(ev.id);
+      const classKey = canonicalSignature;
+      let cls = classByKey.get(classKey);
+      if (!cls) {
+        cls = {
+          key: classKey,
+          canonicalEventSignature: canonicalSignature,
+          representative: ev,
+          memberIds: new Set(),
+        };
+        classByKey.set(classKey, cls);
+      }
+      cls.memberIds.add(ev.id);
+      classKeyByEventId.set(ev.id, classKey);
+      if (Array.isArray(ev.equivalentEventIds)) {
+        for (const memberId of ev.equivalentEventIds) {
+          cls.memberIds.add(memberId);
+          classKeyByEventId.set(memberId, classKey);
+        }
+      }
+    }
+
+    const canonicalClasses = Array.from(classByKey.values()).map(cls => {
+      const memberIds = Array.from(cls.memberIds).sort((a, b) =>
+        (Number(a) - Number(b)) || String(a).localeCompare(String(b))
+      );
+      let representative = null;
+      for (const memberId of memberIds) {
+        representative = eventInfo[memberId];
+        if (representative) break;
+      }
+      if (!representative) representative = cls.representative || events[0];
+      const multiplicity = memberIds.length;
+      return {
+        id: representative.id,
+        signature: cls.key,
+        canonicalEventSignature: cls.canonicalEventSignature,
+        representative,
+        members: memberIds,
+        multiplicity,
+        red: memberIds.some(id => defaultPathIds.has(id)),
+      };
+    }).sort((a, b) =>
+      (layoutDepth(a.representative) - layoutDepth(b.representative)) ||
+      (layoutHash(a.representative) - layoutHash(b.representative)) ||
+      (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
+      String(a.id).localeCompare(String(b.id))
     );
-    const representative = sortedMembers[0];
-    return {
-      id: representative.id,
-      signature: groupKey,
-      representative,
-      members: sortedMembers,
-      multiplicity: members.length,
-      red: members.some(ev => defaultPathIds.has(ev.id)),
-    };
-  }).sort((a, b) =>
-    (layoutDepth(a.representative) - layoutDepth(b.representative)) ||
-    (layoutHash(a.representative) - layoutHash(b.representative)) ||
-    (layoutOrder(a.representative) - layoutOrder(b.representative)) ||
-    String(a.id).localeCompare(String(b.id))
-  );
 
-  const classIdByEventId = new Map();
-  for (const cls of canonicalClasses) {
-    for (const ev of cls.members) classIdByEventId.set(ev.id, cls.id);
+    const classIdByKey = new Map(canonicalClasses.map(cls => [cls.signature, cls.id]));
+    const classRedIds = new Set(canonicalClasses.filter(cls => cls.red).map(cls => cls.id));
+    const renderEdgesAll = [];
+    for (const [src, dst] of (data.causal_edges || [])) {
+      const sourceKey = classKeyByEventId.get(src);
+      const targetKey = classKeyByEventId.get(dst);
+      if (sourceKey == null || targetKey == null || sourceKey === targetKey) continue;
+      const source = classIdByKey.get(sourceKey);
+      const target = classIdByKey.get(targetKey);
+      if (source == null || target == null || source === target) continue;
+      renderEdgesAll.push({ source, target, mwcKind: 'occurrence' });
+    }
+
+    canonicalModel = { canonicalClasses, classRedIds, renderEdgesAll };
+    canonicalModelCache.set(data, canonicalModel);
   }
-  const classRedIds = new Set(canonicalClasses.filter(cls => cls.red).map(cls => cls.id));
+
+  const canonicalClasses = canonicalModel.canonicalClasses;
+  const classRedIds = canonicalModel.classRedIds;
 
   const CAUSAL_NODE_CAP = 8000;
   const totalVisible = canonicalClasses.length;
@@ -2600,18 +2641,9 @@ function renderMultiwayCausal() {
   const truncated = serverTruncated || clientTruncated;
   const renderClasses = clientTruncated ? canonicalClasses.slice(-CAUSAL_NODE_CAP) : canonicalClasses;
   const renderIds = new Set(renderClasses.map(cls => cls.id));
-  const renderEdges = [];
-  const seenEdgeKeys = new Set();
-  for (const [src, dst] of (data.causal_edges || [])) {
-    const source = classIdByEventId.get(src);
-    const target = classIdByEventId.get(dst);
-    if (source == null || target == null || source === target) continue;
-    if (!renderIds.has(source) || !renderIds.has(target)) continue;
-    const key = `${source}->${target}`;
-    if (seenEdgeKeys.has(key)) continue;
-    seenEdgeKeys.add(key);
-    renderEdges.push({ source, target, mwcKind: 'occurrence' });
-  }
+  const renderEdges = clientTruncated
+    ? canonicalModel.renderEdgesAll.filter(d => renderIds.has(d.source) && renderIds.has(d.target))
+    : canonicalModel.renderEdgesAll;
 
   const g = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => g.attr('transform', e.transform)));
@@ -2649,7 +2681,7 @@ function renderMultiwayCausal() {
     id: cls.id,
     mwcKind: 'occurrence',
     canonicalEventSignature: cls.signature,
-    equivalentEventIds: cls.members.map(ev => ev.id),
+    equivalentEventIds: cls.members.slice(),
     multiplicity: cls.multiplicity,
   }, posById.get(cls.id)));
   const nodeR = Math.max(1.5, 4 - Math.log10(nodes.length + 1) * 1.15);
