@@ -2170,7 +2170,10 @@ async function loadApplicationPlayback(ruleId) {
       atomicFrameCursor = 0;
       updateTruncationBanner();
       updateStatusLabel();
-      renderCurrentViewApplication();
+      // Render the before-state (same as what step mode was showing) so
+      // no unpositioned new nodes flash on initial Application mode activation.
+      // Playback starts from here when the user presses play.
+      renderCurrentViewApplication(_beforeStateForFrame(0));
     } else {
       // Feature flag OFF or no usable frames — degrade gracefully
       setPlaybackMode('step');
@@ -2276,16 +2279,21 @@ function startSubFrameAnimation(frame) {
     renderCurrentViewApplication(frame.state);
 
     _appSubFrameTimer = setTimeout(() => {
-      // Phase 3: settle — advance cursor, clear all highlights
-      atomicFrameCursor++;
+      // Phase 3: settle — show the same after-state without highlight, then
+      // advance the cursor AFTER the dwell so Phase 1 of the next frame sees
+      // the correct before-state (frame.state, not frames[K+1].state).
+      // Bug fixed: advancing atomicFrameCursor before the render caused
+      // renderCurrentViewApplication() to jump to frames[K+1].state, producing
+      // a forward-then-backward flicker at every frame boundary.
       _appHighlight     = null;
       _appStateOverride = null;
-      renderCurrentViewApplication();
+      renderCurrentViewApplication(frame.state);  // still show frame K's after-state
       updateStatusLabel();
 
       _appSubFrameTimer = setTimeout(() => {
+        // Advance cursor after settle, then start next frame
+        atomicFrameCursor++;
         _appSubFrameTimer = null;
-        // Continue play loop if still in play mode
         if (playing && playbackMode === 'application') {
           stepAtomicFrameForward();
         }
