@@ -30,6 +30,20 @@ let playing = false;
 let playTimer = null;
 let playIntervalMs = 1200; // §6.9 [L6] configurable play speed (50–5000 ms)
 
+// ── Application-mode playback state (Phase B) ──────────────────────────────
+let playbackMode             = 'step';   // 'step' | 'application'
+let atomicFrameCursor        = 0;        // index into _appPlaybackFrames
+let _appPlaybackFrames       = null;     // array from playback.frames[], null until loaded
+let _appPlaybackTruncated    = false;
+let _appPlaybackTruncationReason = null;
+let _appPlaybackLoading      = false;    // prevents duplicate fetches
+let playbackSpeedMult        = 1.0;      // 0.5 – 4×
+const PLAYBACK_SPEED_STOPS   = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]; // index→multiplier
+let _appSubFrameTimer        = null;     // active setTimeout handle for sub-frame animation
+let _appHighlight            = null;     // null | { consumed: [], produced: [], phase: string }
+let _appStateOverride        = null;     // transient: replaces data.states[currentStep] in renderers
+let _canvasCurrentTransform  = null;     // latest d3 zoom transform for canvas highlight overlay
+
 // =========================================================================
 // COMPUTE LIVENESS — overlay state machine
 // =========================================================================
@@ -696,6 +710,16 @@ function removeCustomRule(ruleId) {
 function selectRule(ruleId) {
   // Stop playback before switching rules so the play button stays consistent
   if (playing) togglePlay();
+  // Reset application-mode playback state on rule change (contract §6.3).
+  // Flip mode to 'step' first so the UI (step slider, mode buttons) is consistent
+  // before the new rule's render runs. _resetAppPlayback() clears frame state;
+  // the explicit mode assignment + UI update below ensures the slider stays enabled.
+  _resetAppPlayback();
+  if (playbackMode === 'application') {
+    playbackMode = 'step';
+    _updatePlaybackModeUI();
+    _updateStepSliderDisabled();
+  }
   activeRule = ruleId;
   clearLineage();
   document.querySelectorAll('.rule-card').forEach(c => c.classList.remove('active'));
@@ -851,9 +875,10 @@ function renderSpatial() {
   }
 
   const mw = MULTIWAY[activeRule];
-  const state = (selectedMultiwayNode && mw && mw.states && mw.states[selectedMultiwayNode])
-    ? mw.states[selectedMultiwayNode].state
-    : data.states[currentStep];
+  const state = _appStateOverride
+    ?? ((selectedMultiwayNode && mw && mw.states && mw.states[selectedMultiwayNode])
+      ? mw.states[selectedMultiwayNode].state
+      : data.states[currentStep]);
 
   const svg = d3.select('#main-svg');
   svg.selectAll('*').remove();
@@ -962,6 +987,23 @@ function renderSpatial() {
       recomputeLineage();
       renderSpatial();
     });
+
+  // Application-mode LHS/RHS highlight overlay (SVG path)
+  if (_appHighlight) {
+    const { consumed, produced } = _appHighlight;
+    link.each(function(d) {
+      const edgeTuple = state[d.edgeIdx] || [];
+      const isConsumed = consumed.some(c => _edgeMatch(c, edgeTuple));
+      const isProduced = produced.some(p => _edgeMatch(p, edgeTuple));
+      if (isConsumed) {
+        d3.select(this).attr('stroke', '#f59e0b').attr('stroke-width', baseEdgeWidth * 2.5)
+          .attr('stroke-opacity', 1);
+      } else if (isProduced) {
+        d3.select(this).attr('stroke', '#a78bfa').attr('stroke-width', baseEdgeWidth * 2.5)
+          .attr('stroke-opacity', 0.9);
+      }
+    });
+  }
 
   // Node birth colors
   const nodeBirthMap = {};
@@ -1159,14 +1201,16 @@ function renderSpatialCanvas() {
   }
 
   const mw = MULTIWAY[activeRule];
-  const state = (selectedMultiwayNode && mw && mw.states && mw.states[selectedMultiwayNode])
-    ? mw.states[selectedMultiwayNode].state
-    : data.states[currentStep];
+  const state = _appStateOverride
+    ?? ((selectedMultiwayNode && mw && mw.states && mw.states[selectedMultiwayNode])
+      ? mw.states[selectedMultiwayNode].state
+      : data.states[currentStep]);
 
   // LEVER-4: invalidate hull cache whenever topology identity changes.
   // Covers ALL entry points: slider, setStep() (play/keyboard), selectRule(),
   // multiway-node selection, and explicit invalidation (hulls toggle-on, key reset).
-  const _nextHullKey = `${activeRule}:${currentStep}:${selectedMultiwayNode || ''}:${(state || []).length}`;
+  // atomicFrameCursor included so each app-mode frame gets fresh hull computation.
+  const _nextHullKey = `${activeRule}:${currentStep}:${selectedMultiwayNode || ''}:${(state || []).length}:${playbackMode === 'application' ? atomicFrameCursor : ''}`;
   if (_nextHullKey !== _hullCacheKey) {
     _hullCacheKey = _nextHullKey;
     CanvasRenderer.invalidateHullCache();
@@ -1323,6 +1367,7 @@ function renderSpatialCanvas() {
   // ── Zoom behaviour ────────────────────────────────────────────────────────
   const zoomBehavior = d3.zoom().scaleExtent([0.05, 20]).on('zoom', e => {
     overlayG.attr('transform', e.transform);
+    _canvasCurrentTransform = e.transform;
     CanvasRenderer.setTransform(e.transform);
     CanvasRenderer.drawFrame({
       nodes, nodeById, links, selfLoops, hyperedges,
@@ -1406,6 +1451,15 @@ function renderSpatialCanvas() {
       nodes, nodeById, links, selfLoops, hyperedges,
       nodeR, baseEdgeWidth, isDark, opts, selectedEdges, getEdgeSelColor,
     });
+    // Application-mode highlight overlay: draw on top of canvas frame
+    if (_appHighlight && playbackMode === 'application') {
+      const canvasEl = document.getElementById('main-canvas');
+      if (canvasEl) {
+        const ctx = canvasEl.getContext('2d');
+        _drawAppHighlightOverlay(ctx, nodes, nodeById, links, state,
+          _canvasCurrentTransform);
+      }
+    }
     if (forceOverlaySync) {
       _syncOverlayHitTestLayer();
       return;
@@ -2034,24 +2088,30 @@ function togglePlay() {
   const btn = document.getElementById('play-btn');
   if (playing) {
     btn.innerHTML = '&#9646;&#9646;';
-    playTimer = setInterval(() => {
-      const data = DATA[activeRule];
-      const max = (data.states || []).length - 1;
-      if (currentStep >= max) { togglePlay(); return; }
-      setStep(currentStep + 1);
-    }, playIntervalMs); // §6.9 [L6] uses configurable interval
+    if (playbackMode === 'application') {
+      // Application mode: drive the sub-frame animation chain
+      stepAtomicFrameForward();
+    } else {
+      playTimer = setInterval(() => {
+        const data = DATA[activeRule];
+        const max = (data.states || []).length - 1;
+        if (currentStep >= max) { togglePlay(); return; }
+        setStep(currentStep + 1);
+      }, playIntervalMs); // §6.9 [L6] uses configurable interval
+    }
   } else {
     btn.innerHTML = '&#9654;';
     clearInterval(playTimer);
+    clearSubFrameTimer();
   }
 }
 
-// §6.9 [L6] Play-speed slider handler (50–5000 ms)
+// §6.9 [L6] Play-speed slider handler (50–5000 ms) — step mode only
 function setPlaySpeed(ms) {
   playIntervalMs = ms;
   const display = document.getElementById('speed-display');
   if (display) display.textContent = ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
-  if (playing) {
+  if (playing && playbackMode === 'step') {
     clearInterval(playTimer);
     playTimer = setInterval(() => {
       const data = DATA[activeRule];
@@ -2062,7 +2122,280 @@ function setPlaySpeed(ms) {
   }
 }
 
+// =========================================================================
+// APPLICATION-MODE PLAYBACK (Phase B) — contract §6.2, §8
+// =========================================================================
+
+// Helper: check if two edge tuples are equal (order-insensitive comparison)
+function _edgeMatch(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  const sa = a.slice().sort((x, y) => x - y);
+  const sb = b.slice().sort((x, y) => x - y);
+  return sa.every((v, i) => v === sb[i]);
+}
+
+// Helper: get the state immediately BEFORE frame at cursor index
+function _beforeStateForFrame(cursor) {
+  if (cursor <= 0) return DATA[activeRule]?.states?.[0] || [];
+  return _appPlaybackFrames[cursor - 1].state;
+}
+
+// Reset all application-mode state (called on rule change and mode switch)
+function _resetAppPlayback() {
+  _appPlaybackFrames        = null;
+  _appPlaybackTruncated     = false;
+  _appPlaybackTruncationReason = null;
+  _appPlaybackLoading       = false;
+  atomicFrameCursor         = 0;
+  _appHighlight             = null;
+  _appStateOverride         = null;
+  clearSubFrameTimer();
+  showPlaybackUnavailable(false);
+  showPlaybackLoadingIndicator(false);
+  updateTruncationBanner();
+}
+
+// Fetch the application playback trace lazily (only on first opt-in)
+async function loadApplicationPlayback(ruleId) {
+  if (_appPlaybackLoading) return;
+  _appPlaybackLoading = true;
+  showPlaybackLoadingIndicator(true);
+  try {
+    const resp = await fetch(`/api/rules/${ruleId}?playback=application`);
+    const data = await resp.json();
+    if (data.playback && Array.isArray(data.playback.frames) && data.playback.frames.length > 0) {
+      _appPlaybackFrames           = data.playback.frames;
+      _appPlaybackTruncated        = !!data.playback.truncated;
+      _appPlaybackTruncationReason = data.playback.truncation_reason || null;
+      atomicFrameCursor = 0;
+      updateTruncationBanner();
+      updateStatusLabel();
+      renderCurrentViewApplication();
+    } else {
+      // Feature flag OFF or no usable frames — degrade gracefully
+      setPlaybackMode('step');
+      showPlaybackUnavailable(true);
+    }
+  } catch (e) {
+    setPlaybackMode('step');
+    showPlaybackUnavailable(true);
+  } finally {
+    _appPlaybackLoading = false;
+    showPlaybackLoadingIndicator(false);
+  }
+}
+
+// Switch between 'step' and 'application' modes
+function setPlaybackMode(mode) {
+  if (mode === playbackMode) return;
+  if (playing) togglePlay();
+  clearSubFrameTimer();
+  _appHighlight     = null;
+  _appStateOverride = null;
+  playbackMode = mode;
+  _updatePlaybackModeUI();
+  _updateStepSliderDisabled();
+  if (mode === 'application') {
+    if (_appPlaybackFrames === null) {
+      loadApplicationPlayback(activeRule);
+    } else {
+      updateStatusLabel();
+      renderCurrentViewApplication();
+    }
+  } else {
+    renderCurrentView();
+  }
+}
+
+// Navigate directly to an atomic frame (pause any ongoing animation)
+function setAtomicFrame(idx) {
+  if (!_appPlaybackFrames) return;
+  clearSubFrameTimer();
+  _appHighlight = null;
+  atomicFrameCursor = Math.max(0, Math.min(idx, _appPlaybackFrames.length - 1));
+  updateStatusLabel();
+  renderCurrentViewApplication();
+}
+
+// Advance one atomic frame with the three-phase sub-frame animation
+function stepAtomicFrameForward() {
+  if (!_appPlaybackFrames) return;
+  if (atomicFrameCursor >= _appPlaybackFrames.length) { if (playing) togglePlay(); return; }
+  startSubFrameAnimation(_appPlaybackFrames[atomicFrameCursor]);
+}
+
+// Three-phase sub-frame animation per contract §8.3
+// All durations scale by 1/playbackSpeedMult; Phase 1 clamped to ≥80ms.
+function startSubFrameAnimation(frame) {
+  clearSubFrameTimer();
+  const t    = 1.0 / playbackSpeedMult;
+  const ph1  = Math.max(80, 150 * t);   // LHS highlight   (≥80ms always)
+  const ph2  = 200 * t;                  // LHS→RHS morph
+  const ph3  = 150 * t;                  // settle dwell
+
+  // Phase 1: show BEFORE state with consumed edges highlighted (amber)
+  const beforeState = _beforeStateForFrame(atomicFrameCursor);
+  _appHighlight = { consumed: frame.consumed, produced: [], phase: 'lhs' };
+  renderCurrentViewApplication(beforeState);
+
+  _appSubFrameTimer = setTimeout(() => {
+    // Phase 2: show AFTER state with produced edges highlighted (violet)
+    _appHighlight = { consumed: [], produced: frame.produced, phase: 'transition' };
+    renderCurrentViewApplication(frame.state);
+
+    _appSubFrameTimer = setTimeout(() => {
+      // Phase 3: settle — advance cursor, clear all highlights
+      atomicFrameCursor++;
+      _appHighlight     = null;
+      _appStateOverride = null;
+      renderCurrentViewApplication();
+      updateStatusLabel();
+
+      _appSubFrameTimer = setTimeout(() => {
+        _appSubFrameTimer = null;
+        // Continue play loop if still in play mode
+        if (playing && playbackMode === 'application') {
+          stepAtomicFrameForward();
+        }
+      }, ph3);
+    }, ph2);
+  }, ph1);
+}
+
+function clearSubFrameTimer() {
+  if (_appSubFrameTimer) { clearTimeout(_appSubFrameTimer); _appSubFrameTimer = null; }
+}
+
+// Render the spatial graph using the current atomic frame state
+function renderCurrentViewApplication(stateOverride) {
+  const frame = _appPlaybackFrames && _appPlaybackFrames[Math.min(
+    atomicFrameCursor, _appPlaybackFrames.length - 1)];
+  _appStateOverride = stateOverride !== undefined
+    ? stateOverride
+    : (frame ? frame.state : null);
+  if (USE_CANVAS && !_canvasWorkerDisabled) renderSpatialCanvas();
+  else renderSpatial();
+  _appStateOverride = null;
+}
+
+// Speed slider: maps 0–6 index to PLAYBACK_SPEED_STOPS multiplier
+function setPlaybackSpeed(idx) {
+  playbackSpeedMult = PLAYBACK_SPEED_STOPS[+idx] ?? 1.0;
+  const lbl = document.getElementById('speed-mult-label');
+  if (lbl) lbl.textContent = playbackSpeedMult + '×';
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────
+
+function updateStatusLabel() {
+  const el = document.getElementById('playback-status-label');
+  if (!el) return;
+  if (playbackMode === 'application' && _appPlaybackFrames) {
+    const cursor = Math.min(atomicFrameCursor, _appPlaybackFrames.length - 1);
+    const f = _appPlaybackFrames[cursor];
+    el.textContent = f ? `step ${f.step} / frame ${cursor}` : '— / —';
+  } else {
+    el.textContent = '— / —';
+  }
+}
+
+function updateTruncationBanner() {
+  const banner = document.getElementById('playback-truncation-banner');
+  if (!banner) return;
+  if (_appPlaybackTruncated && _appPlaybackFrames && _appPlaybackFrames.length > 0) {
+    const labels = { max_frames: 'frame cap', max_time_ms: 'time cap' };
+    const reasonEl = document.getElementById('trunc-reason-text');
+    const countEl  = document.getElementById('trunc-frame-count');
+    if (reasonEl) reasonEl.textContent =
+      labels[_appPlaybackTruncationReason] || _appPlaybackTruncationReason || 'cap';
+    if (countEl) countEl.textContent = _appPlaybackFrames.length - 1;
+    banner.classList.remove('hidden');
+  } else {
+    banner.classList.add('hidden');
+  }
+}
+
+function showPlaybackLoadingIndicator(v) {
+  document.getElementById('playback-loading')?.classList.toggle('hidden', !v);
+}
+
+function showPlaybackUnavailable(v) {
+  document.getElementById('playback-unavailable')?.classList.toggle('hidden', !v);
+}
+
+function _updatePlaybackModeUI() {
+  const btnStep = document.getElementById('btn-mode-step');
+  const btnApp  = document.getElementById('btn-mode-application');
+  if (btnStep) btnStep.classList.toggle('active', playbackMode === 'step');
+  if (btnApp)  btnApp.classList.toggle('active', playbackMode === 'application');
+  document.querySelectorAll('.app-pb-only').forEach(el =>
+    el.classList.toggle('hidden', playbackMode !== 'application'));
+}
+
+function _updateStepSliderDisabled() {
+  const sl = document.getElementById('step-slider');
+  if (sl) sl.disabled = (playbackMode === 'application');
+}
+
+// Canvas-path highlight overlay: draw amber rings on consumed, violet rings on produced
+// nodeById may be a Map or plain object; we normalise with _nodeGet.
+function _drawAppHighlightOverlay(ctx, nodes, nodeById, links, currentState, transform) {
+  if (!_appHighlight || (!_appHighlight.consumed.length && !_appHighlight.produced.length)) return;
+  const { consumed, produced } = _appHighlight;
+  const _nodeGet = id => (nodeById instanceof Map) ? nodeById.get(id) : nodeById[id];
+
+  function highlightEdges(edgeList, color) {
+    if (!edgeList.length) return;
+    ctx.save();
+    if (transform) {
+      ctx.translate(transform.x, transform.y);
+      ctx.scale(transform.k, transform.k);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 4;
+    ctx.globalAlpha = 0.85;
+    ctx.setLineDash([]);
+
+    for (const edgeTuple of edgeList) {
+      const tupleSet = new Set(edgeTuple);
+      // Draw edges (links) whose both endpoints are in the edge tuple
+      for (const lnk of links) {
+        const srcId = lnk.source && (lnk.source.id ?? lnk.source);
+        const tgtId = lnk.target && (lnk.target.id ?? lnk.target);
+        if (!tupleSet.has(srcId) || !tupleSet.has(tgtId)) continue;
+        const sNode = _nodeGet(srcId);
+        const tNode = _nodeGet(tgtId);
+        if (!sNode || !tNode || sNode.x == null) continue;
+        ctx.beginPath();
+        ctx.moveTo(sNode.x, sNode.y);
+        ctx.lineTo(tNode.x, tNode.y);
+        ctx.stroke();
+      }
+      // Draw node halos
+      for (const nid of edgeTuple) {
+        const nd = _nodeGet(nid);
+        if (!nd || nd.x == null) continue;
+        ctx.beginPath();
+        ctx.arc(nd.x, nd.y, (nd._r || 5) + 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  highlightEdges(consumed, '#f59e0b');   // amber — LHS
+  highlightEdges(produced, '#a78bfa');   // violet — RHS
+}
+
+// =========================================================================
+// END APPLICATION-MODE PLAYBACK
+// =========================================================================
+
 function stepPlus1() {
+  if (playbackMode === 'application') {
+    setAtomicFrame(atomicFrameCursor + 1);
+    return;
+  }
   const data = DATA[activeRule];
   const max = (data.states || []).length - 1;
   if (currentStep < max) setStep(currentStep + 1);
@@ -2105,6 +2438,15 @@ function hideTooltip() { document.getElementById('tooltip').style.display = 'non
 document.addEventListener('keydown', e => {
   const data = DATA[activeRule];
   if (!data) return;
+  // Application mode: arrows navigate atomic frames (regardless of play state)
+  if (playbackMode === 'application') {
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); setAtomicFrame(atomicFrameCursor - 1); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); setAtomicFrame(atomicFrameCursor + 1); return; }
+    if (e.key === ' ') { e.preventDefault(); togglePlay(); return; }
+    if (e.key === 'Escape') clearLineage();
+    return;
+  }
+  // Step mode: existing behaviour
   const max = (data.states || []).length - 1;
   if (e.key === 'ArrowLeft' && currentStep > 0) setStep(currentStep - 1);
   if (e.key === 'ArrowRight' && currentStep < max) setStep(currentStep + 1);
