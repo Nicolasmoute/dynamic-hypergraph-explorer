@@ -2558,35 +2558,27 @@ function renderMultiwayCausal() {
     );
   for (const ev of events) eventInfo[ev.id] = ev;
 
-  const signatureMembers = new Map();
-  const signatureByEventId = new Map();
+  const canonicalClassesBySignature = new Map();
   for (const ev of events) {
     const signature = ev.canonicalEventSignature || String(ev.id);
-    let members = signatureMembers.get(signature);
-    if (!members) {
-      members = new Set();
-      signatureMembers.set(signature, members);
-    }
-    members.add(ev.id);
-    if (Array.isArray(ev.equivalentEventIds)) {
-      for (const memberId of ev.equivalentEventIds) members.add(memberId);
-    }
-    signatureByEventId.set(ev.id, signature);
+    const groupKey = `${ev.step}::${signature}`;
+    const group = canonicalClassesBySignature.get(groupKey);
+    if (group) group.push(ev);
+    else canonicalClassesBySignature.set(groupKey, [ev]);
   }
 
-  const canonicalClasses = Array.from(signatureMembers.entries()).map(([signature, members]) => {
-    const memberIds = Array.from(members).sort((a, b) =>
-      (Number(a) - Number(b)) || String(a).localeCompare(String(b))
+  const canonicalClasses = Array.from(canonicalClassesBySignature.entries()).map(([groupKey, members]) => {
+    const sortedMembers = members.slice().sort((a, b) =>
+      (Number(a.id) - Number(b.id)) || String(a.id).localeCompare(String(b.id))
     );
-    const visibleMembers = events.filter(ev => signatureByEventId.get(ev.id) === signature);
-    const representative = visibleMembers[0] || eventInfo[memberIds[0]] || events[0];
+    const representative = sortedMembers[0];
     return {
       id: representative.id,
-      signature,
+      signature: groupKey,
       representative,
-      members: memberIds,
-      multiplicity: memberIds.length,
-      red: memberIds.some(id => defaultPathIds.has(id)),
+      members: sortedMembers,
+      multiplicity: members.length,
+      red: members.some(ev => defaultPathIds.has(ev.id)),
     };
   }).sort((a, b) =>
     (layoutDepth(a.representative) - layoutDepth(b.representative)) ||
@@ -2595,7 +2587,10 @@ function renderMultiwayCausal() {
     String(a.id).localeCompare(String(b.id))
   );
 
-  const signatureToNodeId = new Map(canonicalClasses.map(cls => [cls.signature, cls.id]));
+  const classIdByEventId = new Map();
+  for (const cls of canonicalClasses) {
+    for (const ev of cls.members) classIdByEventId.set(ev.id, cls.id);
+  }
   const classRedIds = new Set(canonicalClasses.filter(cls => cls.red).map(cls => cls.id));
 
   const CAUSAL_NODE_CAP = 8000;
@@ -2608,11 +2603,8 @@ function renderMultiwayCausal() {
   const renderEdges = [];
   const seenEdgeKeys = new Set();
   for (const [src, dst] of (data.causal_edges || [])) {
-    const sourceSignature = signatureByEventId.get(src);
-    const targetSignature = signatureByEventId.get(dst);
-    if (sourceSignature == null || targetSignature == null || sourceSignature === targetSignature) continue;
-    const source = signatureToNodeId.get(sourceSignature);
-    const target = signatureToNodeId.get(targetSignature);
+    const source = classIdByEventId.get(src);
+    const target = classIdByEventId.get(dst);
     if (source == null || target == null || source === target) continue;
     if (!renderIds.has(source) || !renderIds.has(target)) continue;
     const key = `${source}->${target}`;
