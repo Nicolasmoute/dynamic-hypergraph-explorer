@@ -357,6 +357,10 @@
   .loading-overlay .loading-text {
     font-size: 13px; color: var(--text-dim);
   }
+  /* Phase B: application-mode playback helpers */
+  .hidden { display: none !important; }
+  /* .app-pb-only elements start with .hidden; JS removes it to reveal them in application mode */
+  .mode-btn.active { background: var(--accent) !important; color: #fff !important; }
 </style>
 </head>
 <body>
@@ -434,6 +438,33 @@
       <div id="extend-row" style="display:none; align-items:center; gap:8px; margin-top:10px;">
         <button class="editor-btn" id="extend-btn" onclick="extendOneStep()">+ Extend 1 step</button>
         <span id="extend-status" style="font-size:10px; color:var(--text-dim);"></span>
+      </div>
+      <!-- Phase B: Application-mode playback controls -->
+      <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
+        <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+          <span style="font-size:10px; color:var(--text-dim); white-space:nowrap;">Mode</span>
+          <button id="btn-mode-step" class="mode-btn active" onclick="setPlaybackMode('step')"
+            style="padding:2px 8px; font-size:10px; border-radius:3px; border:1px solid var(--border); background:var(--accent); color:#fff; cursor:pointer;">Step</button>
+          <button id="btn-mode-application" class="mode-btn" onclick="setPlaybackMode('application')"
+            style="padding:2px 8px; font-size:10px; border-radius:3px; border:1px solid var(--border); background:var(--surface2); color:var(--text); cursor:pointer;">Application</button>
+          <span id="playback-loading"  class="hidden" style="font-size:9px; color:var(--text-dim);">Loading…</span>
+          <span id="playback-unavailable" class="hidden" style="font-size:9px; color:#e05050;">Not available</span>
+        </div>
+        <!-- Status label and app-mode speed slider (app-pb-only = hidden in step mode) -->
+        <div id="playback-status-label" class="app-pb-only hidden"
+          style="font-size:10px; font-family:'JetBrains Mono',monospace; color:var(--text-dim); margin-bottom:5px;">— / —</div>
+        <div id="playback-speed-control" class="app-pb-only hidden"
+          style="display:flex; align-items:center; gap:8px;">
+          <label style="font-size:10px; color:var(--text-dim); white-space:nowrap;">App speed <span id="speed-mult-label">1×</span></label>
+          <input type="range" id="playback-speed-slider" min="0" max="6" step="1" value="2"
+            oninput="setPlaybackSpeed(+this.value)"
+            style="flex:1; accent-color:#f59e0b; -webkit-appearance:none; height:4px; border-radius:2px; background:var(--border);">
+        </div>
+        <!-- Truncation banner -->
+        <div id="playback-truncation-banner" class="hidden"
+          style="margin-top:6px; padding:4px 6px; background:#7c2d12; color:#fcd34d; border-radius:4px; font-size:9px; line-height:1.4;">
+          Truncated (<span id="trunc-reason-text"></span>) — frames 0–<span id="trunc-frame-count"></span> shown.
+        </div>
       </div>
     </div>
     <div class="sidebar-section">
