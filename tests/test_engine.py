@@ -869,6 +869,47 @@ class TestMultiwayCausalGraph:
                     "truncated", "truncation_reason"):
             assert key in r, f"missing key: {key!r}"
 
+    def test_event_class_metadata_present(self):
+        """Public MWC events carry canonical-class aggregation metadata."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=3)
+        event = next(ev for ev in r["events"] if ev["id"] != 0)
+        for field in (
+            "canonicalEventSignature",
+            "canonicalConsumed",
+            "canonicalProduced",
+            "multiplicity",
+            "equivalentEventIds",
+        ):
+            assert field in event, f"missing field: {field!r}"
+
+    def test_event_class_metadata_is_self_consistent(self):
+        """Equivalent events must share class metadata and multiplicity."""
+        p = self._parsed()
+        r = engine.multiway_causal_graph([[0, 1]], p["lhs"], p["rhs"], max_steps=4)
+        events = r["events"]
+        event_ids = {ev["id"] for ev in events}
+        by_signature = {}
+        for ev in events:
+            assert ev["multiplicity"] == len(ev["equivalentEventIds"])
+            assert ev["id"] in ev["equivalentEventIds"]
+            assert set(ev["equivalentEventIds"]) <= event_ids
+            assert ev["canonicalConsumed"] == sorted(ev["canonicalConsumed"])
+            assert ev["canonicalProduced"] == sorted(ev["canonicalProduced"])
+            by_signature.setdefault(ev["canonicalEventSignature"], []).append(ev)
+
+        assert any(ev["multiplicity"] > 1 for ev in events)
+        for group in by_signature.values():
+            first = group[0]
+            for ev in group[1:]:
+                assert ev["equivalentEventIds"] == first["equivalentEventIds"]
+                assert ev["multiplicity"] == first["multiplicity"]
+                assert ev["canonicalConsumed"] == first["canonicalConsumed"]
+                assert ev["canonicalProduced"] == first["canonicalProduced"]
+
+    def test_cache_version_bumped_for_mwc_metadata(self):
+        assert engine.CACHE_VERSION == "v11"
+
     def test_events_have_required_fields(self):
         """Each event must have id, step, occ_id, parent_occ_id, match_idx,
         consumed, produced, branch_path."""

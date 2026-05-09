@@ -228,7 +228,9 @@ class TestGetMultiwayCausal:
     def test_event_fields_present(self, client):
         events = client.get("/api/rules/rule3/multiway-causal").json()["events"]
         for field in ("id", "step", "occ_id", "parent_occ_id", "match_idx",
-                      "consumed", "produced", "branch_path"):
+                      "consumed", "produced", "branch_path",
+                      "canonicalEventSignature", "canonicalConsumed",
+                      "canonicalProduced", "multiplicity", "equivalentEventIds"):
             assert field in events[0], f"Missing event field: {field}"
 
     def test_causal_edges_reference_valid_ids(self, client):
@@ -341,6 +343,13 @@ class TestCustomMultiwayCausal:
         data = self._post().json()
         assert isinstance(data["events"], list)
         assert len(data["events"]) > 0
+
+    def test_event_class_fields_present(self):
+        events = self._post().json()["events"]
+        for field in ("canonicalEventSignature", "canonicalConsumed",
+                      "canonicalProduced", "multiplicity", "equivalentEventIds"):
+            assert field in events[0], f"Missing event field: {field}"
+        assert events[0]["multiplicity"] == len(events[0]["equivalentEventIds"])
 
     def test_causal_edges_reference_valid_ids(self):
         data = self._post().json()
