@@ -10,6 +10,7 @@
 !server/__init__.py
 !server/engine.py
 !server/main.py
+!server/warmup.py
 !server/requirements.txt
 
 # Client

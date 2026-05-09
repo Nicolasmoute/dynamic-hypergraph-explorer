@@ -951,3 +951,37 @@ class TestServeClient:
         r = client.get("/")
         # May 404 if client/index.html absent in test env — accept both
         assert r.status_code in (200, 404)
+
+
+# ── server.warmup ─────────────────────────────────────────────────────
+
+class TestWarmup:
+    """server.warmup is importable and exits cleanly when cache is warm."""
+
+    def test_warmup_exits_zero_when_cache_already_warm(self):
+        """warmup.main() returns 0 when all cache entries are already populated."""
+        # Pre-populate in-memory cache for all built-in rules.
+        from server import main as _main
+        from server import warmup
+        for rule in _main.RULES:
+            rid = rule["id"]
+            # Ensure at least rule-data is present so get_rule_data() hits cache.
+            _main.get_rule_data(rid)
+        exit_code = warmup.main()
+        assert exit_code == 0, f"warmup.main() returned {exit_code}"
+
+    def test_warmup_warm_function_returns_0_on_success(self):
+        """_warm() returns 0 when the callback succeeds."""
+        from server.warmup import _warm
+        calls = []
+        result = _warm("test-label", "rule_x", lambda: calls.append(1))
+        assert result == 0
+        assert len(calls) == 1
+
+    def test_warmup_warm_function_returns_1_on_exception(self):
+        """_warm() returns 1 and does not raise when the callback raises."""
+        from server.warmup import _warm
+        def boom():
+            raise RuntimeError("simulated failure")
+        result = _warm("test-label", "rule_x", boom)
+        assert result == 1
