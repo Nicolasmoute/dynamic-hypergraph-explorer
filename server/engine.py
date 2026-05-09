@@ -1316,6 +1316,10 @@ def compute_multiway_occurrences(
     for _step in range(1, max_steps + 1):
         if not frontier:
             break
+        if len(occurrences) >= max_occurrences:
+            truncated = True
+            truncation_reason = "max_occurrences"
+            break
         if operation_budget_exhausted() and any(
             bool(find_matches(occ["_state"], lhs)) for occ in frontier
         ):

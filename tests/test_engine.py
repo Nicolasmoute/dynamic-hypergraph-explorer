@@ -793,6 +793,17 @@ class TestComputeMultiwayOccurrences:
             (2, 0, 1, [1]),
         ]
 
+    def test_max_operations_tie_with_occurrences_cap_reports_occurrences(self):
+        """When occurrence cap and operation budget both exhaust at the same boundary, occurrences wins."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=10, max_occurrences=3, max_time_ms=5000, max_operations=2,
+        )
+        assert result["truncated"] is True
+        assert result["truncation_reason"] == "max_occurrences"
+        assert len(result["occurrences"]) == 3
+
     def test_max_operations_prefix_is_replay_stable(self):
         """Operation-budget truncation must not emit unreplayable partial occurrences."""
         p = self._parsed()
