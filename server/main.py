@@ -113,7 +113,7 @@ RULES = [
     {
         "id": "rule4", "name": "Sierpinski Hyperedge",
         "notation": "{{x,y,z}} → {{x,u,w},{y,v,u},{z,w,v}}",
-        "desc": "Ternary hyperedges split into 3 new ones. Fractal structure, dimension ≈ 1.4.",
+        "desc": "Ternary hyperedges split into 3 new ones. Fractal structure, dimension ≈ 1.585.",
         "blurb": "A single ternary hyperedge self-similarly subdivides into three, recreating the Sierpinski gasket. Each step triples the hyperedge count. Hausdorff dimension ≈ log(3)/log(2) ≈ 1.585.",
         "tag": "Fractal", "tagClass": "tag-fractal",
         "init": [[0, 1, 2]],
