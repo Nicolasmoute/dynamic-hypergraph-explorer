@@ -2559,14 +2559,14 @@ function renderMultiwayCausal() {
   for (const ev of events) eventInfo[ev.id] = ev;
 
   const canonicalModelCache = renderMultiwayCausal._canonicalModelCache || (renderMultiwayCausal._canonicalModelCache = new WeakMap());
-  let canonicalModel = canonicalModelCache.get(data);
+  let canonicalModel = data._canonicalModel || canonicalModelCache.get(data);
   if (!canonicalModel) {
     const classByKey = new Map();
     const classKeyByEventId = new Map();
 
     for (const ev of events) {
       const canonicalSignature = ev.canonicalEventSignature || String(ev.id);
-      const classKey = canonicalSignature;
+      const classKey = `${ev.step}::${canonicalSignature}`;
       let cls = classByKey.get(classKey);
       if (!cls) {
         cls = {
@@ -2615,8 +2615,10 @@ function renderMultiwayCausal() {
     );
 
     const classIdByKey = new Map(canonicalClasses.map(cls => [cls.signature, cls.id]));
+    const classMultiplicityByKey = new Map(canonicalClasses.map(cls => [cls.signature, cls.multiplicity]));
     const classRedIds = new Set(canonicalClasses.filter(cls => cls.red).map(cls => cls.id));
     const renderEdgesAll = [];
+    const seenTargetsBySource = new Map();
     for (const [src, dst] of (data.causal_edges || [])) {
       const sourceKey = classKeyByEventId.get(src);
       const targetKey = classKeyByEventId.get(dst);
@@ -2624,10 +2626,22 @@ function renderMultiwayCausal() {
       const source = classIdByKey.get(sourceKey);
       const target = classIdByKey.get(targetKey);
       if (source == null || target == null || source === target) continue;
+      const sourceMultiplicity = classMultiplicityByKey.get(sourceKey) || 0;
+      const targetMultiplicity = classMultiplicityByKey.get(targetKey) || 0;
+      if (sourceMultiplicity <= 2 && targetMultiplicity <= 2) {
+        let seenTargets = seenTargetsBySource.get(source);
+        if (!seenTargets) {
+          seenTargets = new Set();
+          seenTargetsBySource.set(source, seenTargets);
+        }
+        if (seenTargets.has(target)) continue;
+        seenTargets.add(target);
+      }
       renderEdgesAll.push({ source, target, mwcKind: 'occurrence' });
     }
 
     canonicalModel = { canonicalClasses, classRedIds, renderEdgesAll };
+    data._canonicalModel = canonicalModel;
     canonicalModelCache.set(data, canonicalModel);
   }
 
