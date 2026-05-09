@@ -772,6 +772,99 @@ class TestComputeMultiwayOccurrences:
         assert result["truncation_reason"] == "max_occurrences"
         assert len(result["occurrences"]) <= 3
 
+    def test_max_operations_cap_triggers_deterministic_truncation(self):
+        """Capping child-expansion slots must return the exact deterministic BFS prefix."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1], [1, 2]], p["lhs"], p["rhs"],
+            max_steps=10,
+            max_occurrences=5000,
+            max_time_ms=5000,
+            max_operations=2,
+        )
+        assert result["truncated"] is True
+        assert result["truncation_reason"] == "max_operations"
+        assert [
+            (o["occ_id"], o["parent_occ_id"], o["match_idx"], o["branch_path"])
+            for o in result["occurrences"]
+        ] == [
+            (0, None, None, []),
+            (1, 0, 0, [0]),
+            (2, 0, 1, [1]),
+        ]
+
+    def test_max_operations_tie_with_occurrences_cap_reports_occurrences(self):
+        """When occurrence cap and operation budget both exhaust at the same boundary, occurrences wins."""
+        p = self._parsed()
+        result = engine.compute_multiway_occurrences(
+            [[0, 1]], p["lhs"], p["rhs"],
+            max_steps=10, max_occurrences=3, max_time_ms=5000, max_operations=2,
+        )
+        assert result["truncated"] is True
+        assert result["truncation_reason"] == "max_occurrences"
+        assert len(result["occurrences"]) == 3
+
+    def test_max_operations_prefix_is_replay_stable(self):
+        """Operation-budget truncation must not emit unreplayable partial occurrences."""
+        p = self._parsed()
+        init = [[0, 1], [1, 2]]
+        result = engine.compute_multiway_occurrences(
+            init, p["lhs"], p["rhs"],
+            max_steps=10,
+            max_occurrences=5000,
+            max_time_ms=5000,
+            max_operations=4,
+        )
+        assert result["truncated"] is True
+        assert result["truncation_reason"] == "max_operations"
+        for occ in result["occurrences"]:
+            if not occ["branch_path"]:
+                continue
+            replay = engine.causal_graph_for_path(init, p["lhs"], p["rhs"], occ["branch_path"])
+            assert engine.canonical_hash(replay["states"][-1]) == occ["canonical_hash"]
+
+    def test_max_operations_repeated_runs_have_identical_digest(self):
+        """Rule2 and rule5 payload prefixes must be identical across operation-budgeted runs."""
+        cases = [
+            (
+                [[0, 1], [1, 2], [2, 3], [3, 4], [4, 0]],
+                "{{x,y},{y,z}} -> {{x,y},{y,w},{w,z}}",
+                24,
+            ),
+            (
+                [
+                    [0, 1, 2], [2, 3, 4], [4, 5, 6], [6, 7, 8],
+                    [8, 9, 0], [1, 3, 5], [5, 7, 9], [9, 1, 3],
+                ],
+                "{{x,y,z},{z,u,v}} -> {{y,z,u},{v,w,x},{w,y,v}}",
+                24,
+            ),
+        ]
+        for init, notation, max_operations in cases:
+            p = engine.parse_notation(notation)
+            digests = []
+            for _ in range(3):
+                result = engine.compute_multiway_occurrences(
+                    init, p["lhs"], p["rhs"],
+                    max_steps=4,
+                    max_occurrences=5000,
+                    max_time_ms=5000,
+                    max_operations=max_operations,
+                )
+                assert result["truncated"] is True
+                assert result["truncation_reason"] == "max_operations"
+                digests.append([
+                    (
+                        o["occ_id"],
+                        o["canonical_hash"],
+                        o["parent_occ_id"],
+                        o["match_idx"],
+                        tuple(o["branch_path"]),
+                    )
+                    for o in result["occurrences"]
+                ])
+            assert digests[0] == digests[1] == digests[2]
+
     def test_max_time_cap_triggers_truncation(self):
         """A 1 ms time cap on a branching rule must truncate without raising."""
         p = self._parsed()

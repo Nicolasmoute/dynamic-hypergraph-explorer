@@ -38,6 +38,12 @@ CACHE_VERSION = "v11"
 Edge = list[int]
 Hypergraph = list[Edge]
 
+# One operation is one deterministic child-expansion slot in
+# compute_multiway_occurrences().  2,000 operations is the recommended budget
+# for parity with the legacy 5s wall-clock default on the observed rule5
+# 1,989-event payload while keeping deterministic truncation opt-in.
+RECOMMENDED_MULTIWAY_OCCURRENCE_OPERATION_BUDGET = 2_000
+
 # Thread-local storage — node counter + cancel signal.
 # Using thread-local for the cancel signal lets find_matches.rec() observe
 # it without requiring signature changes on every inner function.
@@ -1189,6 +1195,7 @@ def compute_multiway_occurrences(
     max_steps: int = 4,
     max_occurrences: int = 5000,
     max_time_ms: int = 5000,
+    max_operations: Optional[int] = None,
     include_internal_states: bool = False,
 ) -> dict:
     """BFS over the multiway system tracking every history occurrence separately.
@@ -1225,6 +1232,14 @@ def compute_multiway_occurrences(
       ``truncation_reason="max_occurrences"``.
     * ``max_time_ms`` (default 5 000 ms): wall-clock cap; set
       ``truncation_reason="max_time_ms"`` when exceeded.
+    * ``max_operations`` (default ``None``): optional deterministic operation
+      cap.  One operation is one child-expansion slot: selecting the next match
+      in BFS parent/match order, applying it, normalizing fresh nodes, and
+      canonicalizing the child state.  Exhaustion sets
+      ``truncation_reason="max_operations"``.  Use
+      ``RECOMMENDED_MULTIWAY_OCCURRENCE_OPERATION_BUDGET`` (2 000) as the
+      recommended budget for parity with the legacy 5s default on the observed
+      rule5 1,989-event payload.
 
     When truncated, the returned occurrences are a valid prefix of the full
     BFS tree (all provenance links are consistent within the returned set).
@@ -1243,6 +1258,7 @@ def compute_multiway_occurrences(
         max_steps:        Maximum BFS depth (rewrite steps from root).
         max_occurrences:  Total occurrence cap including the root.
         max_time_ms:      Wall-clock cap in milliseconds.
+        max_operations:   Optional deterministic child-expansion-slot cap.
         include_internal_states:
                           Keep private ``_state`` entries for engine-internal
                           callers that need source-state metadata.
@@ -1265,7 +1281,7 @@ def compute_multiway_occurrences(
           ],
           "root_hash":         str,    # canonical hash of init_state
           "truncated":         bool,
-          "truncation_reason": str | None,  # "max_occurrences"|"max_time_ms"|None
+          "truncation_reason": str | None,  # "max_occurrences"|"max_time_ms"|"max_operations"|None
         }
     """
     max_n = max((n for e in init_state for n in e), default=0)
@@ -1292,9 +1308,23 @@ def compute_multiway_occurrences(
     next_occ_id: int = 1
     truncated: bool = False
     truncation_reason: Optional[str] = None
+    operations_used: int = 0
+
+    def operation_budget_exhausted() -> bool:
+        return max_operations is not None and operations_used >= max_operations
 
     for _step in range(1, max_steps + 1):
         if not frontier:
+            break
+        if len(occurrences) >= max_occurrences:
+            truncated = True
+            truncation_reason = "max_occurrences"
+            break
+        if operation_budget_exhausted() and any(
+            bool(find_matches(occ["_state"], lhs)) for occ in frontier
+        ):
+            truncated = True
+            truncation_reason = "max_operations"
             break
         if (time.time() - t0) * 1000 > max_time_ms:
             truncated = True
@@ -1313,11 +1343,16 @@ def compute_multiway_occurrences(
                     truncated = True
                     truncation_reason = "max_occurrences"
                     break
+                if operation_budget_exhausted():
+                    truncated = True
+                    truncation_reason = "max_operations"
+                    break
                 if (time.time() - t0) * 1000 > max_time_ms:
                     truncated = True
                     truncation_reason = "max_time_ms"
                     break
 
+                operations_used += 1
                 mi, bind = matches[mi_idx]
                 result = _apply_match(parent_state, lhs, rhs, mi, bind)
 
