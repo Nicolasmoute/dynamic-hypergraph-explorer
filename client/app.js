@@ -2097,13 +2097,25 @@ function togglePlay() {
   if (playing) {
     btn.innerHTML = '&#9646;&#9646;';
     if (playbackMode === 'application') {
+      // If cursor is past the last frame, restart from the beginning
+      if (_appPlaybackFrames && atomicFrameCursor >= _appPlaybackFrames.length) {
+        atomicFrameCursor = 0;
+        _appHighlight     = null;
+        _appStateOverride = null;
+        updateStatusLabel();
+        renderCurrentViewApplication(_beforeStateForFrame(0));
+      }
       // Application mode: drive the sub-frame animation chain
       stepAtomicFrameForward();
     } else {
+      // Step mode: if at or past the last step, restart from step 0
+      const data = DATA[activeRule];
+      const max = data ? (data.states || []).length - 1 : -1;
+      if (max >= 0 && currentStep >= max) setStep(0);
       playTimer = setInterval(() => {
-        const data = DATA[activeRule];
-        const max = (data.states || []).length - 1;
-        if (currentStep >= max) { togglePlay(); return; }
+        const d = DATA[activeRule];
+        const m = (d.states || []).length - 1;
+        if (currentStep >= m) { togglePlay(); return; }
         setStep(currentStep + 1);
       }, playIntervalMs); // §6.9 [L6] uses configurable interval
     }
