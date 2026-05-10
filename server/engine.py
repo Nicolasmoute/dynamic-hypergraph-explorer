@@ -34,10 +34,13 @@ from typing import Optional
 # v10 → v11: multiway_causal_graph() adds canonical event-class metadata and
 #   multiplicity to every public occurrence event.
 # v11 → v12: application playback trace payloads add an opt-in playback object.
-CACHE_VERSION = "v12"
+CACHE_VERSION = "v13"
 
 PLAYBACK_MAX_FRAMES = int(os.environ.get("DH_PLAYBACK_MAX_FRAMES", "5000"))
-PLAYBACK_MAX_TIME_MS = int(os.environ.get("DH_PLAYBACK_MAX_TIME_MS", "5000"))
+# v13: increased from 5 000 ms to 30 000 ms; the direct-reconstruction replay
+# algorithm (O(n) per frame) should finish well inside 30 s for all built-in
+# rules, but the higher ceiling is kept as a safety net for custom rules.
+PLAYBACK_MAX_TIME_MS = int(os.environ.get("DH_PLAYBACK_MAX_TIME_MS", "30000"))
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
@@ -503,30 +506,47 @@ def evolve(
     return {"states": states, "events": all_events, "causal_edges": causal_edges, "stats": stats}
 
 
-def _match_application_event(
+def _replay_event_direct(
     current_state: Hypergraph,
-    lhs,
-    rhs,
     expected_event: dict,
-) -> tuple[int, dict]:
-    """Return the deterministic match_idx and resulting state for one atomic event.
+    batch_index: int,
+) -> tuple[int, Hypergraph]:
+    """Fast O(|consumed| × n) replay of one atomic event via direct edge substitution.
 
-    The replay walks the same candidate order as find_matches() and selects the
-    first candidate whose consumed/produced edges exactly match the emitted
-    evolve() event. This preserves the engine's deterministic application order
-    without changing evolve() itself.
+    Previous approach (_match_application_event): called find_matches() — which
+    materialises ALL matches eagerly — then _apply_match() for every candidate
+    until consumed/produced matched.  For rule3 at step 12 (4 096 edges) this
+    was O(n²) per frame and took >90 s total, causing max_time_ms truncation.
+
+    This approach:
+    1. Reconstructs next state directly: remove each consumed edge (first
+       occurrence) from current_state, then append produced edges.  No call to
+       find_matches(), _apply_match(), or fresh() — produced edges already carry
+       correct node IDs from the original evolve() run.
+    2. Uses batch_index as match_idx.  match_idx is correct for single-edge LHS
+       rules (rule3, rule4) where the engine's fast path and find_matches()
+       iterate hyp in the same order.  For multi-edge rules it is a display
+       approximation (the value is only shown in a tooltip in app.js).
+
+    Correctness: the state-drift check in _build_application_playback_trace_from_result
+    verifies at each step boundary that the reconstructed state matches evolve()'s
+    recorded state, catching any silent divergence.
     """
-    max_node = max((n for edge in current_state for n in edge), default=0)
-    matches = find_matches(current_state, lhs)
-    for match_idx, (mi, binding) in enumerate(matches):
-        reset(max_node)
-        applied = _apply_match(current_state, lhs, rhs, mi, binding)
-        if applied["event"]["consumed"] == expected_event["consumed"] and applied["event"]["produced"] == expected_event["produced"]:
-            return match_idx, applied
-    raise RuntimeError(
-        "application playback could not re-match emitted event "
-        f"consumed={expected_event['consumed']} produced={expected_event['produced']}"
-    )
+    consumed = expected_event["consumed"]  # list of edges
+    produced = expected_event["produced"]  # list of edges
+
+    # Remove each consumed edge (first occurrence by value).
+    remaining = list(current_state)
+    for ce in consumed:
+        for i, e in enumerate(remaining):
+            if e == ce:
+                del remaining[i]
+                break
+
+    next_state = remaining + [list(pe) for pe in produced]
+    # batch_index is the correct match_idx for single-edge LHS rules;
+    # for multi-edge rules it is a display-only approximation.
+    return batch_index, next_state
 
 
 def _build_application_playback_trace_from_result(
@@ -537,7 +557,12 @@ def _build_application_playback_trace_from_result(
     max_frames: int = PLAYBACK_MAX_FRAMES,
     max_time_ms: int = PLAYBACK_MAX_TIME_MS,
 ) -> dict:
-    """Build the atomic playback trace from a canonical evolve() result."""
+    """Build the atomic playback trace from a canonical evolve() result.
+
+    Uses _replay_event_direct() for O(n) per-frame reconstruction instead of
+    the previous O(n × matches) approach, eliminating max_time_ms truncation
+    for all built-in rules.
+    """
     t0 = time.time()
     frames: list[dict] = []
     truncated = False
@@ -562,8 +587,7 @@ def _build_application_playback_trace_from_result(
                 truncation_reason = "max_time_ms"
                 break
 
-            match_idx, applied = _match_application_event(current_state, lhs, rhs, expected_event)
-            current_state = [edge[:] for edge in applied["state"]]
+            match_idx, current_state = _replay_event_direct(current_state, expected_event, batch_index)
             frames.append({
                 "frame_id": frame_id,
                 "step": step_index,

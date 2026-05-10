@@ -1,4 +1,4 @@
-"""Pre-warm the v12 disk cache synchronously before the server starts.
+"""Pre-warm the v13 disk cache synchronously before the server starts.
 
 Called from start.sh *before* uvicorn so every first user request is a cache
 hit (<1s) rather than a cold computation (up to ~15s for rule5 MWC).
@@ -41,10 +41,12 @@ def main() -> int:
         _MWCAUSAL_MAX_OCCURRENCES,
         _MWCAUSAL_MAX_TIME_MS,
         _PRECOMPUTE_MULTIWAY_CAUSAL,
+        _INCREMENTAL_PLAYBACK_ENABLED,
         _preload_disk_cache,
         get_rule_data,
         get_multiway,
         get_multiway_causal,
+        get_rule,
     )
 
     loaded = _preload_disk_cache()
@@ -73,6 +75,16 @@ def main() -> int:
                     _MWCAUSAL_MAX_OCCURRENCES,
                     _MWCAUSAL_MAX_TIME_MS,
                 ),
+            )
+
+        # 4. Application playback trace (v13: fast direct-reconstruction
+        #    algorithm makes this feasible; gated by the same flag as the
+        #    feature itself so it's skipped when the feature is off)
+        if _INCREMENTAL_PLAYBACK_ENABLED:
+            errors += _warm(
+                "playback-app",
+                rid,
+                lambda r=rid: get_rule(r, playback="application"),
             )
 
     elapsed = time.time() - t0

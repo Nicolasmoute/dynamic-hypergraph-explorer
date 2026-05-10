@@ -50,8 +50,8 @@ def _version() -> str:
     return _git_sha()
 
 # ── Persistent cache configuration ───────────────────────────────────
-# Cache root: $DH_CACHE_DIR/<CACHE_VERSION>/ (default /data/cache/v12/ in
-# Docker via Dockerfile ENV; ./data/cache/v12/ in bare-Python local dev).
+# Cache root: $DH_CACHE_DIR/<CACHE_VERSION>/ (default /data/cache/v13/ in
+# Docker via Dockerfile ENV; ./data/cache/v13/ in bare-Python local dev).
 # Bump engine.CACHE_VERSION when engine output semantics change; the new
 # directory is created automatically; old data stays under the old path.
 _CACHE_ROOT: Path = Path(os.environ.get("DH_CACHE_DIR", "./data/cache"))
@@ -597,7 +597,7 @@ def health():
     - status        : always "ok" while the server is alive.
     - uptime_s      : integer seconds since the uvicorn process started.
     - version       : short git SHA of the deployed commit, or "dev".
-    - cache_version : engine.CACHE_VERSION, e.g. "v12".
+    - cache_version : engine.CACHE_VERSION, e.g. "v13".
     - active_jobs   : number of custom rules currently being computed.
     """
     with _jobs_lock:
