@@ -182,7 +182,7 @@ at runtime (defaults to 8080 if unset).
 
 ### Persistent cache volume (required)
 
-The server caches computed results under `/data/cache/v8/`. Without a
+The server caches computed results under `/data/cache/v12/`. Without a
 persistent volume this directory is lost on every deploy restart. Configure it
 once in the Zeabur dashboard:
 
