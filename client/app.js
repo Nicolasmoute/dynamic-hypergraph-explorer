@@ -2126,6 +2126,22 @@ function togglePlay() {
   }
 }
 
+// Reset playback to the beginning (stop + go to step/frame 0).
+// Works in both step mode and application mode.
+function resetPlayback() {
+  if (playing) togglePlay();        // stop auto-play / sub-frame chain
+  clearSubFrameTimer();             // cancel any in-progress animation
+  _appHighlight     = null;
+  _appStateOverride = null;
+  if (playbackMode === 'application' && _appPlaybackFrames) {
+    atomicFrameCursor = 0;
+    updateStatusLabel();
+    renderCurrentViewApplication(_beforeStateForFrame(0));
+  } else {
+    setStep(0);
+  }
+}
+
 // §6.9 [L6] Play-speed slider handler (50–5000 ms) — step mode only
 function setPlaySpeed(ms) {
   playIntervalMs = ms;
