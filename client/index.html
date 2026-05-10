@@ -422,6 +422,8 @@
       <h3>Evolution Step</h3>
       <div class="step-control">
         <button class="play-btn" id="play-btn" onclick="togglePlay()">&#9654;</button>
+        <button class="play-btn" title="Reset to beginning" onclick="resetPlayback()"
+          style="font-size:14px;">&#9198;</button>
         <input type="range" id="step-slider" min="0" max="20" value="0" oninput="setStepFromSlider(+this.value)">
         <span class="step-value" id="step-display">0</span>
         <button class="play-btn" style="width:26px;height:26px;font-size:16px;font-weight:700;" onclick="stepPlus1()">+</button>
