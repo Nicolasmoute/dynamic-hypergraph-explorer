@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -580,6 +581,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Dynamic Hypergraph Explorer", lifespan=lifespan)
+# GZip: playback payloads can be 85+ MB uncompressed; gzip brings them to
+# ~5-15 MB, making warm-cache rule3 feasible under the 3s load budget.
+# minimum_size=1000 skips compression for tiny health/error responses.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
