@@ -776,6 +776,14 @@ function selectRule(ruleId) {
 // VIEWS
 // =========================================================================
 function setView(view, el) {
+  // Pause application-mode playback when switching away from the spatial view
+  // (contract §8.6: "Switching away from the spatial view pauses playback").
+  if (view !== 'spatial' && playbackMode === 'application') {
+    if (playing) togglePlay();  // stop auto-play loop
+    clearSubFrameTimer();       // cancel any in-progress sub-frame animation
+    _appHighlight     = null;
+    _appStateOverride = null;
+  }
   currentView = view;
   document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
   if (el) el.classList.add('active');
@@ -2161,7 +2169,12 @@ async function loadApplicationPlayback(ruleId) {
   _appPlaybackLoading = true;
   showPlaybackLoadingIndicator(true);
   try {
-    const resp = await fetch(`/api/rules/${ruleId}?playback=application`);
+    // Custom rules use /api/custom/{cacheKey}; built-in rules use /api/rules/{ruleId}.
+    const cacheKey = DATA[ruleId]?._cacheKey;
+    const playbackUrl = (ruleId.startsWith('custom_') && cacheKey)
+      ? `/api/custom/${cacheKey}?playback=application`
+      : `/api/rules/${ruleId}?playback=application`;
+    const resp = await fetch(playbackUrl);
     const data = await resp.json();
     if (data.playback && Array.isArray(data.playback.frames) && data.playback.frames.length > 0) {
       _appPlaybackFrames           = data.playback.frames;
