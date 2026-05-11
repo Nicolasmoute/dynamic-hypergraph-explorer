@@ -1153,31 +1153,52 @@ class TestMultiwayCausalGraph:
         by_signature: dict[str, list[dict]] = defaultdict(list)
 
         for ev in events:
-            assert ev["multiplicity"] == len(ev["equivalentEventIds"])
+            # After quotient dedup: multiplicity >= 1 (class size); equivalentEventIds
+            # contains only the representative ID itself (non-reps removed from output).
+            assert ev["multiplicity"] >= 1
+            assert len(ev["equivalentEventIds"]) >= 1
             assert ev["id"] in ev["equivalentEventIds"]
             assert set(ev["equivalentEventIds"]) <= event_ids
             assert ev["canonicalConsumed"] == sorted(ev["canonicalConsumed"])
             assert ev["canonicalProduced"] == sorted(ev["canonicalProduced"])
             by_signature[ev["canonicalEventSignature"]].append(ev)
 
-        representative_total = 0
-        has_nontrivial_class = False
-        for signature_events in by_signature.values():
-            first = signature_events[0]
-            representative_total += first["multiplicity"]
-            if first["multiplicity"] > 1:
-                has_nontrivial_class = True
-            for ev in signature_events:
-                assert ev["equivalentEventIds"] == first["equivalentEventIds"]
-                assert ev["multiplicity"] == first["multiplicity"]
-                assert ev["canonicalConsumed"] == first["canonicalConsumed"]
-                assert ev["canonicalProduced"] == first["canonicalProduced"]
-
-        assert representative_total == len(events)
+        # After quotient dedup each signature has exactly one representative.
+        assert len(by_signature) == len(events), (
+            "Each canonicalEventSignature should appear exactly once after dedup"
+        )
+        # Sum of class sizes (multiplicities) >= number of representatives.
+        representative_total = sum(sig_evs[0]["multiplicity"] for sig_evs in by_signature.values())
+        assert representative_total >= len(events)
+        # At least one non-trivial class (multiplicity > 1) for rule3 at depth 4.
+        has_nontrivial_class = any(sig_evs[0]["multiplicity"] > 1 for sig_evs in by_signature.values())
         assert has_nontrivial_class
 
     def test_cache_version_bumped_for_multiway_causal_event_metadata(self):
-        assert engine.CACHE_VERSION == "v14"
+        assert engine.CACHE_VERSION == "v15"
+
+    # ── quotient-mode acceptance (task t-2026-05-11-85ba2c03) ─────────
+
+    def test_rule5_mwc_step1_dedup_144_to_72(self):
+        """Sofia baseline: rule5 max_steps=1 → 144 concrete → 72 canonical at step==1."""
+        engine.reset(1)
+        p = engine.parse_notation("{{x,y,z},{z,u,v}} → {{y,z,u},{v,w,x},{w,y,v}}")
+        rule5_init = [[0,1,2],[2,3,4],[4,5,6],[6,7,8],[8,9,0],[1,3,5],[5,7,9],[9,1,3]]
+        r = engine.multiway_causal_graph(
+            rule5_init, p["lhs"], p["rhs"],
+            max_steps=1, max_occurrences=5000, max_time_ms=30000,
+        )
+        step1 = [ev for ev in r["events"] if ev["step"] == 1]
+        assert len(step1) == 72, (
+            f"Expected 72 canonical events at step==1 after quotient pass, got {len(step1)}"
+        )
+        # Each representative has multiplicity=2 (two concrete → one canonical)
+        assert all(ev["multiplicity"] == 2 for ev in step1), (
+            "All step-1 canonical classes should have multiplicity=2 for rule5 max_steps=1"
+        )
+        # canonicalEventSignature is unique across all emitted events
+        sigs = [ev["canonicalEventSignature"] for ev in r["events"]]
+        assert len(sigs) == len(set(sigs)), "canonicalEventSignature not unique after dedup"
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""

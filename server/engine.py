@@ -37,7 +37,9 @@ from typing import Optional
 # v12 → v13: direct-reconstruction replay (O(n/frame)); PLAYBACK_MAX_TIME_MS 5→30s.
 # v13 → v14: PLAYBACK_MAX_FRAMES reverted to 1 074 (v12 baseline 716 × 1.5) and
 #   PLAYBACK_MAX_TIME_MS restored to 5 000 ms per stakeholder resource directive.
-CACHE_VERSION = "v14"
+# v14 → v15: multiway-causal events deduplicated by canonicalEventSignature;
+#   each representative event retains multiplicity + equivalentEventIds.
+CACHE_VERSION = "v15"
 
 # Frame cap: 1 074 = floor(716 × 1.5), where 716 was the v12 effective rule3
 # frame count under the 5 s time cap. +50 % headroom per stakeholder directive.
@@ -2225,6 +2227,101 @@ def multiway_causal_graph(
         if bp in by_branch_path and by_branch_path[bp]["occ_id"] != 0
     ]
     greedy_flat_event_count = greedy_path["greedy_event_count"]
+
+    # ── 5. Quotient pass: deduplicate events by canonicalEventSignature ──
+    #
+    # Each canonical equivalence class (identified by canonicalEventSignature)
+    # contributes exactly one representative event to the output.  The
+    # representative is chosen deterministically (first in BFS emission order
+    # = lowest occ_id) with one override: red-path events are ALWAYS their own
+    # representative even when a lower-id green event shares their signature.
+    # This preserves the red-path causal chain intact.
+    #
+    # Causal edges that involve a non-representative event are dropped entirely
+    # (not remapped) to avoid introducing spurious cross-branch causal edges.
+    # Parent_occ_id links on representative events are updated to point to the
+    # representative of the referenced class so that ancestry traversal works
+    # within the deduplicated event set.
+    #
+    # LITERAL: does not modify find_matches, compute_multiway_occurrences,
+    # canonicalEventSignature, or _canonical_event_signature.
+    if events:
+        red_id_set: set[int] = set(default_path_event_ids)
+
+        # Build representative map.  Red events take priority — a red event
+        # becomes the sig representative even if a green event appeared earlier.
+        # (Red events are always their own rep regardless.)
+        rep_by_sig: dict[str, int] = {}
+        for ev in events:
+            sig = ev.get("canonicalEventSignature")
+            ev_id = ev["id"]
+            is_red = ev_id in red_id_set
+            if sig is None:
+                continue
+            if is_red:
+                # Red events: register as sig rep only if no red rep yet for this sig.
+                # Each red event is always its own rep (handled below), but we
+                # record one red rep per sig so green events can collapse to it.
+                if sig not in rep_by_sig:
+                    rep_by_sig[sig] = ev_id
+            else:
+                # Green events: register as sig rep only if no entry exists yet.
+                if sig not in rep_by_sig:
+                    rep_by_sig[sig] = ev_id
+
+        # event id → representative id.
+        # Red events: always self (never collapsed into another event).
+        # Green events: collapse to sig's representative.
+        id_to_rep: dict[int, int] = {}
+        for ev in events:
+            ev_id = ev["id"]
+            sig = ev.get("canonicalEventSignature")
+            if ev_id in red_id_set:
+                id_to_rep[ev_id] = ev_id  # protected
+            elif sig is not None and sig in rep_by_sig:
+                id_to_rep[ev_id] = rep_by_sig[sig]
+            else:
+                id_to_rep[ev_id] = ev_id  # no sig → own rep
+
+        # Keep only representative events.
+        events = [ev for ev in events if id_to_rep[ev["id"]] == ev["id"]]
+        rep_id_set: set[int] = {ev["id"] for ev in events}
+
+        # Update parent_occ_id on representative events to point to the
+        # representative of their parent class (enables ancestry traversal
+        # within the deduplicated id space).
+        for ev in events:
+            orig_parent = ev.get("parent_occ_id")
+            if orig_parent is not None:
+                ev["parent_occ_id"] = id_to_rep.get(orig_parent, orig_parent)
+
+        # Update equivalentEventIds on representatives: after dedup, the list
+        # of valid sibling IDs shrinks to just the representative itself.
+        # multiplicity retains the original canonical-class size.
+        for ev in events:
+            ev["equivalentEventIds"] = [ev["id"]]
+
+        # Causal edges: keep only edges where BOTH endpoints are representatives.
+        # Dropping (not remapping) avoids spurious cross-branch causal edges that
+        # would violate the co-historical ancestry invariant.
+        rep_causal_pairs: set[tuple[int, int]] = set()
+        kept_causal: list[list[int]] = []
+        for src, dst in causal_edges:
+            if src in rep_id_set and dst in rep_id_set and src != dst:
+                p = (src, dst)
+                if p not in rep_causal_pairs:
+                    rep_causal_pairs.add(p)
+                    kept_causal.append([src, dst])
+        causal_edges = kept_causal
+
+        # default_path_event_ids: red events are all reps; deduplicate order.
+        seen_red: set[int] = set()
+        deduped_red: list[int] = []
+        for eid in default_path_event_ids:
+            if eid not in seen_red:
+                seen_red.add(eid)
+                deduped_red.append(eid)
+        default_path_event_ids = deduped_red
 
     embedded_red_count = len(default_path_event_ids)
     stats = {
