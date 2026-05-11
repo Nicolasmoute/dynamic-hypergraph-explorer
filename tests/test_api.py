@@ -323,7 +323,10 @@ class TestGetMultiwayCausal:
         for ev in events:
             assert ev["multiplicity"] == len(ev["equivalentEventIds"])
             assert ev["id"] in ev["equivalentEventIds"]
-            assert set(ev["equivalentEventIds"]) <= event_ids
+            # equivalentEventIds contains the full original collapsed-class ID set;
+            # sibling IDs of deduplicated (non-representative) events are NOT in
+            # the output event list by design — only the representative is present.
+            assert ev["id"] in event_ids
 
     def test_causal_edges_reference_valid_ids(self, client):
         data = client.get("/api/rules/rule3/multiway-causal").json()

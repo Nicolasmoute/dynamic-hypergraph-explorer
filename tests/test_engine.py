@@ -1153,12 +1153,15 @@ class TestMultiwayCausalGraph:
         by_signature: dict[str, list[dict]] = defaultdict(list)
 
         for ev in events:
-            # After quotient dedup: multiplicity >= 1 (class size); equivalentEventIds
-            # contains only the representative ID itself (non-reps removed from output).
-            assert ev["multiplicity"] >= 1
-            assert len(ev["equivalentEventIds"]) >= 1
+            # After quotient dedup: multiplicity == len(equivalentEventIds) still holds
+            # because equivalentEventIds retains the full original collapsed-class ID set
+            # (including non-representative sibling IDs that no longer appear in events).
+            assert ev["multiplicity"] == len(ev["equivalentEventIds"])
             assert ev["id"] in ev["equivalentEventIds"]
-            assert set(ev["equivalentEventIds"]) <= event_ids
+            # NOTE: set(equivalentEventIds) is NOT required to be ⊆ event_ids — sibling
+            # IDs of collapsed classes are intentionally absent from the deduplicated
+            # events list.  The representative's own id IS in both sets.
+            assert ev["id"] in event_ids
             assert ev["canonicalConsumed"] == sorted(ev["canonicalConsumed"])
             assert ev["canonicalProduced"] == sorted(ev["canonicalProduced"])
             by_signature[ev["canonicalEventSignature"]].append(ev)

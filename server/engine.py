@@ -2295,11 +2295,12 @@ def multiway_causal_graph(
             if orig_parent is not None:
                 ev["parent_occ_id"] = id_to_rep.get(orig_parent, orig_parent)
 
-        # Update equivalentEventIds on representatives: after dedup, the list
-        # of valid sibling IDs shrinks to just the representative itself.
-        # multiplicity retains the original canonical-class size.
-        for ev in events:
-            ev["equivalentEventIds"] = [ev["id"]]
+        # equivalentEventIds: keep the FULL original set of collapsed concrete
+        # event IDs (representative's own id + all sibling ids).  This preserves
+        # the public contract multiplicity == len(equivalentEventIds) and lets
+        # the client renderer count class members from the list.  Note: sibling
+        # IDs may not appear in the deduplicated events output — they are
+        # historical occurrence identifiers, not output event ids.
 
         # Causal edges: keep only edges where BOTH endpoints are representatives.
         # Dropping (not remapping) avoids spurious cross-branch causal edges that
