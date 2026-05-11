@@ -1,4 +1,4 @@
-"""Pre-warm the v15 disk cache synchronously before the server starts.
+"""Pre-warm the v16 disk cache synchronously before the server starts.
 
 Called from start.sh *before* uvicorn so every first user request is a cache
 hit (<1s) rather than a cold computation (up to ~15s for rule5 MWC).
@@ -78,7 +78,7 @@ def main() -> int:
                     _MWCAUSAL_MAX_TIME_MS,
                 ),
             )
-            # Spec item 7 (v15): emit quotient dedup summary after fresh computation.
+            # Spec item 7 (v16): emit quotient dedup summary after fresh computation.
             # Logs concrete→canonical counts at step 1 (the most informative step).
             # Not emitted when loaded from cache.
             if not was_cached:

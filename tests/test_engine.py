@@ -1178,7 +1178,7 @@ class TestMultiwayCausalGraph:
         assert has_nontrivial_class
 
     def test_cache_version_bumped_for_multiway_causal_event_metadata(self):
-        assert engine.CACHE_VERSION == "v15"
+        assert engine.CACHE_VERSION == "v16"
 
     # ── quotient-mode acceptance (task t-2026-05-11-85ba2c03) ─────────
 

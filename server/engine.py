@@ -39,7 +39,9 @@ from typing import Optional
 #   PLAYBACK_MAX_TIME_MS restored to 5 000 ms per stakeholder resource directive.
 # v14 → v15: multiway-causal events deduplicated by canonicalEventSignature;
 #   each representative event retains multiplicity + equivalentEventIds.
-CACHE_VERSION = "v15"
+# v15 → v16: equivalentEventIds restored to full collapsed-class sibling set
+#   (was incorrectly reset to [rep_id] in r1; payload shape corrected).
+CACHE_VERSION = "v16"
 
 # Frame cap: 1 074 = floor(716 × 1.5), where 716 was the v12 effective rule3
 # frame count under the 5 s time cap. +50 % headroom per stakeholder directive.
