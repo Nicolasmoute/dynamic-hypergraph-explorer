@@ -17,7 +17,7 @@ echo "[start] client dir  : $(ls /app/client/ 2>/dev/null | tr '\n' ' ' || echo 
 echo "[start] DH_CACHE_DIR: ${DH_CACHE_DIR:-<unset, default ./data/cache>}"
 echo "[start] data dir    : $(ls /data/ 2>/dev/null | tr '\n' ' ' || echo not-yet-created)"
 echo "[start] ---"
-echo "[start] Pre-warming v16 cache (server/warmup.py) ..."
+echo "[start] Pre-warming v17 cache (server/warmup.py) ..."
 python -m server.warmup
 WARMUP_EXIT=$?
 if [ "$WARMUP_EXIT" -ne 0 ]; then

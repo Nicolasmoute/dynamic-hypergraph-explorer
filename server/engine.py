@@ -2243,8 +2243,10 @@ def multiway_causal_graph(
     # representative even when a lower-id green event shares their signature.
     # This preserves the red-path causal chain intact.
     #
-    # Causal edges that involve a non-representative event are dropped entirely
-    # (not remapped) to avoid introducing spurious cross-branch causal edges.
+    # Causal edges: non-representative endpoints are remapped to their
+    # canonical-class representative ([X]→[Y] exists iff ∃ concrete x∈[X],
+    # y∈[Y] with x→y — Sofia quotient semantics, v17).  Post-remap duplicates
+    # and self-loops (rs==rd) are discarded.
     # Parent_occ_id links on representative events are updated to point to the
     # representative of the referenced class so that ancestry traversal works
     # within the deduplicated event set.
