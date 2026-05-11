@@ -1177,7 +1177,7 @@ class TestMultiwayCausalGraph:
         assert has_nontrivial_class
 
     def test_cache_version_bumped_for_multiway_causal_event_metadata(self):
-        assert engine.CACHE_VERSION == "v13"
+        assert engine.CACHE_VERSION == "v14"
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""

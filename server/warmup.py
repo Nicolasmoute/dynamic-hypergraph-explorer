@@ -1,4 +1,4 @@
-"""Pre-warm the v13 disk cache synchronously before the server starts.
+"""Pre-warm the v14 disk cache synchronously before the server starts.
 
 Called from start.sh *before* uvicorn so every first user request is a cache
 hit (<1s) rather than a cold computation (up to ~15s for rule5 MWC).

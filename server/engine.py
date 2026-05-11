@@ -34,13 +34,17 @@ from typing import Optional
 # v10 → v11: multiway_causal_graph() adds canonical event-class metadata and
 #   multiplicity to every public occurrence event.
 # v11 → v12: application playback trace payloads add an opt-in playback object.
-CACHE_VERSION = "v13"
+# v12 → v13: direct-reconstruction replay (O(n/frame)); PLAYBACK_MAX_TIME_MS 5→30s.
+# v13 → v14: PLAYBACK_MAX_FRAMES reverted to 1 074 (v12 baseline 716 × 1.5) and
+#   PLAYBACK_MAX_TIME_MS restored to 5 000 ms per stakeholder resource directive.
+CACHE_VERSION = "v14"
 
-PLAYBACK_MAX_FRAMES = int(os.environ.get("DH_PLAYBACK_MAX_FRAMES", "5000"))
-# v13: increased from 5 000 ms to 30 000 ms; the direct-reconstruction replay
-# algorithm (O(n) per frame) should finish well inside 30 s for all built-in
-# rules, but the higher ceiling is kept as a safety net for custom rules.
-PLAYBACK_MAX_TIME_MS = int(os.environ.get("DH_PLAYBACK_MAX_TIME_MS", "30000"))
+# Frame cap: 1 074 = floor(716 × 1.5), where 716 was the v12 effective rule3
+# frame count under the 5 s time cap. +50 % headroom per stakeholder directive.
+PLAYBACK_MAX_FRAMES = int(os.environ.get("DH_PLAYBACK_MAX_FRAMES", "1074"))
+# Time cap restored to v12 value (5 000 ms) as a defensive wall-clock backstop.
+# The deterministic PLAYBACK_MAX_FRAMES cap fires first for well-formed rules.
+PLAYBACK_MAX_TIME_MS = int(os.environ.get("DH_PLAYBACK_MAX_TIME_MS", "5000"))
 
 # ── helpers ──────────────────────────────────────────────────────────
 Edge = list[int]
