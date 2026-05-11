@@ -1,4 +1,4 @@
-"""Pre-warm the v14 disk cache synchronously before the server starts.
+"""Pre-warm the v15 disk cache synchronously before the server starts.
 
 Called from start.sh *before* uvicorn so every first user request is a cache
 hit (<1s) rather than a cold computation (up to ~15s for rule5 MWC).
@@ -66,6 +66,8 @@ def main() -> int:
         # 3. Multiway-causal graph (most expensive; gated by the same flag as
         #    the background precompute so env-var opt-outs are respected)
         if _PRECOMPUTE_MULTIWAY_CAUSAL:
+            mwc_key = f"{rid}_mwcausal_{_MWCAUSAL_MAX_STEPS}_{_MWCAUSAL_MAX_OCCURRENCES}_{_MWCAUSAL_MAX_TIME_MS}"
+            was_cached = mwc_key in CACHE
             errors += _warm(
                 "multiway-causal",
                 rid,
@@ -76,6 +78,20 @@ def main() -> int:
                     _MWCAUSAL_MAX_TIME_MS,
                 ),
             )
+            # Spec item 7 (v15): emit quotient dedup summary after fresh computation.
+            # Logs concrete→canonical counts at step 1 (the most informative step).
+            # Not emitted when loaded from cache.
+            if not was_cached:
+                result = CACHE.get(mwc_key)
+                events = result.get("events", []) if isinstance(result, dict) else []
+                step1 = [e for e in events if e.get("step") == 1]
+                if step1:
+                    concrete1 = sum(e.get("multiplicity", 1) for e in step1)
+                    canonical1 = len(step1)
+                    log.info(
+                        "  multiway-causal  %-8s  step 1: %d events → %d canonical",
+                        rid, concrete1, canonical1,
+                    )
 
         # 4. Application playback trace (v13: fast direct-reconstruction
         #    algorithm makes this feasible; gated by the same flag as the

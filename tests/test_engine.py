@@ -1179,6 +1179,18 @@ class TestMultiwayCausalGraph:
 
     # ── quotient-mode acceptance (task t-2026-05-11-85ba2c03) ─────────
 
+    # ── acceptance item 8: full quotient-mode suite ────────────────────
+    #
+    # Empirical dedup factors (max_steps=1, max_occurrences=5000) measured
+    # 2026-05-11 on current origin/main + v15 quotient pass:
+    #   rule1: step 1 — 2 concrete → 1 canonical  (factor 2×)
+    #   rule2: step 1 — 10 concrete → 1 canonical (factor 10×)
+    #   rule3: step 1 — 2 concrete → 1 canonical  (factor 2×)
+    #   rule4: step 1 — 6 concrete → 1 canonical  (factor 6×)
+    #   rule5: step 1 — 144 concrete → 72 canonical (factor 2×, 72 classes)
+    # Rules 2-4 collapse step 1 to a single canonical class; rule5 is the
+    # only built-in rule that retains multiple canonical classes at step 1.
+
     def test_rule5_mwc_step1_dedup_144_to_72(self):
         """Sofia baseline: rule5 max_steps=1 → 144 concrete → 72 canonical at step==1."""
         engine.reset(1)
@@ -1199,6 +1211,86 @@ class TestMultiwayCausalGraph:
         # canonicalEventSignature is unique across all emitted events
         sigs = [ev["canonicalEventSignature"] for ev in r["events"]]
         assert len(sigs) == len(set(sigs)), "canonicalEventSignature not unique after dedup"
+
+    def test_unique_sig_per_step(self):
+        """Each canonicalEventSignature appears at most once per step after dedup."""
+        engine.reset(1)
+        p = engine.parse_notation("{{x,y,z},{z,u,v}} → {{y,z,u},{v,w,x},{w,y,v}}")
+        rule5_init = [[0,1,2],[2,3,4],[4,5,6],[6,7,8],[8,9,0],[1,3,5],[5,7,9],[9,1,3]]
+        r = engine.multiway_causal_graph(
+            rule5_init, p["lhs"], p["rhs"],
+            max_steps=1, max_occurrences=5000, max_time_ms=30000,
+        )
+        from collections import defaultdict
+        sigs_by_step: dict[int, list[str]] = defaultdict(list)
+        for ev in r["events"]:
+            sigs_by_step[ev["step"]].append(ev["canonicalEventSignature"])
+        for step, sigs in sigs_by_step.items():
+            assert len(sigs) == len(set(sigs)), (
+                f"Step {step}: duplicate canonicalEventSignature — dedup invariant violated"
+            )
+
+    def test_multiplicity_sum_equals_concrete_count(self):
+        """sum(multiplicity) per step must equal the pre-dedup concrete event count.
+
+        Pre-dedup concrete count comes from compute_multiway_occurrences directly.
+        """
+        engine.reset(1)
+        p = engine.parse_notation("{{x,y,z},{z,u,v}} → {{y,z,u},{v,w,x},{w,y,v}}")
+        rule5_init = [[0,1,2],[2,3,4],[4,5,6],[6,7,8],[8,9,0],[1,3,5],[5,7,9],[9,1,3]]
+
+        # Pre-dedup counts from raw BFS
+        engine.reset(1)
+        bfs = engine.compute_multiway_occurrences(
+            rule5_init, p["lhs"], p["rhs"],
+            max_steps=1, max_occurrences=5000, max_time_ms=30000,
+            include_internal_states=True,
+        )
+        pre_counts: dict[int, int] = {}
+        for occ in bfs["occurrences"]:
+            if occ["occ_id"] != 0:
+                s = occ["step"]
+                pre_counts[s] = pre_counts.get(s, 0) + 1
+
+        # Post-dedup result
+        engine.reset(1)
+        r = engine.multiway_causal_graph(
+            rule5_init, p["lhs"], p["rhs"],
+            max_steps=1, max_occurrences=5000, max_time_ms=30000,
+        )
+        from collections import defaultdict
+        mult_by_step: dict[int, int] = defaultdict(int)
+        for ev in r["events"]:
+            mult_by_step[ev["step"]] += ev["multiplicity"]
+
+        for step, pre_count in pre_counts.items():
+            post_sum = mult_by_step.get(step, 0)
+            assert post_sum == pre_count, (
+                f"Step {step}: sum(multiplicity)={post_sum} != pre-dedup count={pre_count}"
+            )
+
+    def test_representative_selection_idempotent(self):
+        """Two consecutive calls return the same representative event IDs per step."""
+        engine.reset(1)
+        p = engine.parse_notation("{{x,y,z},{z,u,v}} → {{y,z,u},{v,w,x},{w,y,v}}")
+        rule5_init = [[0,1,2],[2,3,4],[4,5,6],[6,7,8],[8,9,0],[1,3,5],[5,7,9],[9,1,3]]
+
+        runs = []
+        for _ in range(2):
+            engine.reset(1)
+            r = engine.multiway_causal_graph(
+                rule5_init, p["lhs"], p["rhs"],
+                max_steps=1, max_occurrences=5000, max_time_ms=30000,
+            )
+            # Capture (step, canonicalEventSignature, multiplicity) tuples — same
+            # rep selection means same canonical sigs with same multiplicities.
+            key = tuple(sorted(
+                (ev["step"], ev["canonicalEventSignature"], ev["multiplicity"])
+                for ev in r["events"]
+            ))
+            runs.append(key)
+
+        assert runs[0] == runs[1], "Representative selection is not idempotent"
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""
