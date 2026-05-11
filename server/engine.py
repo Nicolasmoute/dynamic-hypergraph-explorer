@@ -2251,6 +2251,10 @@ def multiway_causal_graph(
     #
     # LITERAL: does not modify find_matches, compute_multiway_occurrences,
     # canonicalEventSignature, or _canonical_event_signature.
+    # Edge stats for v17 remap pass; populated inside if-events, zero otherwise.
+    _n_concrete_edges: int = 0
+    _n_canonical_edges: int = 0
+    _self_loops_dropped: int = 0
     if events:
         red_id_set: set[int] = set(default_path_event_ids)
 
@@ -2312,6 +2316,11 @@ def multiway_causal_graph(
         # representative.  [X]→[Y] exists iff ∃ concrete x∈[X], y∈[Y] with
         # x→y (Sofia quotient semantics).  Post-remap deduplication handles
         # multiple concrete edges collapsing to the same representative pair.
+        _n_concrete_edges: int = len(causal_edges)
+        _self_loops_dropped: int = sum(
+            1 for s, d in causal_edges
+            if id_to_rep.get(s, s) == id_to_rep.get(d, d)
+        )
         remap_pairs: set[tuple[int, int]] = set()
         remapped_causal: list[list[int]] = []
         for src, dst in causal_edges:
@@ -2323,6 +2332,7 @@ def multiway_causal_graph(
                     remap_pairs.add(p)
                     remapped_causal.append([rs, rd])
         causal_edges = remapped_causal
+        _n_canonical_edges: int = len(causal_edges)
 
         # default_path_event_ids: red events are all reps; deduplicate order.
         seen_red: set[int] = set()
@@ -2345,6 +2355,10 @@ def multiway_causal_graph(
         "max_occurrences": max_occurrences,
         "max_time_ms": max_time_ms,
         "truncation_reason": truncation_reason,
+        # v17 remap-pass edge stats (0 when no events processed by quotient pass)
+        "causal_edge_concrete": _n_concrete_edges,
+        "causal_edge_canonical": _n_canonical_edges,
+        "causal_self_loops_dropped": _self_loops_dropped,
     }
 
     return {

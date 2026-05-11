@@ -78,20 +78,26 @@ def main() -> int:
                     _MWCAUSAL_MAX_TIME_MS,
                 ),
             )
-            # Spec item 7 (v16): emit quotient dedup summary after fresh computation.
-            # Logs concrete→canonical counts at step 1 (the most informative step).
+            # Spec item 7 (v16/v17): emit quotient dedup summary after fresh computation.
+            # Logs concrete→canonical counts at step 1 + edge remap stats.
             # Not emitted when loaded from cache.
             if not was_cached:
                 result = CACHE.get(mwc_key)
-                events = result.get("events", []) if isinstance(result, dict) else []
-                step1 = [e for e in events if e.get("step") == 1]
-                if step1:
-                    concrete1 = sum(e.get("multiplicity", 1) for e in step1)
-                    canonical1 = len(step1)
-                    log.info(
-                        "  multiway-causal  %-8s  step 1: %d events → %d canonical",
-                        rid, concrete1, canonical1,
-                    )
+                if isinstance(result, dict):
+                    events = result.get("events", [])
+                    step1 = [e for e in events if e.get("step") == 1]
+                    if step1:
+                        concrete1 = sum(e.get("multiplicity", 1) for e in step1)
+                        canonical1 = len(step1)
+                        st = result.get("stats", {})
+                        e_conc = st.get("causal_edge_concrete", 0)
+                        e_can = st.get("causal_edge_canonical", 0)
+                        e_sl = st.get("causal_self_loops_dropped", 0)
+                        log.info(
+                            "  multiway-causal  %-8s  step 1: %d events → %d canonical;"
+                            " edges: %d concrete → %d canonical (%d self-loops dropped)",
+                            rid, concrete1, canonical1, e_conc, e_can, e_sl,
+                        )
 
         # 4. Application playback trace (v13: fast direct-reconstruction
         #    algorithm makes this feasible; gated by the same flag as the

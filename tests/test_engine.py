@@ -1621,19 +1621,17 @@ class TestMultiwayCausalGraph:
                 f"{dst}(step={ev_by_id[dst]['step']}) violates ordering"
             )
 
-    @pytest.mark.skip(
-        reason=(
-            "v17 remap policy: [X]→[Y] iff ∃ concrete x∈[X], y∈[Y] with x→y "
-            "(Sofia quotient semantics). The representative of X need not be in "
-            "the parent_occ_id chain of the representative of Y. Test will be "
-            "rewritten in TURN 2 to reflect quotient-graph ancestry semantics."
-        )
-    )
     def test_causal_src_is_strict_ancestor_via_parent_chain(self):
-        """For each causal edge [A, B], A must appear in B's parent_occ_id chain.
+        """v17 quotient semantics: every event at step > 1 has ≥1 incoming
+        causal edge from a strictly earlier step.
 
-        This verifies the co-historical guarantee: only events in B's
-        actual history (ancestry) can be causal predecessors of B.
+        Replaces the pre-v17 DROP assertion that required the concrete src
+        to appear in dst's parent_occ_id chain.  Under REMAP, [X]→[Y] exists
+        iff ∃ concrete x∈[X], y∈[Y] with x→y; the representative of X need
+        not be in the concrete ancestry chain of the representative of Y.
+
+        Step-1 events are excluded: their causal parent is the initial state
+        (occ_id=0), which is not emitted as an event in the response.
         """
         p = self._parsed()
         r = engine.multiway_causal_graph(
@@ -1641,24 +1639,22 @@ class TestMultiwayCausalGraph:
             max_steps=4, max_occurrences=500, max_time_ms=1000,
         )
         ev_by_id = {ev["id"]: ev for ev in r["events"]}
-
-        def ancestry_ids(ev: dict) -> set[int]:
-            """Walk parent_occ_id chain from ev back to root; return all occ_ids seen."""
-            ids: set[int] = set()
-            cur_id = ev["parent_occ_id"]
-            while cur_id is not None:
-                ids.add(cur_id)
-                parent_ev = ev_by_id.get(cur_id)
-                if parent_ev is None:
-                    break  # reached root (occ_id=0, no event entry)
-                cur_id = parent_ev["parent_occ_id"]
-            return ids
-
+        incoming: dict[int, list[int]] = {}
         for src, dst in r["causal_edges"]:
-            dst_ev = ev_by_id[dst]
-            ancestors = ancestry_ids(dst_ev)
-            assert src in ancestors, (
-                f"Causal edge {src} → {dst}: {src} is not in {dst}'s ancestry {ancestors}"
+            incoming.setdefault(dst, []).append(src)
+
+        for ev in r["events"]:
+            if ev["step"] <= 1:
+                # Step-1 parent is occ_id=0 (initial state), not in events list
+                continue
+            inc = incoming.get(ev["id"], [])
+            assert inc, (
+                f"Event {ev['id']} at step {ev['step']} has no incoming causal edges "
+                f"(expected ≥1 from an earlier step under REMAP semantics)"
+            )
+            assert any(ev_by_id[s]["step"] < ev["step"] for s in inc), (
+                f"Event {ev['id']} at step {ev['step']}: all incoming edges are from "
+                f"same or later step — causal step ordering violated"
             )
 
     # ── caps ───────────────────────────────────────────────────────────
