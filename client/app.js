@@ -2992,11 +2992,22 @@ function renderMultiwayCausal() {
       const d = layoutDepth(ev);
       depthCounts.set(d, (depthCounts.get(d) || 0) + 1);
     }
-    const maxStepCount = depthCounts.size ? Math.max(...depthCounts.values()) : 0;
+    // dense_step: step with the highest event count (first above threshold if tied)
+    let denseStep = null, denseCount = 0;
+    for (const [step, count] of depthCounts) {
+      if (count > denseCount || (count === denseCount && denseStep === null)) {
+        denseStep = step; denseCount = count;
+      }
+    }
+    // step_with_max: deepest step actually present in the response
+    const stepWithMax = depthCounts.size ? Math.max(...depthCounts.keys()) : 0;
     const densityBanner = document.getElementById('mwc-density-banner');
     if (densityBanner) {
       const dismissed = sessionStorage.getItem('mwcDensityBannerDismissed') === '1';
-      if (maxStepCount > 200 && !dismissed) {
+      if (denseCount > 200 && !dismissed) {
+        document.getElementById('mwc-banner-dense-step').textContent = String(denseStep);
+        document.getElementById('mwc-banner-dense-count').textContent = denseCount.toLocaleString();
+        document.getElementById('mwc-banner-step-with-max').textContent = String(stepWithMax);
         densityBanner.classList.add('mwc-banner-visible');
       } else {
         densityBanner.classList.remove('mwc-banner-visible');

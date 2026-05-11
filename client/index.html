@@ -563,8 +563,10 @@
         <span class="mwc-banner-icon">⚠</span>
         <div class="mwc-banner-body">
           <div class="mwc-banner-title">Dense step detected</div>
-          One or more steps have &gt;200 equivalence classes — BFS-capping may leave depth-1 parents partly uncovered.
-          To explore more of the multiway causal structure, raise <code>max_occurrences</code> or use a representative-coverage sampler (forthcoming).
+          This view explores up to <strong id="mwc-banner-step-with-max">?</strong> steps;
+          budget exhausts on step <strong id="mwc-banner-dense-step">?</strong>
+          (<strong id="mwc-banner-dense-count">?</strong> outcomes).
+          Increase the rewrite budget or switch rules to explore deeper.
         </div>
         <button class="mwc-banner-dismiss" onclick="dismissMwcDensityBanner()" title="Dismiss for this session" aria-label="Dismiss">✕</button>
       </div>
