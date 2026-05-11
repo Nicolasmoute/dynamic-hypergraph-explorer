@@ -41,7 +41,11 @@ from typing import Optional
 #   each representative event retains multiplicity + equivalentEventIds.
 # v15 → v16: equivalentEventIds restored to full collapsed-class sibling set
 #   (was incorrectly reset to [rep_id] in r1; payload shape corrected).
-CACHE_VERSION = "v16"
+# v16 → v17: causal edge policy changed from DROP to REMAP — non-rep endpoints
+#   are remapped to their canonical-class representative; [X]→[Y] exists iff
+#   ∃ concrete x∈[X], y∈[Y] with x→y (Sofia quotient semantics). Fixes orphan
+#   representative nodes that had no causal edges under the drop policy.
+CACHE_VERSION = "v17"
 
 # Frame cap: 1 074 = floor(716 × 1.5), where 716 was the v12 effective rule3
 # frame count under the 5 s time cap. +50 % headroom per stakeholder directive.
@@ -2304,18 +2308,21 @@ def multiway_causal_graph(
         # IDs may not appear in the deduplicated events output — they are
         # historical occurrence identifiers, not output event ids.
 
-        # Causal edges: keep only edges where BOTH endpoints are representatives.
-        # Dropping (not remapping) avoids spurious cross-branch causal edges that
-        # would violate the co-historical ancestry invariant.
-        rep_causal_pairs: set[tuple[int, int]] = set()
-        kept_causal: list[list[int]] = []
+        # Causal edges: remap non-rep endpoints to their canonical-class
+        # representative.  [X]→[Y] exists iff ∃ concrete x∈[X], y∈[Y] with
+        # x→y (Sofia quotient semantics).  Post-remap deduplication handles
+        # multiple concrete edges collapsing to the same representative pair.
+        remap_pairs: set[tuple[int, int]] = set()
+        remapped_causal: list[list[int]] = []
         for src, dst in causal_edges:
-            if src in rep_id_set and dst in rep_id_set and src != dst:
-                p = (src, dst)
-                if p not in rep_causal_pairs:
-                    rep_causal_pairs.add(p)
-                    kept_causal.append([src, dst])
-        causal_edges = kept_causal
+            rs = id_to_rep.get(src, src)
+            rd = id_to_rep.get(dst, dst)
+            if rs != rd:
+                p = (rs, rd)
+                if p not in remap_pairs:
+                    remap_pairs.add(p)
+                    remapped_causal.append([rs, rd])
+        causal_edges = remapped_causal
 
         # default_path_event_ids: red events are all reps; deduplicate order.
         seen_red: set[int] = set()

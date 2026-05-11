@@ -360,7 +360,11 @@ class TestGetMultiwayCausal:
         assert len(data["default_path_event_ids"]) == sum(
             len(step_events) for step_events in greedy["events"]
         )
-        assert induced_red_edges == sorted(tuple(edge) for edge in greedy["causal_edges"])
+        # v17 remap policy: single-history edges are preserved but remap may add
+        # extra cross-class edges in the induced red subgraph.  Greedy topology
+        # is a subset of induced red edges (not necessarily equal).
+        greedy_edge_set = {tuple(edge) for edge in greedy["causal_edges"]}
+        assert greedy_edge_set <= set(induced_red_edges)
         assert all(eid in ev_by_id for eid in data["default_path_event_ids"])
 
     def test_rule3_red_layout_depths_match_greedy_batches(self, client):

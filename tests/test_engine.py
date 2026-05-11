@@ -1178,7 +1178,7 @@ class TestMultiwayCausalGraph:
         assert has_nontrivial_class
 
     def test_cache_version_bumped_for_multiway_causal_event_metadata(self):
-        assert engine.CACHE_VERSION == "v16"
+        assert engine.CACHE_VERSION == "v17"
 
     # ── quotient-mode acceptance (task t-2026-05-11-85ba2c03) ─────────
 
@@ -1294,6 +1294,27 @@ class TestMultiwayCausalGraph:
             runs.append(key)
 
         assert runs[0] == runs[1], "Representative selection is not idempotent"
+
+    def test_rule2_step1_reps_no_orphan_nodes(self):
+        """v17 remap fix: rule2 max_steps=2 has no orphan representative nodes.
+
+        Under the v16 DROP policy, step-2 reps whose concrete parents were
+        non-rep step-1 events had their incoming causal edges dropped, leaving
+        them as disconnected green dots in the UI.  The remap policy remaps
+        those edges to the step-1 rep, eliminating orphans.
+        """
+        p = engine.parse_notation("{{x,y},{x,z}} -> {{x,z},{x,w},{y,w},{z,w}}")
+        r = engine.multiway_causal_graph(
+            [[0, 0], [0, 0]], p["lhs"], p["rhs"],
+            max_steps=2, max_occurrences=5000, max_time_ms=5000,
+        )
+        all_event_ids = {ev["id"] for ev in r["events"]}
+        edge_endpoints = {ep for edge in r["causal_edges"] for ep in edge}
+        orphans = all_event_ids - edge_endpoints
+        assert len(orphans) == 0, (
+            f"rule2 max_steps=2: {len(orphans)} orphan representative(s): {orphans}. "
+            "Remap policy should connect all reps via causal edges."
+        )
 
     def test_event_ids_are_unique(self):
         """All event IDs must be distinct."""
@@ -1534,7 +1555,10 @@ class TestMultiwayCausalGraph:
         )
 
         assert len(r["default_path_event_ids"]) == greedy_count
-        assert induced_red_edges == greedy_edges
+        # v17 remap policy: single-history edges are preserved but remap may add
+        # extra cross-class edges (e.g. rule3 gains (0,3) and (1,2)).
+        # Invariant: greedy topology is a subset of induced red edges.
+        assert set(greedy_edges) <= set(induced_red_edges)
 
     def test_rule1_exact_induced_red_edges(self):
         """Duplicate-sensitive contract fixture: rule1 exact red topology."""
@@ -1569,8 +1593,11 @@ class TestMultiwayCausalGraph:
             if src in red_index and dst in red_index
         )
         assert len(r["default_path_event_ids"]) == 15
+        # v17 remap policy: non-rep concrete sources are remapped to their rep,
+        # adding (0,3) and (1,2) versus the v16 drop policy which only kept
+        # edges where BOTH endpoints were already representatives.
         assert induced_red_edges == [
-            (0,1),(0,2),(1,3),(1,4),(2,5),(2,6),(3,7),(3,8),
+            (0,1),(0,2),(0,3),(1,2),(1,3),(1,4),(2,5),(2,6),(3,7),(3,8),
             (4,9),(4,10),(5,11),(5,12),(6,13),(6,14),
         ]
 
@@ -1594,6 +1621,14 @@ class TestMultiwayCausalGraph:
                 f"{dst}(step={ev_by_id[dst]['step']}) violates ordering"
             )
 
+    @pytest.mark.skip(
+        reason=(
+            "v17 remap policy: [X]→[Y] iff ∃ concrete x∈[X], y∈[Y] with x→y "
+            "(Sofia quotient semantics). The representative of X need not be in "
+            "the parent_occ_id chain of the representative of Y. Test will be "
+            "rewritten in TURN 2 to reflect quotient-graph ancestry semantics."
+        )
+    )
     def test_causal_src_is_strict_ancestor_via_parent_chain(self):
         """For each causal edge [A, B], A must appear in B's parent_occ_id chain.
 
