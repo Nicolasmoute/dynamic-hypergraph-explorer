@@ -2985,6 +2985,25 @@ function renderMultiwayCausal() {
     .map(t => t[4]);
   for (const ev of events) eventInfo[ev.id] = ev;
 
+  // MWC density banner: show when any step has >200 events and user hasn't dismissed.
+  {
+    const depthCounts = new Map();
+    for (const ev of events) {
+      const d = layoutDepth(ev);
+      depthCounts.set(d, (depthCounts.get(d) || 0) + 1);
+    }
+    const maxStepCount = depthCounts.size ? Math.max(...depthCounts.values()) : 0;
+    const densityBanner = document.getElementById('mwc-density-banner');
+    if (densityBanner) {
+      const dismissed = sessionStorage.getItem('mwcDensityBannerDismissed') === '1';
+      if (maxStepCount > 200 && !dismissed) {
+        densityBanner.classList.add('mwc-banner-visible');
+      } else {
+        densityBanner.classList.remove('mwc-banner-visible');
+      }
+    }
+  }
+
   const canonicalModelCache = renderMultiwayCausal._canonicalModelCache || (renderMultiwayCausal._canonicalModelCache = new WeakMap());
   let canonicalModel = data._canonicalModel || canonicalModelCache.get(data);
   if (!canonicalModel) {
@@ -3233,6 +3252,12 @@ function renderMultiwayCausal() {
       .attr('font-family', "'JetBrains Mono', monospace")
       .text(bannerText);
   }
+}
+
+function dismissMwcDensityBanner() {
+  sessionStorage.setItem('mwcDensityBannerDismissed', '1');
+  const banner = document.getElementById('mwc-density-banner');
+  if (banner) banner.classList.remove('mwc-banner-visible');
 }
 
 function tracePathTo(mw, targetHash) {

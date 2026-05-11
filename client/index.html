@@ -282,6 +282,42 @@
   .causal-overlay { display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
   .causal-overlay.active { display: block; }
 
+  #mwc-density-banner {
+    display: none;
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 640px;
+    width: calc(100% - 40px);
+    padding: 8px 12px 8px 14px;
+    border-radius: 6px;
+    background: rgba(180, 120, 0, 0.13);
+    border: 1px solid rgba(200, 140, 0, 0.45);
+    color: var(--text);
+    font-size: 11px;
+    line-height: 1.55;
+    z-index: 20;
+    align-items: flex-start;
+    gap: 10px;
+    pointer-events: auto;
+  }
+  #mwc-density-banner.mwc-banner-visible { display: flex; }
+  #mwc-density-banner .mwc-banner-icon { color: #e0900a; flex-shrink: 0; margin-top: 1px; }
+  #mwc-density-banner .mwc-banner-body { flex: 1; }
+  #mwc-density-banner .mwc-banner-title {
+    font-weight: 600; color: #d48a00;
+    font-family: 'JetBrains Mono', monospace;
+    margin-bottom: 2px;
+  }
+  #mwc-density-banner .mwc-banner-dismiss {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-dim); font-size: 15px; line-height: 1;
+    padding: 0 2px; flex-shrink: 0; margin-top: 1px;
+    opacity: 0.7;
+  }
+  #mwc-density-banner .mwc-banner-dismiss:hover { opacity: 1; }
+
   .tooltip {
     position: absolute; pointer-events: none;
     background: var(--surface); border: 1px solid var(--border-bright);
@@ -521,7 +557,18 @@
     <svg id="main-svg"></svg>
     <div class="causal-overlay" id="causal-view"><svg id="causal-svg"></svg></div>
     <div class="causal-overlay" id="multiway-view"><svg id="multiway-svg"></svg></div>
-    <div class="causal-overlay" id="multiway-causal-view"><svg id="multiway-causal-svg"></svg></div>
+    <div class="causal-overlay" id="multiway-causal-view">
+      <svg id="multiway-causal-svg"></svg>
+      <div id="mwc-density-banner" role="status" aria-live="polite">
+        <span class="mwc-banner-icon">⚠</span>
+        <div class="mwc-banner-body">
+          <div class="mwc-banner-title">Dense step detected</div>
+          One or more steps have &gt;200 equivalence classes — BFS-capping may leave depth-1 parents partly uncovered.
+          To explore more of the multiway causal structure, raise <code>max_occurrences</code> or use a representative-coverage sampler (forthcoming).
+        </div>
+        <button class="mwc-banner-dismiss" onclick="dismissMwcDensityBanner()" title="Dismiss for this session" aria-label="Dismiss">✕</button>
+      </div>
+    </div>
     <div id="causal-label" style="display:none; position:absolute; top:12px; left:50%; transform:translateX(-50%); padding:4px 10px; border-radius:999px; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); font-size:11px; font-family:'JetBrains Mono', monospace; pointer-events:none; z-index:12;"></div>
     <div id="growth-view" style="display:none; position:absolute; inset:0; background:var(--bg); overflow-y:auto; padding: 32px;"></div>
     <div id="compute-overlay">
